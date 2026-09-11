@@ -2,7 +2,7 @@
 
 TicketAutomation is a standalone Python project for coordinating automation around implementation tickets. It is independent of the repositories it works on: target projects are configured through local settings and are not part of this package.
 
-V1 is scoped to one implementation ticket at a time. The current scaffold establishes configuration, a CLI entry point, and shared models that later workflow tickets can build on.
+V1 is scoped to one implementation ticket at a time. The current scaffold establishes configuration, repository preflight, a CLI entry point, and shared models that later workflow tickets can build on.
 
 Human control remains explicit. TicketAutomation does not commit, push, change branches, or modify a target repository without later workflow code and human direction.
 
@@ -30,5 +30,16 @@ Load, validate, and summarize the effective configuration:
 python -m ticket_automation config
 ```
 
+Inspect the configured target repository before any writable automation runs:
+
+```powershell
+python -m ticket_automation preflight
+```
+
 The verification commands in `config.example.toml` are examples only. They are not assumed to be the final commands for any target repository.
 
+## Repository Preflight
+
+Preflight is the safety gate for target repositories. It checks that `project.repo` exists, is a Git working tree, is on a branch, has no unstaged, untracked, or staged changes, and is not on one of the configured protected branches such as `main` or `master`.
+
+The target repository must start clean. TicketAutomation deliberately does not stash changes, discard files, switch branches, reset history, or perform any automatic Git cleanup. If preflight fails, fix the repository yourself and run preflight again.

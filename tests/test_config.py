@@ -1,147 +1,123 @@
 from __future__ import annotations
 
-import shutil
-import tempfile
-import unittest
-from pathlib import Path
+import pytest
 
+from tests.helpers import copy_example_config
 from ticket_automation.config import ConfigError, load_config, parse_config
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+def test_loads_example_config(tmp_path):
+    copy_example_config(tmp_path)
+
+    config = load_config(tmp_path)
+
+    assert config.project.name == "PhosPy"
+    assert config.project.repo.as_posix() == "C:/Projects/phospy"
+    assert config.project.protected_branches == ("main", "master")
+    assert config.runner.max_correction_rounds == 3
+    assert config.codex.executable == "codex"
+    assert config.codex.implementation_sandbox == "workspace-write"
+    assert config.codex.review_sandbox == "read-only"
+    assert [command.name for command in config.verification.commands] == ["tests", "typing"]
 
 
-def copy_example_config(config_dir: Path) -> Path:
-    source = PROJECT_ROOT / "config.example.toml"
-    destination = config_dir / source.name
-    shutil.copyfile(source, destination)
-    return destination
-
-
-class ConfigTests(unittest.TestCase):
-    def test_loads_example_config(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            config_dir = Path(tmp_dir)
-            copy_example_config(config_dir)
-
-            config = load_config(config_dir)
-
-        self.assertEqual(config.project.name, "PhosPy")
-        self.assertEqual(config.project.repo.as_posix(), "C:/Projects/phospy")
-        self.assertEqual(config.project.protected_branches, ("main", "master"))
-        self.assertEqual(config.runner.max_correction_rounds, 3)
-        self.assertEqual(config.codex.executable, "codex")
-        self.assertEqual(config.codex.implementation_sandbox, "workspace-write")
-        self.assertEqual(config.codex.review_sandbox, "read-only")
-        self.assertEqual(
-            [command.name for command in config.verification.commands],
-            ["tests", "typing"],
-        )
-
-    def test_local_config_overrides_example_config(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            config_dir = Path(tmp_dir)
-            copy_example_config(config_dir)
-            local_config = config_dir / "config.local.toml"
-            local_config.write_text(
-                """
+def test_local_config_overrides_example_config(tmp_path):
+    copy_example_config(tmp_path)
+    local_config = tmp_path / "config.local.toml"
+    local_config.write_text(
+        """
 [project]
 repo = "D:/work/phospy-local"
 
 [runner]
 max_correction_rounds = 2
 """.strip(),
-                encoding="utf-8",
-            )
+        encoding="utf-8",
+    )
 
-            config = load_config(config_dir)
+    config = load_config(tmp_path)
 
-        self.assertEqual(config.project.name, "PhosPy")
-        self.assertEqual(config.project.repo.as_posix(), "D:/work/phospy-local")
-        self.assertEqual(config.runner.max_correction_rounds, 2)
-        self.assertEqual(
-            config.source_files,
-            (config_dir / "config.example.toml", local_config),
-        )
+    assert config.project.name == "PhosPy"
+    assert config.project.repo.as_posix() == "D:/work/phospy-local"
+    assert config.runner.max_correction_rounds == 2
+    assert config.source_files == (tmp_path / "config.example.toml", local_config)
 
-    def test_missing_local_config_is_acceptable(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            config_dir = Path(tmp_dir)
-            copy_example_config(config_dir)
 
-            config = load_config(config_dir)
+def test_missing_local_config_is_acceptable(tmp_path):
+    copy_example_config(tmp_path)
 
-        self.assertEqual(config.source_files, (config_dir / "config.example.toml",))
+    config = load_config(tmp_path)
 
-    def test_invalid_required_values_are_rejected(self):
-        test_cases = [
-            ({"project": {"repo": ""}}, "project.repo"),
-            ({"runner": {"max_correction_rounds": 0}}, "positive integer"),
-            (
-                {"codex": {"implementation_sandbox": "danger-full-access"}},
-                "codex.implementation_sandbox",
-            ),
-            (
-                {"verification": {"commands": [{"name": "tests", "argv": []}]}},
-                r"verification.commands\[1\].argv",
-            ),
-        ]
-        for config_patch, message in test_cases:
-            with self.subTest(message=message):
-                raw_config = {
-                    "project": {
-                        "name": "PhosPy",
-                        "repo": "C:/Projects/phospy",
-                        "protected_branches": ["main"],
-                    },
-                    "runner": {"max_correction_rounds": 3},
-                    "codex": {
-                        "executable": "codex",
-                        "implementation_sandbox": "workspace-write",
-                        "review_sandbox": "read-only",
-                    },
-                    "verification": {
-                        "commands": [{"name": "tests", "argv": ["python", "-m", "pytest"]}]
-                    },
-                }
-                for section, values in config_patch.items():
-                    raw_config[section].update(values)
+    assert config.source_files == (tmp_path / "config.example.toml",)
 
-                with self.assertRaisesRegex(ConfigError, message):
-                    parse_config(raw_config)
 
-    def test_verification_commands_retain_argument_boundaries(self):
-        config = parse_config(
-            {
-                "project": {
-                    "name": "PhosPy",
-                    "repo": "C:/Projects/phospy",
-                    "protected_branches": ["main"],
-                },
-                "runner": {"max_correction_rounds": 3},
-                "codex": {
-                    "executable": "codex",
-                    "implementation_sandbox": "workspace-write",
-                    "review_sandbox": "read-only",
-                },
-                "verification": {
-                    "commands": [
-                        {
-                            "name": "targeted tests",
-                            "argv": ["python", "-m", "pytest", "tests/unit/test file.py"],
-                        }
-                    ]
-                },
-            }
-        )
+@pytest.mark.parametrize(
+    ("config_patch", "message"),
+    [
+        ({"project": {"repo": ""}}, "project.repo"),
+        ({"runner": {"max_correction_rounds": 0}}, "positive integer"),
+        (
+            {"codex": {"implementation_sandbox": "danger-full-access"}},
+            "codex.implementation_sandbox",
+        ),
+        (
+            {"verification": {"commands": [{"name": "tests", "argv": []}]}},
+            r"verification.commands\[1\].argv",
+        ),
+    ],
+)
+def test_invalid_required_values_are_rejected(config_patch, message):
+    raw_config = {
+        "project": {
+            "name": "PhosPy",
+            "repo": "C:/Projects/phospy",
+            "protected_branches": ["main"],
+        },
+        "runner": {"max_correction_rounds": 3},
+        "codex": {
+            "executable": "codex",
+            "implementation_sandbox": "workspace-write",
+            "review_sandbox": "read-only",
+        },
+        "verification": {
+            "commands": [{"name": "tests", "argv": ["python", "-m", "pytest"]}]
+        },
+    }
+    for section, values in config_patch.items():
+        raw_config[section].update(values)
 
-        self.assertEqual(
-            config.verification.commands[0].argv,
-            (
-                "python",
-                "-m",
-                "pytest",
-                "tests/unit/test file.py",
-            ),
-        )
+    with pytest.raises(ConfigError, match=message):
+        parse_config(raw_config)
 
+
+def test_verification_commands_retain_argument_boundaries():
+    config = parse_config(
+        {
+            "project": {
+                "name": "PhosPy",
+                "repo": "C:/Projects/phospy",
+                "protected_branches": ["main"],
+            },
+            "runner": {"max_correction_rounds": 3},
+            "codex": {
+                "executable": "codex",
+                "implementation_sandbox": "workspace-write",
+                "review_sandbox": "read-only",
+            },
+            "verification": {
+                "commands": [
+                    {
+                        "name": "targeted tests",
+                        "argv": ["python", "-m", "pytest", "tests/unit/test file.py"],
+                    }
+                ]
+            },
+        }
+    )
+
+    assert config.verification.commands[0].argv == (
+        "python",
+        "-m",
+        "pytest",
+        "tests/unit/test file.py",
+    )

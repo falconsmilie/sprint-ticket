@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from .config import ConfigError, format_config_summary, load_config
+from .preflight import format_preflight_result, run_preflight
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -27,6 +28,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     config_parser.set_defaults(handler=_handle_config)
 
+    preflight_parser = subparsers.add_parser(
+        "preflight",
+        help="Inspect the configured repository and reject unsafe starting states.",
+    )
+    preflight_parser.set_defaults(handler=_handle_preflight)
+
     return parser
 
 
@@ -44,3 +51,9 @@ def _handle_config(args: argparse.Namespace) -> int:
     print(format_config_summary(config))
     return 0
 
+
+def _handle_preflight(args: argparse.Namespace) -> int:
+    config = load_config(args.config_dir)
+    result = run_preflight(config)
+    print(format_preflight_result(result))
+    return 0 if result.passed else 1

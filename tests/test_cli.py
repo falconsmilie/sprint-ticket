@@ -1,48 +1,62 @@
 from __future__ import annotations
 
-import os
-import shutil
-import subprocess
-import sys
-import tempfile
-import unittest
-from pathlib import Path
+import pytest
+
+from tests.helpers import (
+    GIT,
+    copy_example_config,
+    create_git_repo,
+    run_cli,
+    write_preflight_config,
+)
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+def test_cli_help_succeeds(tmp_path):
+    result = run_cli("--help", cwd=tmp_path)
+
+    assert result.returncode == 0
+    assert "config" in result.stdout
+    assert "preflight" in result.stdout
 
 
-def run_cli(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(PROJECT_ROOT)
-    return subprocess.run(
-        [sys.executable, "-m", "ticket_automation", *args],
-        cwd=cwd,
-        env=env,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+def test_cli_config_output(tmp_path):
+    copy_example_config(tmp_path)
+
+    result = run_cli("config", cwd=tmp_path)
+
+    assert result.returncode == 0
+    assert "TicketAutomation configuration" in result.stdout
+    assert "PhosPy" in result.stdout
+    assert "C:\\Projects\\phospy" in result.stdout
+    assert "tests: python -m pytest" in result.stdout
 
 
-class CliTests(unittest.TestCase):
-    def test_cli_help_succeeds(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            result = run_cli("--help", cwd=Path(tmp_dir))
+@pytest.mark.skipif(GIT is None, reason="git executable is required for preflight CLI tests")
+def test_cli_preflight_output_and_exit_code(tmp_path):
+    config_dir = tmp_path / "config"
+    repo = create_git_repo(tmp_path / "repo")
+    config_dir.mkdir()
+    write_preflight_config(config_dir, repo)
 
-        self.assertEqual(result.returncode, 0)
-        self.assertIn("config", result.stdout)
+    result = run_cli("--config-dir", str(config_dir), "preflight", cwd=config_dir)
 
-    def test_cli_config_output(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            config_dir = Path(tmp_dir)
-            shutil.copyfile(PROJECT_ROOT / "config.example.toml", config_dir / "config.example.toml")
+    assert result.returncode == 0
+    assert "Repository" in result.stdout
+    assert "Branch" in result.stdout
+    assert "feature/example" in result.stdout
+    assert "PREFLIGHT PASSED" in result.stdout
 
-            result = run_cli("config", cwd=config_dir)
 
-        self.assertEqual(result.returncode, 0)
-        self.assertIn("TicketAutomation configuration", result.stdout)
-        self.assertIn("PhosPy", result.stdout)
-        self.assertIn("C:\\Projects\\phospy", result.stdout)
-        self.assertIn("tests: python -m pytest", result.stdout)
+@pytest.mark.skipif(GIT is None, reason="git executable is required for preflight CLI tests")
+def test_cli_preflight_failure_returns_nonzero(tmp_path):
+    config_dir = tmp_path / "config"
+    repo = create_git_repo(tmp_path / "repo")
+    config_dir.mkdir()
+    write_preflight_config(config_dir, repo, codex="ticket-automation-missing-codex")
 
+    result = run_cli("--config-dir", str(config_dir), "preflight", cwd=config_dir)
+
+    assert result.returncode == 1
+    assert "Codex CLI" in result.stdout
+    assert "ticket-automation-missing-codex" in result.stdout
+    assert "PREFLIGHT FAILED" in result.stdout
