@@ -38,6 +38,7 @@ class CodexSettings:
 class VerificationCommand:
     name: str
     argv: tuple[str, ...]
+    timeout_seconds: int
 
 
 @dataclass(frozen=True)
@@ -114,7 +115,7 @@ def parse_config(raw_config: dict[str, Any], *, source_files: tuple[Path, ...] =
 def format_config_summary(config: AppConfig) -> str:
     source_files = ", ".join(str(path) for path in config.source_files) or "in-memory config"
     verification = "\n".join(
-        f"  - {command.name}: {_format_argv(command.argv)}"
+        f"  - {command.name} ({command.timeout_seconds}s): {_format_argv(command.argv)}"
         for command in config.verification.commands
     )
 
@@ -227,7 +228,18 @@ def _parse_verification_commands(verification: dict[str, Any]) -> tuple[Verifica
             f"verification.commands[{index}].argv",
             allow_empty=False,
         )
-        parsed_commands.append(VerificationCommand(name=name, argv=argv))
+        timeout_seconds = _require_positive_int(
+            command,
+            "timeout_seconds",
+            f"verification.commands[{index}].timeout_seconds",
+        )
+        parsed_commands.append(
+            VerificationCommand(
+                name=name,
+                argv=argv,
+                timeout_seconds=timeout_seconds,
+            )
+        )
     return tuple(parsed_commands)
 
 

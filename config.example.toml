@@ -14,8 +14,9 @@ review_sandbox = "read-only"
 [[verification.commands]]
 name = "tests"
 argv = ["python", "-m", "pytest"]
+timeout_seconds = 1800
 
 [[verification.commands]]
 name = "typing"
 argv = ["pyright"]
-
+timeout_seconds = 1800

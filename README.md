@@ -2,7 +2,7 @@
 
 TicketAutomation is a standalone Python project for coordinating automation around implementation tickets. It is independent of the repositories it works on: target projects are configured through local settings and are not part of this package.
 
-V1 is scoped to one implementation ticket at a time. The current scaffold establishes configuration, repository preflight, persistent run snapshots, a first writable implementation stage, a CLI entry point, and shared models that later workflow tickets can build on.
+V1 is scoped to one implementation ticket at a time. The current scaffold establishes configuration, repository preflight, persistent run snapshots, a first writable implementation stage, deterministic verification gates, a CLI entry point, and shared models that later workflow tickets can build on.
 
 Human control remains explicit. TicketAutomation does not commit, push, change branches, stage files, reset work, stash work, or clean a target repository. The implementation agent may edit the working tree, and TicketAutomation verifies the branch, HEAD, and staging area after that writable boundary.
 
@@ -36,13 +36,13 @@ Inspect the configured target repository before any writable automation runs:
 python -m ticket_automation preflight
 ```
 
-Create a persistent run record from a local Markdown ticket and invoke the implementation agent:
+Create a persistent run record from a local Markdown ticket, invoke the implementation agent, and run the configured verification gates:
 
 ```powershell
 python -m ticket_automation run tickets/example.md
 ```
 
-For this stage, `run` performs preflight, copies the ticket verbatim into `runs/<run-id>/ticket.md`, records the starting branch and baseline HEAD SHA, invokes Codex once with a `workspace-write` sandbox, and stops before verification or review. The Codex prompt, event stream, stderr log, and structured result are stored in `runs/<run-id>/implementation/`.
+For this stage, `run` performs preflight, copies the ticket verbatim into `runs/<run-id>/ticket.md`, records the starting branch and baseline HEAD SHA, invokes Codex once with a `workspace-write` sandbox, then runs the configured verification commands. The Codex prompt, event stream, stderr log, and structured result are stored in `runs/<run-id>/implementation/`. Verification artifacts are stored in `runs/<run-id>/verification/`.
 
 List known run records:
 
@@ -50,7 +50,14 @@ List known run records:
 python -m ticket_automation status
 ```
 
-The verification commands in `config.example.toml` are examples only. They are not assumed to be the final commands for any target repository.
+The verification commands in `config.example.toml` are examples only. They are not assumed to be the final commands for any target repository. Each command uses an argument array and an explicit timeout:
+
+```toml
+[[verification.commands]]
+name = "tests"
+argv = ["python", "-m", "pytest"]
+timeout_seconds = 1800
+```
 
 ## Repository Preflight
 
@@ -70,4 +77,12 @@ The implementation stage renders `prompts/implement.md` with the complete snapsh
 
 After Codex exits, TicketAutomation independently inspects Git. The current branch must still match the starting branch, `HEAD` must still match the baseline SHA, and the staging area must be empty. If any of those invariants are violated, the run becomes `HUMAN_REQUIRED` and TicketAutomation does not undo the mutation. A `BLOCKED` implementation result also becomes `HUMAN_REQUIRED` with the agent result preserved in `implementation/result.json`. If Codex reports `COMPLETED` without any worktree changes for an implementation ticket, the run becomes `HUMAN_REQUIRED`. Codex execution failures become `FAILED`.
 
-When implementation completes and the safety checks pass, TicketAutomation captures `runs/<run-id>/diffs/after-implementation.patch` and `runs/<run-id>/diffs/after-implementation.stat` from Git. Verification and review are not implemented in this stage.
+When implementation completes and the safety checks pass, TicketAutomation captures `runs/<run-id>/diffs/after-implementation.patch` and `runs/<run-id>/diffs/after-implementation.stat` from Git.
+
+## Verification
+
+TicketAutomation has two validation levels. Implementation-agent targeted validation is whatever the writable agent chose to run while doing the work. Those claims are kept in `runs/<run-id>/implementation/result.json` as implementation feedback.
+
+Runner deterministic acceptance gates are the configured `[[verification.commands]]` records. TicketAutomation runs those commands itself from the target repository directory, preserves stdout and stderr, and treats those results as authoritative for workflow acceptance. Commands are executed from argument arrays without a shell.
+
+The first verification attempt writes `runs/<run-id>/verification/round-0.json` and `runs/<run-id>/verification/round-0.log`. Later correction rounds can use `round-1`, `round-2`, and so on. Passing gates move the run to `VERIFY`, which is the temporary successful stop until review exists. Failing gates move the run to `CORRECT` and produce typed `VerificationFailure` correction reasons. Environment or process execution problems, such as a missing executable or timeout, move the run to `HUMAN_REQUIRED`.

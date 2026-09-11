@@ -19,6 +19,10 @@ def test_loads_example_config(tmp_path):
     assert config.codex.implementation_sandbox == "workspace-write"
     assert config.codex.review_sandbox == "read-only"
     assert [command.name for command in config.verification.commands] == ["tests", "typing"]
+    assert [command.timeout_seconds for command in config.verification.commands] == [
+        1800,
+        1800,
+    ]
 
 
 def test_local_config_overrides_example_config(tmp_path):
@@ -64,6 +68,30 @@ def test_missing_local_config_is_acceptable(tmp_path):
             {"verification": {"commands": [{"name": "tests", "argv": []}]}},
             r"verification.commands\[1\].argv",
         ),
+        (
+            {
+                "verification": {
+                    "commands": [
+                        {"name": "tests", "argv": ["python", "-m", "pytest"]}
+                    ]
+                }
+            },
+            r"verification.commands\[1\].timeout_seconds",
+        ),
+        (
+            {
+                "verification": {
+                    "commands": [
+                        {
+                            "name": "tests",
+                            "argv": ["python", "-m", "pytest"],
+                            "timeout_seconds": 0,
+                        }
+                    ]
+                }
+            },
+            r"verification.commands\[1\].timeout_seconds",
+        ),
     ],
 )
 def test_invalid_required_values_are_rejected(config_patch, message):
@@ -80,7 +108,13 @@ def test_invalid_required_values_are_rejected(config_patch, message):
             "review_sandbox": "read-only",
         },
         "verification": {
-            "commands": [{"name": "tests", "argv": ["python", "-m", "pytest"]}]
+            "commands": [
+                {
+                    "name": "tests",
+                    "argv": ["python", "-m", "pytest"],
+                    "timeout_seconds": 1800,
+                }
+            ]
         },
     }
     for section, values in config_patch.items():
@@ -109,6 +143,7 @@ def test_verification_commands_retain_argument_boundaries():
                     {
                         "name": "targeted tests",
                         "argv": ["python", "-m", "pytest", "tests/unit/test file.py"],
+                        "timeout_seconds": 1800,
                     }
                 ]
             },
@@ -121,3 +156,4 @@ def test_verification_commands_retain_argument_boundaries():
         "pytest",
         "tests/unit/test file.py",
     )
+    assert config.verification.commands[0].timeout_seconds == 1800

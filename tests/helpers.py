@@ -167,6 +167,7 @@ def make_config(
     protected_branches: tuple[str, ...] = ("main", "master"),
     codex_executable: str = sys.executable,
     max_correction_rounds: int = 1,
+    verification_commands: tuple[VerificationCommand, ...] | None = None,
 ) -> AppConfig:
     executable = (
         Path(codex_executable).as_posix()
@@ -186,12 +187,14 @@ def make_config(
             review_sandbox="read-only",
         ),
         verification=VerificationSettings(
-            commands=(
+            commands=verification_commands
+            or (
                 VerificationCommand(
                     name="python",
-                    argv=(Path(sys.executable).as_posix(),),
+                    argv=(Path(sys.executable).as_posix(), "-c", "raise SystemExit(0)"),
+                    timeout_seconds=1800,
                 ),
-            )
+            ),
         ),
         source_files=(),
     )
@@ -203,28 +206,41 @@ def write_preflight_config(
     *,
     codex: str | None = None,
     max_correction_rounds: int = 1,
+    verification_commands: tuple[VerificationCommand, ...] | None = None,
 ) -> None:
     executable = codex or Path(sys.executable).as_posix()
-    config_dir.joinpath("config.example.toml").write_text(
-        "\n".join(
+    commands = verification_commands or (
+        VerificationCommand(
+            name="python",
+            argv=(Path(sys.executable).as_posix(), "-c", "raise SystemExit(0)"),
+            timeout_seconds=1800,
+        ),
+    )
+    lines = [
+        "[project]",
+        'name = "Example"',
+        f"repo = {json.dumps(repo.as_posix())}",
+        'protected_branches = ["main", "master"]',
+        "",
+        "[runner]",
+        f"max_correction_rounds = {max_correction_rounds}",
+        "",
+        "[codex]",
+        f"executable = {json.dumps(executable)}",
+        'implementation_sandbox = "workspace-write"',
+        'review_sandbox = "read-only"',
+    ]
+    for command in commands:
+        lines.extend(
             [
-                "[project]",
-                'name = "Example"',
-                f"repo = {json.dumps(repo.as_posix())}",
-                'protected_branches = ["main", "master"]',
-                "",
-                "[runner]",
-                f"max_correction_rounds = {max_correction_rounds}",
-                "",
-                "[codex]",
-                f"executable = {json.dumps(executable)}",
-                'implementation_sandbox = "workspace-write"',
-                'review_sandbox = "read-only"',
                 "",
                 "[[verification.commands]]",
-                'name = "python"',
-                f"argv = [{json.dumps(Path(sys.executable).as_posix())}]",
+                f"name = {json.dumps(command.name)}",
+                f"argv = {json.dumps(list(command.argv))}",
+                f"timeout_seconds = {command.timeout_seconds}",
             ]
-        ),
+        )
+    config_dir.joinpath("config.example.toml").write_text(
+        "\n".join(lines),
         encoding="utf-8",
     )

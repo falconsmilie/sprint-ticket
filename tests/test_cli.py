@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 
@@ -13,6 +14,7 @@ from tests.helpers import (
     write_fake_codex_executable,
     write_preflight_config,
 )
+from ticket_automation.config import VerificationCommand
 
 
 def test_cli_help_succeeds(tmp_path):
@@ -34,7 +36,7 @@ def test_cli_config_output(tmp_path):
     assert "TicketAutomation configuration" in result.stdout
     assert "PhosPy" in result.stdout
     assert "C:\\Projects\\phospy" in result.stdout
-    assert "tests: python -m pytest" in result.stdout
+    assert "tests (1800s): python -m pytest" in result.stdout
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for preflight CLI tests")
@@ -69,7 +71,7 @@ def test_cli_preflight_failure_returns_nonzero(tmp_path):
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for run CLI tests")
-def test_cli_run_invokes_fake_codex_and_stops_before_verification(tmp_path, monkeypatch):
+def test_cli_run_invokes_fake_codex_and_runs_verification(tmp_path, monkeypatch):
     config_dir = tmp_path / "config"
     repo = create_git_repo(tmp_path / "repo")
     ticket = tmp_path / "QDEB-003.md"
@@ -86,10 +88,45 @@ def test_cli_run_invokes_fake_codex_and_stops_before_verification(tmp_path, monk
     assert result.returncode == 0
     assert "Snapshot created for run" in result.stdout
     assert "Implementation state: IMPLEMENT" in result.stdout
-    assert "No verification or review has been attempted." in result.stdout
+    assert "Verification state: VERIFY" in result.stdout
+    assert "No review has been attempted." in result.stdout
     assert run_git(repo, "diff", "--name-only") == "file.txt"
     fake_record = json.loads(record_path.read_text(encoding="utf-8"))
     assert sandbox_value(tuple(fake_record["argv"])) == "workspace-write"
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for run CLI tests")
+def test_cli_verification_failure_overrides_agent_claimed_tests(tmp_path, monkeypatch):
+    config_dir = tmp_path / "config"
+    repo = create_git_repo(tmp_path / "repo")
+    ticket = tmp_path / "QDEB-003.md"
+    ticket.write_text("# Ticket\n\nDo the thing.\n", encoding="utf-8")
+    fake_codex = write_fake_codex_executable(tmp_path / "fake-bin")
+    config_dir.mkdir()
+    write_preflight_config(
+        config_dir,
+        repo,
+        codex=str(fake_codex),
+        verification_commands=(
+            VerificationCommand(
+                name="runner-gate",
+                argv=(
+                    sys.executable,
+                    "-c",
+                    "import sys; print('runner failed'); raise SystemExit(7)",
+                ),
+                timeout_seconds=1800,
+            ),
+        ),
+    )
+    monkeypatch.setenv("TA_FAKE_CODEX_ACTION", "modify")
+
+    result = run_cli("--config-dir", str(config_dir), "run", str(ticket), cwd=config_dir)
+
+    assert result.returncode == 1
+    assert "Implementation state: IMPLEMENT" in result.stdout
+    assert "Verification state: CORRECT" in result.stdout
+    assert "runner-gate: FAIL" in result.stdout
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for status CLI tests")
