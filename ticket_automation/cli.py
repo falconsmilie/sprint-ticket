@@ -5,6 +5,11 @@ import sys
 from pathlib import Path
 
 from .config import ConfigError, format_config_summary, load_config
+from .implementation import (
+    ImplementationError,
+    format_implementation_result,
+    run_implementation_stage,
+)
 from .preflight import format_preflight_result, run_preflight
 from .runs import (
     RUNS_DIR_NAME,
@@ -46,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser(
         "run",
-        help="Create a ticket snapshot and baseline audit record.",
+        help="Create a ticket snapshot, run implementation, and stop before verification.",
     )
     run_parser.add_argument(
         "ticket",
@@ -90,12 +95,16 @@ def _handle_run(args: argparse.Namespace) -> int:
     config = load_config(args.config_dir)
     runs_dir = args.config_dir / RUNS_DIR_NAME
     try:
-        result = create_run_snapshot(config, args.ticket, runs_dir=runs_dir)
+        snapshot = create_run_snapshot(config, args.ticket, runs_dir=runs_dir)
+        implementation = run_implementation_stage(config, snapshot.run_dir)
     except TicketInputError as error:
         print(f"Ticket input error: {error}", file=sys.stderr)
         return 2
     except RunPreflightError as error:
         print(format_preflight_result(error.result))
+        return 1
+    except ImplementationError as error:
+        print(f"Implementation error: {error}", file=sys.stderr)
         return 1
     except RunError as error:
         print(f"Run error: {error}", file=sys.stderr)
@@ -104,14 +113,14 @@ def _handle_run(args: argparse.Namespace) -> int:
     print(
         "\n".join(
             [
-                f"Snapshot created for run {result.run_record.run_id}.",
-                f"Run directory: {result.run_dir}",
-                "State: SNAPSHOT",
-                "No implementation has been attempted; Codex was not invoked.",
+                f"Snapshot created for run {snapshot.run_record.run_id}.",
+                f"Run directory: {snapshot.run_dir}",
+                format_implementation_result(implementation),
+                "No verification or review has been attempted.",
             ]
         )
     )
-    return 0
+    return 0 if implementation.successful else 1
 
 
 def _handle_status(args: argparse.Namespace) -> int:

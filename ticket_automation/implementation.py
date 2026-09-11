@@ -1,0 +1,567 @@
+from __future__ import annotations
+
+import subprocess
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from os import devnull
+from pathlib import Path
+from typing import Any, Callable, Iterable
+
+from .codex import (
+    CodexExecution,
+    CodexExecutionFailure,
+    CodexProcessRunner,
+    Sandbox,
+    execute as execute_codex,
+)
+from .config import AppConfig
+from .git import GitCommandError, GitRepository
+from .models import WorkflowState
+from .runs import (
+    BASELINE_RECORD_FILE,
+    RUN_RECORD_FILE,
+    RUN_TICKET_FILE,
+    RunError,
+    RunRecord,
+    load_baseline_record,
+    load_run_record,
+    save_run_record,
+)
+
+
+class _SafetyInspectionPhase:
+    BEFORE_IMPLEMENTATION = "before implementation"
+    AFTER_IMPLEMENTATION = "after implementation"
+
+
+_IMPLEMENTATION_DIR_NAME = "implementation"
+_DIFFS_DIR_NAME = "diffs"
+_AFTER_IMPLEMENTATION_PATCH_FILE = "after-implementation.patch"
+_AFTER_IMPLEMENTATION_STATS_FILE = "after-implementation.stat"
+_TICKET_PLACEHOLDER = "{{SNAPSHOTTED_TICKET}}"
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_IMPLEMENTATION_PROMPT_TEMPLATE = _PROJECT_ROOT / "prompts" / "implement.md"
+_IMPLEMENTATION_RESULT_SCHEMA = (
+    _PROJECT_ROOT / "schemas" / "implementation-result.schema.json"
+)
+
+
+class ImplementationError(RunError):
+    """Raised when the implementation stage cannot be prepared."""
+
+
+@dataclass(frozen=True)
+class _ImplementationSafetyViolation:
+    name: str
+    expected: str
+    actual: str
+    message: str
+
+
+@dataclass(frozen=True)
+class ImplementationStageResult:
+    run_dir: Path
+    run_record: RunRecord
+    artifact_directory: Path
+    codex_execution: CodexExecution | None
+    agent_result: dict[str, Any] | None
+    safety_violations: tuple[_ImplementationSafetyViolation, ...]
+    changed_files: tuple[str, ...]
+    patch_path: Path | None
+    diff_stats_path: Path | None
+    controller_message: str
+
+    @property
+    def successful(self) -> bool:
+        return self.run_record.state == WorkflowState.IMPLEMENT
+
+
+def run_implementation_stage(
+    config: AppConfig,
+    run_dir: Path | str,
+    *,
+    codex_runner: CodexProcessRunner | None = None,
+    clock: Callable[[], datetime] | None = None,
+) -> ImplementationStageResult:
+    run_path = Path(run_dir)
+    run_record_path = run_path / RUN_RECORD_FILE
+    run_record = load_run_record(run_record_path)
+    if run_record.state != WorkflowState.SNAPSHOT:
+        raise ImplementationError(
+            f"Implementation requires run state SNAPSHOT; found {run_record.state.value}."
+        )
+
+    baseline_record = load_baseline_record(run_path / BASELINE_RECORD_FILE)
+    if baseline_record.branch != run_record.starting_branch:
+        raise ImplementationError("Run record and baseline branch do not match.")
+    if baseline_record.head_sha != run_record.baseline_sha:
+        raise ImplementationError("Run record and baseline HEAD do not match.")
+
+    ticket_text = _read_snapshotted_ticket(run_path / RUN_TICKET_FILE)
+    repository = GitRepository(Path(run_record.target_repository_path))
+    implementation_dir = run_path / _IMPLEMENTATION_DIR_NAME
+
+    starting_violations = _inspect_starting_state(repository, run_record)
+    if starting_violations:
+        return _finish(
+            run_record=run_record,
+            run_record_path=run_record_path,
+            run_dir=run_path,
+            artifact_directory=implementation_dir,
+            execution=None,
+            agent_result=None,
+            safety_violations=starting_violations,
+            changed_files=(),
+            patch_path=None,
+            diff_stats_path=None,
+            state=WorkflowState.HUMAN_REQUIRED,
+            controller_message="Repository no longer matches the clean implementation baseline.",
+            clock=clock,
+        )
+
+    prompt = _render_implementation_prompt(ticket_text)
+
+    try:
+        execution = execute_codex(
+            prompt=prompt,
+            repo_path=repository.path,
+            sandbox=Sandbox.WORKSPACE_WRITE,
+            output_schema=_IMPLEMENTATION_RESULT_SCHEMA,
+            artifact_directory=implementation_dir,
+            executable=config.codex.executable,
+            runner=codex_runner,
+        )
+    except CodexExecutionFailure as error:
+        safety_violations = _inspect_safety(
+            repository,
+            run_record,
+            phase=_SafetyInspectionPhase.AFTER_IMPLEMENTATION,
+        )
+        state = (
+            WorkflowState.HUMAN_REQUIRED
+            if safety_violations
+            else WorkflowState.FAILED
+        )
+        message = (
+            "Codex failed and repository safety invariants were violated."
+            if safety_violations
+            else error.execution.failure_message or str(error)
+        )
+        return _finish(
+            run_record=run_record,
+            run_record_path=run_record_path,
+            run_dir=run_path,
+            artifact_directory=implementation_dir,
+            execution=error.execution,
+            agent_result=None,
+            safety_violations=safety_violations,
+            changed_files=(),
+            patch_path=None,
+            diff_stats_path=None,
+            state=state,
+            controller_message=message,
+            clock=clock,
+        )
+
+    agent_result = _require_agent_result(execution.structured_result)
+    safety_violations = _inspect_safety(
+        repository,
+        run_record,
+        phase=_SafetyInspectionPhase.AFTER_IMPLEMENTATION,
+    )
+    if safety_violations:
+        return _finish(
+            run_record=run_record,
+            run_record_path=run_record_path,
+            run_dir=run_path,
+            artifact_directory=implementation_dir,
+            execution=execution,
+            agent_result=agent_result,
+            safety_violations=safety_violations,
+            changed_files=(),
+            patch_path=None,
+            diff_stats_path=None,
+            state=WorkflowState.HUMAN_REQUIRED,
+            controller_message="Repository safety invariants were violated.",
+            clock=clock,
+        )
+
+    try:
+        changed_files = _changed_files(repository, run_record.baseline_sha)
+    except ImplementationError as error:
+        return _finish(
+            run_record=run_record,
+            run_record_path=run_record_path,
+            run_dir=run_path,
+            artifact_directory=implementation_dir,
+            execution=execution,
+            agent_result=agent_result,
+            safety_violations=(),
+            changed_files=(),
+            patch_path=None,
+            diff_stats_path=None,
+            state=WorkflowState.HUMAN_REQUIRED,
+            controller_message=str(error),
+            clock=clock,
+        )
+    agent_status = agent_result["status"]
+    if agent_status == "BLOCKED":
+        return _finish(
+            run_record=run_record,
+            run_record_path=run_record_path,
+            run_dir=run_path,
+            artifact_directory=implementation_dir,
+            execution=execution,
+            agent_result=agent_result,
+            safety_violations=(),
+            changed_files=changed_files,
+            patch_path=None,
+            diff_stats_path=None,
+            state=WorkflowState.HUMAN_REQUIRED,
+            controller_message="Implementation agent returned BLOCKED.",
+            clock=clock,
+        )
+
+    if not changed_files:
+        return _finish(
+            run_record=run_record,
+            run_record_path=run_record_path,
+            run_dir=run_path,
+            artifact_directory=implementation_dir,
+            execution=execution,
+            agent_result=agent_result,
+            safety_violations=(),
+            changed_files=(),
+            patch_path=None,
+            diff_stats_path=None,
+            state=WorkflowState.HUMAN_REQUIRED,
+            controller_message="Implementation completed without repository changes.",
+            clock=clock,
+        )
+
+    try:
+        patch_path, diff_stats_path = _capture_diff(
+            repository,
+            run_path,
+            run_record.baseline_sha,
+        )
+    except ImplementationError as error:
+        return _finish(
+            run_record=run_record,
+            run_record_path=run_record_path,
+            run_dir=run_path,
+            artifact_directory=implementation_dir,
+            execution=execution,
+            agent_result=agent_result,
+            safety_violations=(),
+            changed_files=changed_files,
+            patch_path=None,
+            diff_stats_path=None,
+            state=WorkflowState.HUMAN_REQUIRED,
+            controller_message=str(error),
+            clock=clock,
+        )
+    return _finish(
+        run_record=run_record,
+        run_record_path=run_record_path,
+        run_dir=run_path,
+        artifact_directory=implementation_dir,
+        execution=execution,
+        agent_result=agent_result,
+        safety_violations=(),
+        changed_files=changed_files,
+        patch_path=patch_path,
+        diff_stats_path=diff_stats_path,
+        state=WorkflowState.IMPLEMENT,
+        controller_message="Implementation completed and Git safety checks passed.",
+        clock=clock,
+    )
+
+
+def _render_implementation_prompt(ticket_text: str) -> str:
+    template = _IMPLEMENTATION_PROMPT_TEMPLATE.read_text(encoding="utf-8")
+    if _TICKET_PLACEHOLDER not in template:
+        raise ImplementationError(
+            f"Implementation prompt template is missing {_TICKET_PLACEHOLDER}."
+        )
+    return template.replace(_TICKET_PLACEHOLDER, ticket_text)
+
+
+def format_implementation_result(result: ImplementationStageResult) -> str:
+    rows = [
+        f"Implementation state: {result.run_record.state.value}",
+        f"Artifacts: {result.artifact_directory}",
+        result.controller_message,
+    ]
+    if result.patch_path is not None:
+        rows.append(f"Patch: {result.patch_path}")
+    if result.diff_stats_path is not None:
+        rows.append(f"Diff stats: {result.diff_stats_path}")
+    if result.safety_violations:
+        rows.append("Safety violations:")
+        rows.extend(
+            f"  - {violation.name}: expected {violation.expected}, got {violation.actual}"
+            for violation in result.safety_violations
+        )
+    return "\n".join(rows)
+
+
+def _finish(
+    *,
+    run_record: RunRecord,
+    run_record_path: Path,
+    run_dir: Path,
+    artifact_directory: Path,
+    execution: CodexExecution | None,
+    agent_result: dict[str, Any] | None,
+    safety_violations: tuple[_ImplementationSafetyViolation, ...],
+    changed_files: tuple[str, ...],
+    patch_path: Path | None,
+    diff_stats_path: Path | None,
+    state: WorkflowState,
+    controller_message: str,
+    clock: Callable[[], datetime] | None,
+) -> ImplementationStageResult:
+    updated_record = run_record.with_state(state, updated_timestamp=_timestamp(clock))
+    save_run_record(updated_record, run_record_path)
+    return ImplementationStageResult(
+        run_dir=run_dir,
+        run_record=updated_record,
+        artifact_directory=artifact_directory,
+        codex_execution=execution,
+        agent_result=agent_result,
+        safety_violations=safety_violations,
+        changed_files=changed_files,
+        patch_path=patch_path,
+        diff_stats_path=diff_stats_path,
+        controller_message=controller_message,
+    )
+
+
+def _read_snapshotted_ticket(path: Path) -> str:
+    try:
+        return path.read_bytes().decode("utf-8")
+    except OSError as error:
+        raise ImplementationError(f"Could not read snapshotted ticket: {path}: {error}") from error
+    except UnicodeDecodeError as error:
+        raise ImplementationError(
+            f"Snapshotted ticket must be valid UTF-8 Markdown: {path}"
+        ) from error
+
+
+def _require_agent_result(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ImplementationError("Implementation agent result must be a JSON object.")
+    return value
+
+
+def _inspect_safety(
+    repository: GitRepository,
+    run_record: RunRecord,
+    *,
+    phase: str,
+) -> tuple[_ImplementationSafetyViolation, ...]:
+    violations: list[_ImplementationSafetyViolation] = []
+    try:
+        current_branch = repository.current_branch()
+        current_head = repository.head_sha()
+        staged_files = repository.staged_files()
+    except GitCommandError as error:
+        return (
+            _ImplementationSafetyViolation(
+                name="git-inspection",
+                expected=f"{phase} Git inspection succeeds",
+                actual=str(error),
+                message=f"Could not inspect repository {phase}.",
+            ),
+        )
+
+    if current_branch != run_record.starting_branch:
+        violations.append(
+            _ImplementationSafetyViolation(
+                name="branch",
+                expected=run_record.starting_branch,
+                actual="<detached>" if current_branch is None else current_branch,
+                message=f"Current branch changed {phase}.",
+            )
+        )
+    if current_head != run_record.baseline_sha:
+        violations.append(
+            _ImplementationSafetyViolation(
+                name="HEAD",
+                expected=run_record.baseline_sha,
+                actual=current_head,
+                message=f"HEAD changed {phase}.",
+            )
+        )
+    if staged_files:
+        violations.append(
+            _ImplementationSafetyViolation(
+                name="staging",
+                expected="empty",
+                actual=", ".join(staged_files[:5]),
+                message=f"Staging area is not empty {phase}.",
+            )
+        )
+    return tuple(violations)
+
+
+def _inspect_starting_state(
+    repository: GitRepository,
+    run_record: RunRecord,
+) -> tuple[_ImplementationSafetyViolation, ...]:
+    violations = list(
+        _inspect_safety(
+            repository,
+            run_record,
+            phase=_SafetyInspectionPhase.BEFORE_IMPLEMENTATION,
+        )
+    )
+    try:
+        changed_files = _worktree_changed_files(repository, run_record.baseline_sha)
+    except GitCommandError as error:
+        violations.append(
+            _ImplementationSafetyViolation(
+                name="worktree-inspection",
+                expected="clean baseline worktree inspection succeeds",
+                actual=str(error),
+                message="Could not inspect repository worktree before implementation.",
+            )
+        )
+        return tuple(violations)
+
+    if changed_files:
+        violations.append(
+            _ImplementationSafetyViolation(
+                name="worktree",
+                expected="clean",
+                actual=_format_files(changed_files),
+                message="Worktree changed before implementation started.",
+            )
+        )
+    return tuple(violations)
+
+
+def _changed_files(repository: GitRepository, baseline_sha: str) -> tuple[str, ...]:
+    try:
+        return _worktree_changed_files(repository, baseline_sha)
+    except GitCommandError as error:
+        raise ImplementationError(f"Could not inspect implementation diff: {error}") from error
+
+
+def _capture_diff(
+    repository: GitRepository,
+    run_dir: Path,
+    baseline_sha: str,
+) -> tuple[Path, Path]:
+    diffs_dir = run_dir / _DIFFS_DIR_NAME
+    diffs_dir.mkdir(parents=True, exist_ok=True)
+    patch_path = diffs_dir / _AFTER_IMPLEMENTATION_PATCH_FILE
+    stats_path = diffs_dir / _AFTER_IMPLEMENTATION_STATS_FILE
+    try:
+        patch = _diff_including_untracked(repository, baseline_sha)
+        stats = _diff_stats_including_untracked(repository, baseline_sha)
+    except GitCommandError as error:
+        raise ImplementationError(f"Could not capture implementation diff: {error}") from error
+    patch_path.write_text(patch, encoding="utf-8", newline="\n")
+    stats_path.write_text(stats, encoding="utf-8", newline="\n")
+    return patch_path, stats_path
+
+
+def _worktree_changed_files(
+    repository: GitRepository,
+    baseline_sha: str,
+) -> tuple[str, ...]:
+    return _unique(
+        (*repository.changed_files(baseline_sha), *repository.untracked_files())
+    )
+
+
+def _diff_including_untracked(repository: GitRepository, baseline_sha: str) -> str:
+    parts = [repository.diff(baseline_sha).rstrip()]
+    for file_path in repository.untracked_files():
+        parts.append(
+            _git_no_index_diff(repository.path, file_path, stats=False).rstrip()
+        )
+    return _join_git_sections(parts)
+
+
+def _diff_stats_including_untracked(repository: GitRepository, baseline_sha: str) -> str:
+    parts = [repository.diff_stats(baseline_sha).rstrip()]
+    for file_path in repository.untracked_files():
+        parts.append(
+            _git_no_index_diff(repository.path, file_path, stats=True).rstrip()
+        )
+    return _join_git_sections(parts)
+
+
+def _git_no_index_diff(repo_path: Path, file_path: str, *, stats: bool) -> str:
+    null_candidates = (
+        ("/dev/null",)
+        if devnull == "/dev/null"
+        else ("/dev/null", devnull)
+    )
+    last_result: subprocess.CompletedProcess[str] | None = None
+    for null_path in null_candidates:
+        command = ["git", "diff", "--no-ext-diff", "--no-index"]
+        if stats:
+            command.append("--stat")
+        command.extend(("--", null_path, file_path))
+        result = subprocess.run(
+            command,
+            cwd=repo_path,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode in (0, 1):
+            return result.stdout
+        last_result = result
+    assert last_result is not None
+    raise _git_no_index_error(last_result)
+
+
+def _git_no_index_error(result: subprocess.CompletedProcess[str]) -> GitCommandError:
+    message = result.stderr.strip() or result.stdout.strip() or "no output"
+    command = " ".join(str(argument) for argument in result.args)
+    return GitCommandError(
+        f"{command} failed with exit code {result.returncode}: {message}"
+    )
+
+
+def _unique(values: Iterable[str]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(values))
+
+
+def _join_git_sections(parts: Iterable[str]) -> str:
+    content = "\n".join(part for part in parts if part)
+    if not content:
+        return ""
+    return f"{content}\n"
+
+
+def _format_files(files: tuple[str, ...]) -> str:
+    shown = ", ".join(files[:5])
+    hidden_count = len(files) - 5
+    if hidden_count > 0:
+        shown = f"{shown}, and {hidden_count} more"
+    return shown
+
+
+def _timestamp(clock: Callable[[], datetime] | None) -> str:
+    now = datetime.now(timezone.utc) if clock is None else clock()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return (
+        now.astimezone(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+__all__ = [
+    "ImplementationError",
+    "format_implementation_result",
+    "run_implementation_stage",
+]

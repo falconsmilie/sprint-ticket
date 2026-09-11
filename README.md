@@ -2,9 +2,9 @@
 
 TicketAutomation is a standalone Python project for coordinating automation around implementation tickets. It is independent of the repositories it works on: target projects are configured through local settings and are not part of this package.
 
-V1 is scoped to one implementation ticket at a time. The current scaffold establishes configuration, repository preflight, persistent run snapshots, a CLI entry point, and shared models that later workflow tickets can build on.
+V1 is scoped to one implementation ticket at a time. The current scaffold establishes configuration, repository preflight, persistent run snapshots, a first writable implementation stage, a CLI entry point, and shared models that later workflow tickets can build on.
 
-Human control remains explicit. TicketAutomation does not commit, push, change branches, or modify a target repository without later workflow code and human direction.
+Human control remains explicit. TicketAutomation does not commit, push, change branches, stage files, reset work, stash work, or clean a target repository. The implementation agent may edit the working tree, and TicketAutomation verifies the branch, HEAD, and staging area after that writable boundary.
 
 ## Configuration
 
@@ -36,13 +36,13 @@ Inspect the configured target repository before any writable automation runs:
 python -m ticket_automation preflight
 ```
 
-Create a persistent run record from a local Markdown ticket:
+Create a persistent run record from a local Markdown ticket and invoke the implementation agent:
 
 ```powershell
 python -m ticket_automation run tickets/example.md
 ```
 
-For this stage, `run` intentionally stops after preflight and snapshot creation. It copies the ticket verbatim into `runs/<run-id>/ticket.md`, records the starting branch and baseline HEAD SHA, writes `run.json` and `baseline.json`, and exits before any implementation is attempted. Codex is not invoked by this command yet.
+For this stage, `run` performs preflight, copies the ticket verbatim into `runs/<run-id>/ticket.md`, records the starting branch and baseline HEAD SHA, invokes Codex once with a `workspace-write` sandbox, and stops before verification or review. The Codex prompt, event stream, stderr log, and structured result are stored in `runs/<run-id>/implementation/`.
 
 List known run records:
 
@@ -63,3 +63,11 @@ The target repository must start clean. TicketAutomation deliberately does not s
 Run snapshots are stored under `runs/`. A run ID uses a timestamp plus a sanitized ticket identifier, such as `20260911-130512_QDEB-003`. Existing run directories are not overwritten; a numeric suffix is added if a timestamp collision occurs.
 
 Each run directory contains `run.json`, `ticket.md`, and `baseline.json`. These records are enough to reconstruct the original ticket boundary for later workflow stages: the original ticket path, the copied ticket path, the target repository path, the starting branch, the baseline HEAD SHA, correction round counters, and timestamps.
+
+## Implementation Stage
+
+The implementation stage renders `prompts/implement.md` with the complete snapshotted ticket, then runs a fresh Codex process against the target repository using the `workspace-write` sandbox and `schemas/implementation-result.schema.json`. The schema accepts only `COMPLETED` or `BLOCKED` agent statuses plus a concise summary, tests run, assumptions, and known issues. It does not ask Codex to report changed files because Git remains the source of truth.
+
+After Codex exits, TicketAutomation independently inspects Git. The current branch must still match the starting branch, `HEAD` must still match the baseline SHA, and the staging area must be empty. If any of those invariants are violated, the run becomes `HUMAN_REQUIRED` and TicketAutomation does not undo the mutation. A `BLOCKED` implementation result also becomes `HUMAN_REQUIRED` with the agent result preserved in `implementation/result.json`. If Codex reports `COMPLETED` without any worktree changes for an implementation ticket, the run becomes `HUMAN_REQUIRED`. Codex execution failures become `FAILED`.
+
+When implementation completes and the safety checks pass, TicketAutomation captures `runs/<run-id>/diffs/after-implementation.patch` and `runs/<run-id>/diffs/after-implementation.stat` from Git. Verification and review are not implemented in this stage.

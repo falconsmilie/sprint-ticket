@@ -19,6 +19,83 @@ from ticket_automation.config import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 GIT = shutil.which("git")
+FAKE_CODEX_SCRIPT = r'''
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+
+def implementation_result(status: str) -> dict[str, object]:
+    return {
+        "status": status,
+        "summary": "fake implementation result",
+        "tests_run": [{"command": "fake validation", "result": "PASS"}],
+        "assumptions": [],
+        "known_issues": [] if status == "COMPLETED" else ["blocked by fake codex"],
+    }
+
+
+def emit_result(result: dict[str, object]) -> None:
+    print(json.dumps({"type": "thread.started", "thread_id": "fake-thread"}))
+    print(json.dumps({"type": "turn.started"}))
+    print(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "item_1",
+                    "type": "agent_message",
+                    "text": json.dumps(result),
+                },
+            }
+        )
+    )
+    print(json.dumps({"type": "turn.completed"}))
+
+
+prompt = sys.stdin.read()
+record_path = os.environ.get("TA_FAKE_CODEX_RECORD")
+if record_path:
+    pathlib.Path(record_path).write_text(
+        json.dumps({"argv": sys.argv[1:], "prompt": prompt}, indent=2),
+        encoding="utf-8",
+    )
+
+action = os.environ.get("TA_FAKE_CODEX_ACTION", "modify")
+if action == "fail":
+    sys.stderr.write("fake codex failed\n")
+    raise SystemExit(2)
+
+if action == "modify":
+    pathlib.Path("file.txt").write_text("implemented by fake codex\n", encoding="utf-8")
+    emit_result(implementation_result("COMPLETED"))
+elif action == "untracked":
+    pathlib.Path("added.txt").write_text("new file from fake codex\n", encoding="utf-8")
+    emit_result(implementation_result("COMPLETED"))
+elif action == "blocked":
+    emit_result(implementation_result("BLOCKED"))
+elif action == "no-change":
+    emit_result(implementation_result("COMPLETED"))
+elif action == "stage":
+    pathlib.Path("file.txt").write_text("staged by fake codex\n", encoding="utf-8")
+    subprocess.run(["git", "add", "file.txt"], check=True)
+    emit_result(implementation_result("COMPLETED"))
+elif action == "commit":
+    pathlib.Path("file.txt").write_text("committed by fake codex\n", encoding="utf-8")
+    subprocess.run(["git", "add", "file.txt"], check=True)
+    subprocess.run(["git", "commit", "-m", "fake codex commit"], check=True)
+    emit_result(implementation_result("COMPLETED"))
+elif action == "branch":
+    subprocess.run(["git", "checkout", "-b", "fake-codex-branch"], check=True)
+    emit_result(implementation_result("COMPLETED"))
+else:
+    sys.stderr.write(f"unknown fake codex action: {action}\n")
+    raise SystemExit(2)
+'''
 
 
 def run_cli(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -44,6 +121,24 @@ def run_git(repo: Path, *args: str) -> str:
         text=True,
     )
     return result.stdout.strip()
+
+
+def write_fake_codex_executable(directory: Path) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    script = directory / "fake_codex.py"
+    script.write_text(FAKE_CODEX_SCRIPT, encoding="utf-8")
+    if os.name == "nt":
+        launcher = directory / "fake-codex.cmd"
+        launcher.write_text(
+            f'@echo off\n"{sys.executable}" "{script}" %*\n',
+            encoding="utf-8",
+        )
+        return launcher
+
+    launcher = directory / "fake-codex"
+    launcher.write_text(f"#!{sys.executable}\n{FAKE_CODEX_SCRIPT}", encoding="utf-8")
+    launcher.chmod(0o755)
+    return launcher
 
 
 def create_git_repo(repo: Path, *, branch: str = "feature/example") -> Path:
