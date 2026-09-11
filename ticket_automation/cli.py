@@ -148,9 +148,7 @@ def _handle_run(args: argparse.Namespace) -> int:
         lines.append("Review was not attempted.")
     else:
         lines.append(format_review_result(review))
-    print(
-        "\n".join(lines)
-    )
+    print("\n".join(lines))
     return 0 if review is not None and review.successful else 1
 
 

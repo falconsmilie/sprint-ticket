@@ -3,11 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from .config import AppConfig, VerificationCommand
 from .corrections import CorrectionReason, VerificationFailure
@@ -20,7 +21,6 @@ from .runs import (
     load_run_record,
     save_run_record,
 )
-
 
 VERIFICATION_SCHEMA_VERSION = 1
 VERIFICATION_ROUND_FORMAT = "ticket_automation.verification_round"
@@ -78,8 +78,7 @@ class VerificationProcessRunner(Protocol):
         command: VerificationProcessCommand,
         *,
         timeout_seconds: float | None,
-    ) -> VerificationProcessResult:
-        ...
+    ) -> VerificationProcessResult: ...
 
 
 class SubprocessVerificationRunner:
@@ -247,9 +246,10 @@ def run_verification_stage(
     run_path = Path(run_dir)
     run_record_path = run_path / RUN_RECORD_FILE
     run_record = load_run_record(run_record_path)
-    if run_record.state != WorkflowState.IMPLEMENT:
+    if run_record.state not in (WorkflowState.IMPLEMENT, WorkflowState.VERIFY):
         raise VerificationError(
-            f"Verification requires run state IMPLEMENT; found {run_record.state.value}."
+            "Verification requires run state IMPLEMENT or VERIFY; "
+            f"found {run_record.state.value}."
         )
 
     selected_round = (
@@ -317,8 +317,7 @@ def run_verification_stage(
     elif round_result.errored_commands:
         state = WorkflowState.HUMAN_REQUIRED
         controller_message = (
-            "Verification could not execute completely; "
-            "human intervention is required."
+            "Verification could not execute completely; human intervention is required."
         )
     elif round_result.failed_commands:
         state = WorkflowState.CORRECT
@@ -347,7 +346,7 @@ def run_verification_round(
     log_path: Path,
     process_runner: VerificationProcessRunner | None = None,
     repository: GitRepository | None = None,
-    repository_snapshot: "_RepositoryVerificationSnapshot | None" = None,
+    repository_snapshot: _RepositoryVerificationSnapshot | None = None,
     baseline_sha: str | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> VerificationRound:
@@ -452,9 +451,7 @@ def _run_command(
 
     ended = _utcnow(clock)
     status = (
-        VerificationStatus.PASS
-        if process.returncode == 0
-        else VerificationStatus.FAIL
+        VerificationStatus.PASS if process.returncode == 0 else VerificationStatus.FAIL
     )
     return VerificationCommandResult(
         name=command.name,
@@ -550,7 +547,7 @@ class _RepositoryVerificationSnapshot:
         repository: GitRepository,
         *,
         baseline_sha: str,
-    ) -> "_RepositoryVerificationSnapshot":
+    ) -> _RepositoryVerificationSnapshot:
         untracked_files = repository.untracked_files()
         return cls(
             branch=repository.current_branch(),
@@ -690,11 +687,7 @@ def _verification_safety_violations(
     repository_snapshot: _RepositoryVerificationSnapshot | None,
     baseline_sha: str | None,
 ) -> tuple[VerificationSafetyViolation, ...]:
-    if (
-        repository is None
-        or repository_snapshot is None
-        or baseline_sha is None
-    ):
+    if repository is None or repository_snapshot is None or baseline_sha is None:
         return ()
     try:
         return repository_snapshot.compare(repository, baseline_sha=baseline_sha)
@@ -740,7 +733,9 @@ def _hash_untracked_files(
     repo_path: Path,
     files: tuple[str, ...],
 ) -> tuple[tuple[str, str], ...]:
-    return tuple((file_path, _file_sha256(repo_path / file_path)) for file_path in files)
+    return tuple(
+        (file_path, _file_sha256(repo_path / file_path)) for file_path in files
+    )
 
 
 def _file_sha256(path: Path) -> str:
@@ -839,10 +834,10 @@ def _excerpt(value: str) -> str:
 
 
 def _utcnow(clock: Callable[[], datetime] | None) -> datetime:
-    now = datetime.now(timezone.utc) if clock is None else clock()
+    now = datetime.now(UTC) if clock is None else clock()
     if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
-    return now.astimezone(timezone.utc)
+        now = now.replace(tzinfo=UTC)
+    return now.astimezone(UTC)
 
 
 def _format_timestamp(value: datetime) -> str:
@@ -866,10 +861,10 @@ def _process_text(value: str | bytes | None) -> str:
 
 
 __all__ = [
-    "SubprocessVerificationRunner",
     "VERIFICATION_DIR_NAME",
     "VERIFICATION_ROUND_FORMAT",
     "VERIFICATION_SCHEMA_VERSION",
+    "SubprocessVerificationRunner",
     "VerificationCommandResult",
     "VerificationError",
     "VerificationErrorKind",

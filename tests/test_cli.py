@@ -24,6 +24,7 @@ def test_cli_help_succeeds(tmp_path):
     assert "config" in result.stdout
     assert "preflight" in result.stdout
     assert "run" in result.stdout
+    assert "correct" not in result.stdout
     assert "status" in result.stdout
 
 
@@ -39,7 +40,9 @@ def test_cli_config_output(tmp_path):
     assert "tests (1800s): python -m pytest" in result.stdout
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for preflight CLI tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for preflight CLI tests"
+)
 def test_cli_preflight_output_and_exit_code(tmp_path):
     config_dir = tmp_path / "config"
     repo = create_git_repo(tmp_path / "repo")
@@ -55,7 +58,9 @@ def test_cli_preflight_output_and_exit_code(tmp_path):
     assert "PREFLIGHT PASSED" in result.stdout
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for preflight CLI tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for preflight CLI tests"
+)
 def test_cli_preflight_failure_returns_nonzero(tmp_path):
     config_dir = tmp_path / "config"
     repo = create_git_repo(tmp_path / "repo")
@@ -83,7 +88,9 @@ def test_cli_run_invokes_fake_codex_and_runs_verification(tmp_path, monkeypatch)
     monkeypatch.setenv("TA_FAKE_CODEX_ACTION", "modify")
     monkeypatch.setenv("TA_FAKE_CODEX_RECORD", str(record_path))
 
-    result = run_cli("--config-dir", str(config_dir), "run", str(ticket), cwd=config_dir)
+    result = run_cli(
+        "--config-dir", str(config_dir), "run", str(ticket), cwd=config_dir
+    )
 
     assert result.returncode == 0
     assert "Snapshot created for run" in result.stdout
@@ -92,9 +99,7 @@ def test_cli_run_invokes_fake_codex_and_runs_verification(tmp_path, monkeypatch)
     assert "Review state: REVIEW" in result.stdout
     assert run_git(repo, "diff", "--name-only") == "file.txt"
     fake_record = json.loads(record_path.read_text(encoding="utf-8"))
-    assert [
-        sandbox_value(tuple(call["argv"])) for call in fake_record["calls"]
-    ] == [
+    assert [sandbox_value(tuple(call["argv"])) for call in fake_record["calls"]] == [
         "workspace-write",
         "read-only",
     ]
@@ -126,7 +131,9 @@ def test_cli_verification_failure_overrides_agent_claimed_tests(tmp_path, monkey
     )
     monkeypatch.setenv("TA_FAKE_CODEX_ACTION", "modify")
 
-    result = run_cli("--config-dir", str(config_dir), "run", str(ticket), cwd=config_dir)
+    result = run_cli(
+        "--config-dir", str(config_dir), "run", str(ticket), cwd=config_dir
+    )
 
     assert result.returncode == 1
     assert "Implementation state: IMPLEMENT" in result.stdout
@@ -135,7 +142,9 @@ def test_cli_verification_failure_overrides_agent_claimed_tests(tmp_path, monkey
     assert "runner-gate: FAIL" in result.stdout
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for status CLI tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for status CLI tests"
+)
 def test_cli_status_reads_multiple_run_records(tmp_path, monkeypatch):
     config_dir = tmp_path / "config"
     repo = create_git_repo(tmp_path / "repo")

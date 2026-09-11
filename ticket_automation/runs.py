@@ -5,16 +5,16 @@ import os
 import re
 import shutil
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .config import AppConfig
 from .git import GitCommandError, GitRepository
 from .models import WorkflowState
 from .preflight import PreflightResult, run_preflight
-
 
 RUN_SCHEMA_VERSION = 1
 BASELINE_SCHEMA_VERSION = 1
@@ -128,8 +128,23 @@ class RunRecord:
     schema_version: int = RUN_SCHEMA_VERSION
     format: str = RUN_RECORD_FORMAT
 
-    def with_state(self, state: WorkflowState, *, updated_timestamp: str) -> RunRecord:
-        return replace(self, state=state, updated_timestamp=updated_timestamp)
+    def with_state(
+        self,
+        state: WorkflowState,
+        *,
+        updated_timestamp: str,
+        current_correction_round: int | None = None,
+    ) -> RunRecord:
+        return replace(
+            self,
+            state=state,
+            current_correction_round=(
+                self.current_correction_round
+                if current_correction_round is None
+                else current_correction_round
+            ),
+            updated_timestamp=updated_timestamp,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -294,10 +309,7 @@ def format_status(records: tuple[RunRecord, ...], *, runs_dir: Path | str) -> st
     if not records:
         return f"No runs found in {Path(runs_dir)}."
 
-    header = (
-        f"{'Run ID':<36} {'Ticket ID':<16} {'State':<12} "
-        f"{'Branch':<24} Updated"
-    )
+    header = f"{'Run ID':<36} {'Ticket ID':<16} {'State':<12} {'Branch':<24} Updated"
     rows = [header]
     for record in records:
         rows.append(
@@ -309,18 +321,25 @@ def format_status(records: tuple[RunRecord, ...], *, runs_dir: Path | str) -> st
 
 
 def _timestamp(clock: Callable[[], datetime] | None) -> str:
-    now = datetime.now(timezone.utc) if clock is None else clock()
+    now = datetime.now(UTC) if clock is None else clock()
     if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
-    return now.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        now = now.replace(tzinfo=UTC)
+    return (
+        now.astimezone(UTC)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 def _run_id_prefix(timestamp: str) -> str:
-    parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    parsed = datetime.fromisoformat(timestamp)
     return parsed.strftime("%Y%m%d-%H%M%S")
 
 
-def _reserve_run_directory(runs_dir: Path, timestamp: str, ticket_id: str) -> tuple[str, Path]:
+def _reserve_run_directory(
+    runs_dir: Path, timestamp: str, ticket_id: str
+) -> tuple[str, Path]:
     runs_dir.mkdir(parents=True, exist_ok=True)
     base_run_id = f"{_run_id_prefix(timestamp)}_{ticket_id}"
     for index in range(1, 1000):
@@ -361,7 +380,9 @@ def _read_ticket(ticket_path: Path | str) -> _TicketSource:
     try:
         contents = path.read_bytes()
     except OSError as error:
-        raise TicketInputError(f"Ticket file is not readable: {path}: {error}") from error
+        raise TicketInputError(
+            f"Ticket file is not readable: {path}: {error}"
+        ) from error
     if not contents:
         raise TicketInputError(f"Ticket file is empty: {path}")
     return _TicketSource(path=path, contents=contents)
@@ -401,7 +422,9 @@ def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
             text=True,
         )
         temp_path = Path(temp_name)
-        with os.fdopen(file_descriptor, "w", encoding="utf-8", newline="\n") as temp_file:
+        with os.fdopen(
+            file_descriptor, "w", encoding="utf-8", newline="\n"
+        ) as temp_file:
             file_descriptor = -1
             temp_file.write(payload)
             temp_file.write("\n")
@@ -455,12 +478,12 @@ __all__ = [
     "BASELINE_RECORD_FILE",
     "BASELINE_RECORD_FORMAT",
     "BASELINE_SCHEMA_VERSION",
-    "BaselineRecord",
+    "RUNS_DIR_NAME",
     "RUN_RECORD_FILE",
     "RUN_RECORD_FORMAT",
     "RUN_SCHEMA_VERSION",
     "RUN_TICKET_FILE",
-    "RUNS_DIR_NAME",
+    "BaselineRecord",
     "RunCreationResult",
     "RunError",
     "RunPreflightError",
