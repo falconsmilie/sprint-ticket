@@ -54,6 +54,13 @@ _CORRECTION_RESULT_SCHEMA = (
 )
 _REVIEW_RESULT_FILE = "result.json"
 _REVIEW_FINDING_DISPOSITIONS = frozenset({"REQUIRED", "ADVISORY", "FOLLOW_UP"})
+_TERMINAL_STATES = frozenset(
+    {
+        WorkflowState.READY_FOR_HUMAN,
+        WorkflowState.HUMAN_REQUIRED,
+        WorkflowState.FAILED,
+    }
+)
 
 
 class CorrectionError(RunError):
@@ -174,6 +181,27 @@ def run_correction_stage(
     artifact_directory = (
         run_path / CORRECTION_EXECUTIONS_DIR_NAME / f"round-{correction_round}"
     )
+    if run_record.current_correction_round >= run_record.max_correction_rounds:
+        return _finish(
+            run_record=run_record,
+            run_record_path=run_record_path,
+            run_dir=run_path,
+            correction_round=correction_round,
+            ticket_path=None,
+            artifact_directory=artifact_directory,
+            execution=None,
+            agent_result=None,
+            safety_violations=(),
+            correction_reasons=(),
+            patch_path=None,
+            state=WorkflowState.HUMAN_REQUIRED,
+            controller_message=(
+                "Maximum corrective rounds exhausted; human intervention is required."
+            ),
+            clock=clock,
+            advance_correction_round=False,
+            last_completed_state=run_record.last_completed_state,
+        )
 
     starting_violations = _inspect_correction_invariants(
         repository,
@@ -539,15 +567,18 @@ def _finish(
     controller_message: str,
     clock: Callable[[], datetime] | None,
     advance_correction_round: bool = True,
+    last_completed_state: WorkflowState = WorkflowState.CORRECT,
 ) -> CorrectionStageResult:
     updated_record = run_record.with_state(
         state,
         updated_timestamp=_timestamp(clock),
+        last_completed_state=last_completed_state,
         current_correction_round=(
             correction_round
             if advance_correction_round
             else run_record.current_correction_round
         ),
+        terminal_reason=controller_message if state in _TERMINAL_STATES else None,
     )
     save_run_record(updated_record, run_record_path)
     return CorrectionStageResult(
@@ -660,7 +691,9 @@ def _load_required_review_findings(
     run_path: Path,
     run_record: RunRecord,
 ) -> tuple[ReviewFinding, ...]:
-    review_round = run_record.current_correction_round + 1
+    review_round = run_record.current_review_round
+    if review_round < 1:
+        return ()
     result_path = (
         run_path / REVIEW_DIR_NAME / f"round-{review_round}" / _REVIEW_RESULT_FILE
     )

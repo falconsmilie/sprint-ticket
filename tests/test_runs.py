@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -26,7 +26,7 @@ from ticket_automation.runs import (
 
 
 def fixed_clock() -> datetime:
-    return datetime(2026, 9, 11, 13, 5, 12, tzinfo=timezone.utc)
+    return datetime(2026, 9, 11, 13, 5, 12, tzinfo=UTC)
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
@@ -47,6 +47,7 @@ def test_valid_run_directory_creation(tmp_path):
     assert result.run_dir.joinpath("ticket.md").is_file()
     assert result.run_dir.joinpath("baseline.json").is_file()
     assert result.run_record.state == WorkflowState.SNAPSHOT
+    assert result.run_record.last_completed_state == WorkflowState.SNAPSHOT
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
@@ -217,6 +218,79 @@ def test_correction_round_and_maximum_are_persisted(tmp_path):
 
     assert data["current_correction_round"] == 0
     assert data["max_correction_rounds"] == 7
+    assert data["current_review_round"] == 0
+    assert data["last_completed_state"] == "SNAPSHOT"
+    assert data["terminal_reason"] is None
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
+def test_run_record_loads_pre_review_round_records(tmp_path):
+    repo = create_git_repo(tmp_path / "repo")
+    ticket = tmp_path / "QDEB-003.md"
+    ticket.write_text("# Ticket\n", encoding="utf-8")
+    result = create_run_snapshot(
+        make_config(repo),
+        ticket,
+        runs_dir=tmp_path / "runs",
+        clock=fixed_clock,
+    )
+    record_path = result.run_dir / "run.json"
+    data = json.loads(record_path.read_text(encoding="utf-8"))
+    del data["last_completed_state"]
+    del data["current_review_round"]
+    del data["terminal_reason"]
+    record_path.write_text(json.dumps(data), encoding="utf-8")
+
+    record = load_run_record(record_path)
+
+    assert record.last_completed_state == record.state
+    assert record.current_review_round == 0
+    assert record.terminal_reason is None
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        (
+            "last_completed_state",
+            "UNSUPPORTED",
+            "unsupported workflow state: last_completed_state",
+        ),
+        (
+            "current_correction_round",
+            -1,
+            "non-negative integer: current_correction_round",
+        ),
+        (
+            "current_review_round",
+            -1,
+            "non-negative integer: current_review_round",
+        ),
+    ],
+)
+def test_run_record_rejects_malformed_or_negative_lifecycle_fields(
+    tmp_path,
+    field,
+    value,
+    message,
+):
+    repo = create_git_repo(tmp_path / "repo")
+    ticket = tmp_path / "QDEB-003.md"
+    ticket.write_text("# Ticket\n", encoding="utf-8")
+    result = create_run_snapshot(
+        make_config(repo),
+        ticket,
+        runs_dir=tmp_path / "runs",
+        clock=fixed_clock,
+    )
+    record_path = result.run_dir / "run.json"
+    data = json.loads(record_path.read_text(encoding="utf-8"))
+    data[field] = value
+    record_path.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(RunError, match=message):
+        load_run_record(record_path)
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
@@ -366,8 +440,12 @@ def test_status_can_read_multiple_run_records(tmp_path):
     second_ticket.write_text("# Second\n", encoding="utf-8")
     runs_dir = tmp_path / "runs"
 
-    create_run_snapshot(make_config(repo), first_ticket, runs_dir=runs_dir, clock=fixed_clock)
-    create_run_snapshot(make_config(repo), second_ticket, runs_dir=runs_dir, clock=fixed_clock)
+    create_run_snapshot(
+        make_config(repo), first_ticket, runs_dir=runs_dir, clock=fixed_clock
+    )
+    create_run_snapshot(
+        make_config(repo), second_ticket, runs_dir=runs_dir, clock=fixed_clock
+    )
 
     records = list_run_records(runs_dir)
 

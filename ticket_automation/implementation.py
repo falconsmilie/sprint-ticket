@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from os import devnull
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any
 
 from .codex import (
     CodexExecution,
     CodexExecutionFailure,
     CodexProcessRunner,
     Sandbox,
+)
+from .codex import (
     execute as execute_codex,
 )
 from .config import AppConfig
@@ -43,6 +46,13 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _IMPLEMENTATION_PROMPT_TEMPLATE = _PROJECT_ROOT / "prompts" / "implement.md"
 _IMPLEMENTATION_RESULT_SCHEMA = (
     _PROJECT_ROOT / "schemas" / "implementation-result.schema.json"
+)
+_TERMINAL_STATES = frozenset(
+    {
+        WorkflowState.READY_FOR_HUMAN,
+        WorkflowState.HUMAN_REQUIRED,
+        WorkflowState.FAILED,
+    }
 )
 
 
@@ -138,9 +148,7 @@ def run_implementation_stage(
             phase=_SafetyInspectionPhase.AFTER_IMPLEMENTATION,
         )
         state = (
-            WorkflowState.HUMAN_REQUIRED
-            if safety_violations
-            else WorkflowState.FAILED
+            WorkflowState.HUMAN_REQUIRED if safety_violations else WorkflowState.FAILED
         )
         message = (
             "Codex failed and repository safety invariants were violated."
@@ -322,7 +330,12 @@ def _finish(
     controller_message: str,
     clock: Callable[[], datetime] | None,
 ) -> ImplementationStageResult:
-    updated_record = run_record.with_state(state, updated_timestamp=_timestamp(clock))
+    updated_record = run_record.with_state(
+        state,
+        updated_timestamp=_timestamp(clock),
+        last_completed_state=WorkflowState.IMPLEMENT,
+        terminal_reason=controller_message if state in _TERMINAL_STATES else None,
+    )
     save_run_record(updated_record, run_record_path)
     return ImplementationStageResult(
         run_dir=run_dir,
@@ -342,7 +355,9 @@ def _read_snapshotted_ticket(path: Path) -> str:
     try:
         return path.read_bytes().decode("utf-8")
     except OSError as error:
-        raise ImplementationError(f"Could not read snapshotted ticket: {path}: {error}") from error
+        raise ImplementationError(
+            f"Could not read snapshotted ticket: {path}: {error}"
+        ) from error
     except UnicodeDecodeError as error:
         raise ImplementationError(
             f"Snapshotted ticket must be valid UTF-8 Markdown: {path}"
@@ -446,7 +461,9 @@ def _changed_files(repository: GitRepository, baseline_sha: str) -> tuple[str, .
     try:
         return _worktree_changed_files(repository, baseline_sha)
     except GitCommandError as error:
-        raise ImplementationError(f"Could not inspect implementation diff: {error}") from error
+        raise ImplementationError(
+            f"Could not inspect implementation diff: {error}"
+        ) from error
 
 
 def _capture_diff(
@@ -462,7 +479,9 @@ def _capture_diff(
         patch = _diff_including_untracked(repository, baseline_sha)
         stats = _diff_stats_including_untracked(repository, baseline_sha)
     except GitCommandError as error:
-        raise ImplementationError(f"Could not capture implementation diff: {error}") from error
+        raise ImplementationError(
+            f"Could not capture implementation diff: {error}"
+        ) from error
     patch_path.write_text(patch, encoding="utf-8", newline="\n")
     stats_path.write_text(stats, encoding="utf-8", newline="\n")
     return patch_path, stats_path
@@ -486,7 +505,9 @@ def _diff_including_untracked(repository: GitRepository, baseline_sha: str) -> s
     return _join_git_sections(parts)
 
 
-def _diff_stats_including_untracked(repository: GitRepository, baseline_sha: str) -> str:
+def _diff_stats_including_untracked(
+    repository: GitRepository, baseline_sha: str
+) -> str:
     parts = [repository.diff_stats(baseline_sha).rstrip()]
     for file_path in repository.untracked_files():
         parts.append(
@@ -497,9 +518,7 @@ def _diff_stats_including_untracked(repository: GitRepository, baseline_sha: str
 
 def _git_no_index_diff(repo_path: Path, file_path: str, *, stats: bool) -> str:
     null_candidates = (
-        ("/dev/null",)
-        if devnull == "/dev/null"
-        else ("/dev/null", devnull)
+        ("/dev/null",) if devnull == "/dev/null" else ("/dev/null", devnull)
     )
     last_result: subprocess.CompletedProcess[str] | None = None
     for null_path in null_candidates:
@@ -549,11 +568,11 @@ def _format_files(files: tuple[str, ...]) -> str:
 
 
 def _timestamp(clock: Callable[[], datetime] | None) -> str:
-    now = datetime.now(timezone.utc) if clock is None else clock()
+    now = datetime.now(UTC) if clock is None else clock()
     if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
+        now = now.replace(tzinfo=UTC)
     return (
-        now.astimezone(timezone.utc)
+        now.astimezone(UTC)
         .replace(microsecond=0)
         .isoformat()
         .replace("+00:00", "Z")

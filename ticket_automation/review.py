@@ -1,19 +1,22 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .codex import (
     CodexExecution,
     CodexExecutionFailure,
     CodexProcessRunner,
     Sandbox,
-    execute as execute_codex,
     parse_sandbox,
+)
+from .codex import (
+    execute as execute_codex,
 )
 from .config import AppConfig
 from .git import GitCommandError, GitRepository
@@ -30,7 +33,6 @@ from .runs import (
 )
 from .verification import VERIFICATION_DIR_NAME
 
-
 REVIEW_DIR_NAME = "reviews"
 REVIEW_ROUND_OFFSET = 1
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -38,6 +40,13 @@ _REVIEW_PROMPT_TEMPLATE = _PROJECT_ROOT / "prompts" / "review.md"
 _REVIEW_RESULT_SCHEMA = _PROJECT_ROOT / "schemas" / "review-result.schema.json"
 _IMPLEMENTATION_DIR_NAME = "implementation"
 _IMPLEMENTATION_RESULT_FILE = "result.json"
+_TERMINAL_STATES = frozenset(
+    {
+        WorkflowState.READY_FOR_HUMAN,
+        WorkflowState.HUMAN_REQUIRED,
+        WorkflowState.FAILED,
+    }
+)
 
 
 class ReviewError(RunError):
@@ -81,7 +90,7 @@ class ReviewStageResult:
 
     @property
     def successful(self) -> bool:
-        return self.run_record.state == WorkflowState.REVIEW
+        return self.run_record.state == WorkflowState.READY_FOR_HUMAN
 
     @property
     def required_findings(self) -> tuple[dict[str, Any], ...]:
@@ -116,7 +125,7 @@ def run_review_stage(
         raise ReviewError("Review requires codex.review_sandbox to be read-only.")
 
     repository = GitRepository(Path(run_record.target_repository_path))
-    review_round = run_record.current_correction_round + REVIEW_ROUND_OFFSET
+    review_round = run_record.current_review_round + REVIEW_ROUND_OFFSET
     artifact_directory = run_path / REVIEW_DIR_NAME / f"round-{review_round}"
     if artifact_directory.exists() and any(artifact_directory.iterdir()):
         raise ReviewError(f"Review artifacts already exist for round-{review_round}.")
@@ -158,9 +167,7 @@ def run_review_stage(
     except CodexExecutionFailure as error:
         safety_violations = _inspect_review_invariants(repository, run_record)
         state = (
-            WorkflowState.HUMAN_REQUIRED
-            if safety_violations
-            else WorkflowState.FAILED
+            WorkflowState.HUMAN_REQUIRED if safety_violations else WorkflowState.FAILED
         )
         message = (
             "Codex review failed and repository safety invariants were violated."
@@ -217,8 +224,8 @@ def run_review_stage(
 
     verdict = ReviewVerdict(review_result["verdict"])
     if verdict == ReviewVerdict.PASS:
-        state = WorkflowState.REVIEW
-        controller_message = "Review passed; final reporting has not been added yet."
+        state = WorkflowState.READY_FOR_HUMAN
+        controller_message = "Review passed; ready for human handoff."
     elif verdict == ReviewVerdict.CORRECTIONS_REQUIRED:
         state = WorkflowState.CORRECT
         controller_message = "Review found required corrections."
@@ -289,7 +296,13 @@ def _finish(
     controller_message: str,
     clock: Callable[[], datetime] | None,
 ) -> ReviewStageResult:
-    updated_record = run_record.with_state(state, updated_timestamp=_timestamp(clock))
+    updated_record = run_record.with_state(
+        state,
+        updated_timestamp=_timestamp(clock),
+        last_completed_state=WorkflowState.REVIEW,
+        current_review_round=run_record.current_review_round + REVIEW_ROUND_OFFSET,
+        terminal_reason=controller_message if state in _TERMINAL_STATES else None,
+    )
     save_run_record(updated_record, run_record_path)
     return ReviewStageResult(
         run_dir=run_dir,
@@ -335,7 +348,9 @@ def _read_snapshotted_ticket(path: Path) -> str:
     try:
         return path.read_bytes().decode("utf-8")
     except OSError as error:
-        raise ReviewError(f"Could not read snapshotted ticket: {path}: {error}") from error
+        raise ReviewError(
+            f"Could not read snapshotted ticket: {path}: {error}"
+        ) from error
     except UnicodeDecodeError as error:
         raise ReviewError(
             f"Snapshotted ticket must be valid UTF-8 Markdown: {path}"
@@ -344,9 +359,7 @@ def _read_snapshotted_ticket(path: Path) -> str:
 
 def _read_verification_results(run_path: Path, run_record: RunRecord) -> str:
     round_index = run_record.current_correction_round
-    verification_path = (
-        run_path / VERIFICATION_DIR_NAME / f"round-{round_index}.json"
-    )
+    verification_path = run_path / VERIFICATION_DIR_NAME / f"round-{round_index}.json"
     try:
         data = json.loads(verification_path.read_text(encoding="utf-8"))
     except FileNotFoundError as error:
@@ -363,7 +376,9 @@ def _read_verification_results(run_path: Path, run_record: RunRecord) -> str:
 
 def _require_passing_verification_round(data: Any, path: Path) -> None:
     if not isinstance(data, dict):
-        raise ReviewError(f"Deterministic verification results must be an object: {path}")
+        raise ReviewError(
+            f"Deterministic verification results must be an object: {path}"
+        )
     status = data.get("status")
     if status != "PASS":
         raise ReviewError(
@@ -373,9 +388,7 @@ def _require_passing_verification_round(data: Any, path: Path) -> None:
 
 
 def _read_implementation_summary(run_path: Path) -> str:
-    result_path = (
-        run_path / _IMPLEMENTATION_DIR_NAME / _IMPLEMENTATION_RESULT_FILE
-    )
+    result_path = run_path / _IMPLEMENTATION_DIR_NAME / _IMPLEMENTATION_RESULT_FILE
     try:
         data = json.loads(result_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -475,11 +488,11 @@ def _format_files(files: tuple[str, ...]) -> str:
 
 
 def _timestamp(clock: Callable[[], datetime] | None) -> str:
-    now = datetime.now(timezone.utc) if clock is None else clock()
+    now = datetime.now(UTC) if clock is None else clock()
     if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
+        now = now.replace(tzinfo=UTC)
     return (
-        now.astimezone(timezone.utc)
+        now.astimezone(UTC)
         .replace(microsecond=0)
         .isoformat()
         .replace("+00:00", "Z")
@@ -487,9 +500,9 @@ def _timestamp(clock: Callable[[], datetime] | None) -> str:
 
 
 __all__ = [
-    "FindingDisposition",
     "REVIEW_DIR_NAME",
     "REVIEW_ROUND_OFFSET",
+    "FindingDisposition",
     "ReviewError",
     "ReviewResultConsistencyError",
     "ReviewSafetyViolation",

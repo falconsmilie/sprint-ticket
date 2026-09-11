@@ -5,27 +5,16 @@ import sys
 from pathlib import Path
 
 from .config import ConfigError, format_config_summary, load_config
-from .implementation import (
-    ImplementationError,
-    format_implementation_result,
-    run_implementation_stage,
-)
 from .preflight import format_preflight_result, run_preflight
-from .review import ReviewError, format_review_result, run_review_stage
 from .runs import (
     RUNS_DIR_NAME,
     RunError,
     RunPreflightError,
     TicketInputError,
-    create_run_snapshot,
     format_status,
     list_run_records,
 )
-from .verification import (
-    VerificationError,
-    format_verification_result,
-    run_verification_stage,
-)
+from .workflow import format_lifecycle_result, run_ticket_lifecycle
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -58,8 +47,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser(
         "run",
         help=(
-            "Create a ticket snapshot, run implementation, "
-            "run verification, and run review."
+            "Run one ticket through implementation, verification, review, "
+            "and bounded correction."
         ),
     )
     run_parser.add_argument(
@@ -104,17 +93,10 @@ def _handle_run(args: argparse.Namespace) -> int:
     config = load_config(args.config_dir)
     runs_dir = args.config_dir / RUNS_DIR_NAME
     try:
-        snapshot = create_run_snapshot(config, args.ticket, runs_dir=runs_dir)
-        implementation = run_implementation_stage(config, snapshot.run_dir)
-        verification = (
-            run_verification_stage(config, snapshot.run_dir)
-            if implementation.successful
-            else None
-        )
-        review = (
-            run_review_stage(config, snapshot.run_dir)
-            if verification is not None and verification.successful
-            else None
+        result = run_ticket_lifecycle(
+            config,
+            args.ticket,
+            runs_dir=runs_dir,
         )
     except TicketInputError as error:
         print(f"Ticket input error: {error}", file=sys.stderr)
@@ -122,34 +104,12 @@ def _handle_run(args: argparse.Namespace) -> int:
     except RunPreflightError as error:
         print(format_preflight_result(error.result))
         return 1
-    except ImplementationError as error:
-        print(f"Implementation error: {error}", file=sys.stderr)
-        return 1
-    except VerificationError as error:
-        print(f"Verification error: {error}", file=sys.stderr)
-        return 1
-    except ReviewError as error:
-        print(f"Review error: {error}", file=sys.stderr)
-        return 1
     except RunError as error:
         print(f"Run error: {error}", file=sys.stderr)
         return 1
 
-    lines = [
-        f"Snapshot created for run {snapshot.run_record.run_id}.",
-        f"Run directory: {snapshot.run_dir}",
-        format_implementation_result(implementation),
-    ]
-    if verification is None:
-        lines.append("Verification was not attempted.")
-    else:
-        lines.append(format_verification_result(verification))
-    if review is None:
-        lines.append("Review was not attempted.")
-    else:
-        lines.append(format_review_result(review))
-    print("\n".join(lines))
-    return 0 if review is not None and review.successful else 1
+    print(format_lifecycle_result(result))
+    return 0 if result.successful else 1
 
 
 def _handle_status(args: argparse.Namespace) -> int:

@@ -119,10 +119,13 @@ class RunRecord:
     run_ticket_copy_path: str
     target_repository_path: str
     state: WorkflowState
+    last_completed_state: WorkflowState
     starting_branch: str
     baseline_sha: str
     current_correction_round: int
     max_correction_rounds: int
+    current_review_round: int
+    terminal_reason: str | None
     created_timestamp: str
     updated_timestamp: str
     schema_version: int = RUN_SCHEMA_VERSION
@@ -133,16 +136,28 @@ class RunRecord:
         state: WorkflowState,
         *,
         updated_timestamp: str,
+        last_completed_state: WorkflowState | None = None,
         current_correction_round: int | None = None,
+        current_review_round: int | None = None,
+        terminal_reason: str | None = None,
     ) -> RunRecord:
         return replace(
             self,
             state=state,
+            last_completed_state=(
+                state if last_completed_state is None else last_completed_state
+            ),
             current_correction_round=(
                 self.current_correction_round
                 if current_correction_round is None
                 else current_correction_round
             ),
+            current_review_round=(
+                self.current_review_round
+                if current_review_round is None
+                else current_review_round
+            ),
+            terminal_reason=terminal_reason,
             updated_timestamp=updated_timestamp,
         )
 
@@ -156,10 +171,13 @@ class RunRecord:
             "run_ticket_copy_path": self.run_ticket_copy_path,
             "target_repository_path": self.target_repository_path,
             "state": self.state.value,
+            "last_completed_state": self.last_completed_state.value,
             "starting_branch": self.starting_branch,
             "baseline_sha": self.baseline_sha,
             "current_correction_round": self.current_correction_round,
             "max_correction_rounds": self.max_correction_rounds,
+            "current_review_round": self.current_review_round,
+            "terminal_reason": self.terminal_reason,
             "created_timestamp": self.created_timestamp,
             "updated_timestamp": self.updated_timestamp,
         }
@@ -176,6 +194,12 @@ class RunRecord:
             "format",
             expected=RUN_RECORD_FORMAT,
         )
+        state = _require_workflow_state(data, "state")
+        last_completed_state = _optional_workflow_state(
+            data,
+            "last_completed_state",
+            default=state,
+        )
         return cls(
             schema_version=schema_version,
             format=format_value,
@@ -184,11 +208,21 @@ class RunRecord:
             original_ticket_path=_require_string(data, "original_ticket_path"),
             run_ticket_copy_path=_require_string(data, "run_ticket_copy_path"),
             target_repository_path=_require_string(data, "target_repository_path"),
-            state=WorkflowState(_require_string(data, "state")),
+            state=state,
+            last_completed_state=last_completed_state,
             starting_branch=_require_string(data, "starting_branch"),
             baseline_sha=_require_string(data, "baseline_sha"),
-            current_correction_round=_require_int(data, "current_correction_round"),
+            current_correction_round=_require_non_negative_int(
+                data,
+                "current_correction_round",
+            ),
             max_correction_rounds=_require_int(data, "max_correction_rounds"),
+            current_review_round=_optional_non_negative_int(
+                data,
+                "current_review_round",
+                default=0,
+            ),
+            terminal_reason=_optional_nullable_string(data, "terminal_reason"),
             created_timestamp=_require_string(data, "created_timestamp"),
             updated_timestamp=_require_string(data, "updated_timestamp"),
         )
@@ -231,10 +265,13 @@ def create_run_snapshot(
             run_ticket_copy_path=str(run_ticket_path.resolve()),
             target_repository_path=baseline_record.repository_path,
             state=WorkflowState.PREFLIGHT,
+            last_completed_state=WorkflowState.PREFLIGHT,
             starting_branch=baseline_record.branch,
             baseline_sha=baseline_record.head_sha,
             current_correction_round=0,
             max_correction_rounds=config.runner.max_correction_rounds,
+            current_review_round=0,
+            terminal_reason=None,
             created_timestamp=timestamp,
             updated_timestamp=timestamp,
         )
@@ -247,6 +284,7 @@ def create_run_snapshot(
         run_record = run_record.with_state(
             WorkflowState.SNAPSHOT,
             updated_timestamp=snapshot_timestamp,
+            last_completed_state=WorkflowState.SNAPSHOT,
         )
         save_run_record(run_record, run_record_path)
     except Exception:
@@ -324,12 +362,7 @@ def _timestamp(clock: Callable[[], datetime] | None) -> str:
     now = datetime.now(UTC) if clock is None else clock()
     if now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
-    return (
-        now.astimezone(UTC)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+    return now.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _run_id_prefix(timestamp: str) -> str:
@@ -451,6 +484,76 @@ def _require_int(data: dict[str, Any], key: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         raise RunError(f"Run record field must be an integer: {key}")
     return value
+
+
+def _require_non_negative_int(data: dict[str, Any], key: str) -> int:
+    value = _require_int(data, key)
+    if value < 0:
+        raise RunError(f"Run record field must be a non-negative integer: {key}")
+    return value
+
+
+def _optional_int(data: dict[str, Any], key: str, *, default: int) -> int:
+    if key not in data:
+        return default
+    value = data[key]
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise RunError(f"Run record field must be an integer: {key}")
+    return value
+
+
+def _optional_non_negative_int(data: dict[str, Any], key: str, *, default: int) -> int:
+    value = _optional_int(data, key, default=default)
+    if value < 0:
+        raise RunError(f"Run record field must be a non-negative integer: {key}")
+    return value
+
+
+def _optional_string(
+    data: dict[str, Any],
+    key: str,
+    *,
+    default: str,
+) -> str:
+    if key not in data:
+        return default
+    value = data[key]
+    if not isinstance(value, str) or not value:
+        raise RunError(f"Run record field must be a non-empty string: {key}")
+    return value
+
+
+def _optional_nullable_string(data: dict[str, Any], key: str) -> str | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise RunError(f"Run record field must be a non-empty string or null: {key}")
+    return value
+
+
+def _require_workflow_state(data: dict[str, Any], key: str) -> WorkflowState:
+    return _workflow_state(_require_string(data, key), key=key)
+
+
+def _optional_workflow_state(
+    data: dict[str, Any],
+    key: str,
+    *,
+    default: WorkflowState,
+) -> WorkflowState:
+    if key not in data:
+        return default
+    return _workflow_state(_optional_string(data, key, default=default.value), key=key)
+
+
+def _workflow_state(value: str, *, key: str) -> WorkflowState:
+    try:
+        return WorkflowState(value)
+    except ValueError as error:
+        raise RunError(
+            f"Run record field has unsupported workflow state: {key}"
+        ) from error
 
 
 def _require_exact_int(data: dict[str, Any], key: str, *, expected: int) -> int:

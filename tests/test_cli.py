@@ -24,7 +24,7 @@ def test_cli_help_succeeds(tmp_path):
     assert "config" in result.stdout
     assert "preflight" in result.stdout
     assert "run" in result.stdout
-    assert "correct" not in result.stdout
+    assert "bounded correction" in result.stdout
     assert "status" in result.stdout
 
 
@@ -93,10 +93,11 @@ def test_cli_run_invokes_fake_codex_and_runs_verification(tmp_path, monkeypatch)
     )
 
     assert result.returncode == 0
-    assert "Snapshot created for run" in result.stdout
-    assert "Implementation state: IMPLEMENT" in result.stdout
-    assert "Verification state: VERIFY" in result.stdout
-    assert "Review state: REVIEW" in result.stdout
+    assert "QDEB-003 - READY FOR HUMAN REVIEW" in result.stdout
+    assert "Verification:" in result.stdout
+    assert "  PASS" in result.stdout
+    assert "Review:" in result.stdout
+    assert "No files have been staged or committed." in result.stdout
     assert run_git(repo, "diff", "--name-only") == "file.txt"
     fake_record = json.loads(record_path.read_text(encoding="utf-8"))
     assert [sandbox_value(tuple(call["argv"])) for call in fake_record["calls"]] == [
@@ -136,10 +137,12 @@ def test_cli_verification_failure_overrides_agent_claimed_tests(tmp_path, monkey
     )
 
     assert result.returncode == 1
-    assert "Implementation state: IMPLEMENT" in result.stdout
-    assert "Verification state: CORRECT" in result.stdout
-    assert "Review was not attempted." in result.stdout
-    assert "runner-gate: FAIL" in result.stdout
+    assert "QDEB-003 - HUMAN REQUIRED" in result.stdout
+    assert "Verification:" in result.stdout
+    assert "  FAIL" in result.stdout
+    assert "Review:" in result.stdout
+    assert "  NOT RUN" in result.stdout
+    assert "Maximum corrective rounds exhausted" in result.stdout
 
 
 @pytest.mark.skipif(

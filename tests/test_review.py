@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
 
 import pytest
 
@@ -28,13 +28,12 @@ from ticket_automation.review import (
 )
 from ticket_automation.runs import create_run_snapshot, load_run_record, save_run_record
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ROUND_1 = "round-1"
 
 
 def fixed_clock() -> datetime:
-    return datetime(2026, 9, 11, 13, 5, 15, tzinfo=timezone.utc)
+    return datetime(2026, 9, 11, 13, 5, 15, tzinfo=UTC)
 
 
 @dataclass
@@ -102,7 +101,7 @@ def test_review_uses_read_only_sandbox_and_writes_round_one_artifacts(tmp_path):
     result = run_review_stage(config, run_dir, codex_runner=runner, clock=fixed_clock)
 
     assert result.successful
-    assert result.run_record.state == WorkflowState.REVIEW
+    assert result.run_record.state == WorkflowState.READY_FOR_HUMAN
     assert runner.command is not None
     assert sandbox_value(runner.command.argv) == Sandbox.READ_ONLY.value
     review_dir = run_dir / REVIEW_DIR_NAME / ROUND_1
@@ -110,9 +109,9 @@ def test_review_uses_read_only_sandbox_and_writes_round_one_artifacts(tmp_path):
     assert review_dir.joinpath("prompt.md").is_file()
     assert review_dir.joinpath("events.jsonl").is_file()
     assert review_dir.joinpath("stderr.log").is_file()
-    assert json.loads(review_dir.joinpath("result.json").read_text())[
-        "verdict"
-    ] == "PASS"
+    assert (
+        json.loads(review_dir.joinpath("result.json").read_text())["verdict"] == "PASS"
+    )
     assert review_dir.joinpath("stderr.log").read_text() == "review progress\n"
 
 
@@ -168,7 +167,7 @@ def test_pass_review_accepts_advisory_and_follow_up_observations(tmp_path):
         codex_runner=ReviewRunner(result=result_payload),
     )
 
-    assert result.run_record.state == WorkflowState.REVIEW
+    assert result.run_record.state == WorkflowState.READY_FOR_HUMAN
     assert result.required_findings == ()
     assert [item["disposition"] for item in result.review_result["findings"]] == [
         "ADVISORY",
@@ -329,7 +328,7 @@ def test_disposable_repository_does_not_require_earlier_ticket_history(tmp_path)
         codex_runner=ReviewRunner(result=review_result()),
     )
 
-    assert result.run_record.state == WorkflowState.REVIEW
+    assert result.run_record.state == WorkflowState.READY_FOR_HUMAN
     assert run_git(repo, "log", "--oneline").count("initial") == 1
 
 
@@ -375,9 +374,7 @@ def test_review_result_semantics_reject_contradictions():
             review_result(findings=[finding("R1-F1", disposition="REQUIRED")])
         )
     with pytest.raises(ReviewResultConsistencyError):
-        validate_review_result_semantics(
-            review_result(verdict="CORRECTIONS_REQUIRED")
-        )
+        validate_review_result_semantics(review_result(verdict="CORRECTIONS_REQUIRED"))
 
 
 def verified_run(
@@ -492,23 +489,26 @@ def finding(
 
 
 def event_stream(result: dict[str, object]) -> str:
-    return "\n".join(
-        [
-            json.dumps({"type": "thread.started", "thread_id": "thread"}),
-            json.dumps({"type": "turn.started"}),
-            json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {
-                        "id": "item_1",
-                        "type": "agent_message",
-                        "text": json.dumps(result),
-                    },
-                }
-            ),
-            json.dumps({"type": "turn.completed"}),
-        ]
-    ) + "\n"
+    return (
+        "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "thread"}),
+                json.dumps({"type": "turn.started"}),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "item_1",
+                            "type": "agent_message",
+                            "text": json.dumps(result),
+                        },
+                    }
+                ),
+                json.dumps({"type": "turn.completed"}),
+            ]
+        )
+        + "\n"
+    )
 
 
 def sandbox_value(argv: tuple[str, ...]) -> str:

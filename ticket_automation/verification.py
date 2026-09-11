@@ -26,6 +26,13 @@ VERIFICATION_SCHEMA_VERSION = 1
 VERIFICATION_ROUND_FORMAT = "ticket_automation.verification_round"
 VERIFICATION_DIR_NAME = "verification"
 CORRECTION_EXCERPT_CHARS = 4000
+_TERMINAL_STATES = frozenset(
+    {
+        WorkflowState.READY_FOR_HUMAN,
+        WorkflowState.HUMAN_REQUIRED,
+        WorkflowState.FAILED,
+    }
+)
 
 
 class VerificationError(RunError):
@@ -284,6 +291,10 @@ def run_verification_stage(
         updated_record = run_record.with_state(
             WorkflowState.HUMAN_REQUIRED,
             updated_timestamp=_timestamp(clock),
+            last_completed_state=WorkflowState.VERIFY,
+            terminal_reason=(
+                "Verification could not start from the recorded implementation state."
+            ),
         )
         save_run_record(updated_record, run_record_path)
         return VerificationStageResult(
@@ -326,7 +337,12 @@ def run_verification_stage(
         state = WorkflowState.VERIFY
         controller_message = "Verification passed; review can start."
 
-    updated_record = run_record.with_state(state, updated_timestamp=_timestamp(clock))
+    updated_record = run_record.with_state(
+        state,
+        updated_timestamp=_timestamp(clock),
+        last_completed_state=WorkflowState.VERIFY,
+        terminal_reason=controller_message if state in _TERMINAL_STATES else None,
+    )
     save_run_record(updated_record, run_record_path)
     return VerificationStageResult(
         run_dir=run_path,
