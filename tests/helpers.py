@@ -39,6 +39,15 @@ def implementation_result(status: str) -> dict[str, object]:
     }
 
 
+def review_result() -> dict[str, object]:
+    return {
+        "verdict": "PASS",
+        "summary": "fake review accepted the implementation",
+        "confidence": "HIGH",
+        "findings": [],
+    }
+
+
 def emit_result(result: dict[str, object]) -> None:
     print(json.dumps({"type": "thread.started", "thread_id": "fake-thread"}))
     print(json.dumps({"type": "turn.started"}))
@@ -60,17 +69,22 @@ def emit_result(result: dict[str, object]) -> None:
 prompt = sys.stdin.read()
 record_path = os.environ.get("TA_FAKE_CODEX_RECORD")
 if record_path:
-    pathlib.Path(record_path).write_text(
-        json.dumps({"argv": sys.argv[1:], "prompt": prompt}, indent=2),
-        encoding="utf-8",
-    )
+    path = pathlib.Path(record_path)
+    if path.is_file():
+        record = json.loads(path.read_text(encoding="utf-8"))
+    else:
+        record = {"calls": []}
+    record["calls"].append({"argv": sys.argv[1:], "prompt": prompt})
+    path.write_text(json.dumps(record, indent=2), encoding="utf-8")
 
 action = os.environ.get("TA_FAKE_CODEX_ACTION", "modify")
 if action == "fail":
     sys.stderr.write("fake codex failed\n")
     raise SystemExit(2)
 
-if action == "modify":
+if "--sandbox" in sys.argv and sys.argv[sys.argv.index("--sandbox") + 1] == "read-only":
+    emit_result(review_result())
+elif action == "modify":
     pathlib.Path("file.txt").write_text("implemented by fake codex\n", encoding="utf-8")
     emit_result(implementation_result("COMPLETED"))
 elif action == "untracked":

@@ -89,10 +89,15 @@ def test_cli_run_invokes_fake_codex_and_runs_verification(tmp_path, monkeypatch)
     assert "Snapshot created for run" in result.stdout
     assert "Implementation state: IMPLEMENT" in result.stdout
     assert "Verification state: VERIFY" in result.stdout
-    assert "No review has been attempted." in result.stdout
+    assert "Review state: REVIEW" in result.stdout
     assert run_git(repo, "diff", "--name-only") == "file.txt"
     fake_record = json.loads(record_path.read_text(encoding="utf-8"))
-    assert sandbox_value(tuple(fake_record["argv"])) == "workspace-write"
+    assert [
+        sandbox_value(tuple(call["argv"])) for call in fake_record["calls"]
+    ] == [
+        "workspace-write",
+        "read-only",
+    ]
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for run CLI tests")
@@ -126,6 +131,7 @@ def test_cli_verification_failure_overrides_agent_claimed_tests(tmp_path, monkey
     assert result.returncode == 1
     assert "Implementation state: IMPLEMENT" in result.stdout
     assert "Verification state: CORRECT" in result.stdout
+    assert "Review was not attempted." in result.stdout
     assert "runner-gate: FAIL" in result.stdout
 
 

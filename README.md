@@ -2,9 +2,9 @@
 
 TicketAutomation is a standalone Python project for coordinating automation around implementation tickets. It is independent of the repositories it works on: target projects are configured through local settings and are not part of this package.
 
-V1 is scoped to one implementation ticket at a time. The current scaffold establishes configuration, repository preflight, persistent run snapshots, a first writable implementation stage, deterministic verification gates, a CLI entry point, and shared models that later workflow tickets can build on.
+V1 is scoped to one implementation ticket at a time. The current scaffold establishes configuration, repository preflight, persistent run snapshots, a first writable implementation stage, deterministic verification gates, an independent read-only review stage, a CLI entry point, and shared models that later workflow tickets can build on.
 
-Human control remains explicit. TicketAutomation does not commit, push, change branches, stage files, reset work, stash work, or clean a target repository. The implementation agent may edit the working tree, and TicketAutomation verifies the branch, HEAD, and staging area after that writable boundary.
+Human control remains explicit. TicketAutomation does not commit, push, change branches, stage files, reset work, stash work, or clean a target repository. The implementation agent may edit the working tree, and TicketAutomation verifies the branch, HEAD, and staging area after that writable boundary. The review agent runs in a separate read-only Codex invocation and must not edit the repository.
 
 ## Configuration
 
@@ -36,13 +36,13 @@ Inspect the configured target repository before any writable automation runs:
 python -m ticket_automation preflight
 ```
 
-Create a persistent run record from a local Markdown ticket, invoke the implementation agent, and run the configured verification gates:
+Create a persistent run record from a local Markdown ticket, invoke the implementation agent, run the configured verification gates, and then run an independent review if verification passes:
 
 ```powershell
 python -m ticket_automation run tickets/example.md
 ```
 
-For this stage, `run` performs preflight, copies the ticket verbatim into `runs/<run-id>/ticket.md`, records the starting branch and baseline HEAD SHA, invokes Codex once with a `workspace-write` sandbox, then runs the configured verification commands. The Codex prompt, event stream, stderr log, and structured result are stored in `runs/<run-id>/implementation/`. Verification artifacts are stored in `runs/<run-id>/verification/`.
+For this stage, `run` performs preflight, copies the ticket verbatim into `runs/<run-id>/ticket.md`, records the starting branch and baseline HEAD SHA, invokes Codex once with a `workspace-write` sandbox, then runs the configured verification commands. If those deterministic gates pass, TicketAutomation invokes a fresh Codex reviewer with a `read-only` sandbox. Implementation artifacts are stored in `runs/<run-id>/implementation/`, verification artifacts are stored in `runs/<run-id>/verification/`, and review artifacts are stored in `runs/<run-id>/reviews/round-1/`.
 
 List known run records:
 
@@ -85,4 +85,14 @@ TicketAutomation has two validation levels. Implementation-agent targeted valida
 
 Runner deterministic acceptance gates are the configured `[[verification.commands]]` records. TicketAutomation runs those commands itself from the target repository directory, preserves stdout and stderr, and treats those results as authoritative for workflow acceptance. Commands are executed from argument arrays without a shell.
 
-The first verification attempt writes `runs/<run-id>/verification/round-0.json` and `runs/<run-id>/verification/round-0.log`. Later correction rounds can use `round-1`, `round-2`, and so on. Passing gates move the run to `VERIFY`, which is the temporary successful stop until review exists. Failing gates move the run to `CORRECT` and produce typed `VerificationFailure` correction reasons. Environment or process execution problems, such as a missing executable or timeout, move the run to `HUMAN_REQUIRED`.
+The first verification attempt writes `runs/<run-id>/verification/round-0.json` and `runs/<run-id>/verification/round-0.log`. Later correction rounds can use `round-1`, `round-2`, and so on. Passing gates move the run to `VERIFY`, which allows review to start. Failing gates move the run to `CORRECT` and produce typed `VerificationFailure` correction reasons. Environment or process execution problems, such as a missing executable or timeout, move the run to `HUMAN_REQUIRED`.
+
+## Review
+
+Review deliberately uses a separate Codex invocation from implementation. The reviewer receives `prompts/review.md`, the complete snapshotted ticket, baseline SHA, starting branch, current branch, deterministic verification results, and the implementation summary where available. The prompt instructs the reviewer to inspect the complete current working tree relative to the original baseline and to respect repository authority such as AGENTS.md, ADRs, contracts, validation rules, provenance rules, tests, documentation, and established implementation patterns.
+
+The structured result must match `schemas/review-result.schema.json` with one of `PASS`, `CORRECTIONS_REQUIRED`, or `HUMAN_REVIEW_REQUIRED`. `PASS` may include advisory or follow-up findings, but it must not include `REQUIRED` findings. `CORRECTIONS_REQUIRED` must include at least one `REQUIRED` finding. A schema-valid but contradictory result, such as `PASS` with a required finding, moves the run to `HUMAN_REQUIRED` without manufacturing a corrected verdict.
+
+Each review writes `prompt.md`, `events.jsonl`, `stderr.log`, and `result.json` under `runs/<run-id>/reviews/round-1/`. After the reviewer exits, TicketAutomation independently checks that the branch still matches the recorded starting branch, `HEAD` still equals the baseline SHA, and the staging area is empty. If any invariant changed, the run becomes `HUMAN_REQUIRED` and TicketAutomation does not reset or repair the repository.
+
+TA-007 is validated with disposable temporary Git repositories and mocked Codex executions. Earlier TicketAutomation development tickets may already have been manually reviewed and committed, so the review mechanism does not try to reconstruct or retroactively review TA-001 through TA-006.

@@ -325,7 +325,7 @@ def run_verification_stage(
         controller_message = "Verification failed; corrective work is required."
     else:
         state = WorkflowState.VERIFY
-        controller_message = "Verification passed; review has not been added yet."
+        controller_message = "Verification passed; review can start."
 
     updated_record = run_record.with_state(state, updated_timestamp=_timestamp(clock))
     save_run_record(updated_record, run_record_path)

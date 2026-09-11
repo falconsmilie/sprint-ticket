@@ -11,6 +11,7 @@ from .implementation import (
     run_implementation_stage,
 )
 from .preflight import format_preflight_result, run_preflight
+from .review import ReviewError, format_review_result, run_review_stage
 from .runs import (
     RUNS_DIR_NAME,
     RunError,
@@ -56,7 +57,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser(
         "run",
-        help="Create a ticket snapshot, run implementation, and run verification.",
+        help=(
+            "Create a ticket snapshot, run implementation, "
+            "run verification, and run review."
+        ),
     )
     run_parser.add_argument(
         "ticket",
@@ -107,6 +111,11 @@ def _handle_run(args: argparse.Namespace) -> int:
             if implementation.successful
             else None
         )
+        review = (
+            run_review_stage(config, snapshot.run_dir)
+            if verification is not None and verification.successful
+            else None
+        )
     except TicketInputError as error:
         print(f"Ticket input error: {error}", file=sys.stderr)
         return 2
@@ -118,6 +127,9 @@ def _handle_run(args: argparse.Namespace) -> int:
         return 1
     except VerificationError as error:
         print(f"Verification error: {error}", file=sys.stderr)
+        return 1
+    except ReviewError as error:
+        print(f"Review error: {error}", file=sys.stderr)
         return 1
     except RunError as error:
         print(f"Run error: {error}", file=sys.stderr)
@@ -132,11 +144,14 @@ def _handle_run(args: argparse.Namespace) -> int:
         lines.append("Verification was not attempted.")
     else:
         lines.append(format_verification_result(verification))
-        lines.append("No review has been attempted.")
+    if review is None:
+        lines.append("Review was not attempted.")
+    else:
+        lines.append(format_review_result(review))
     print(
         "\n".join(lines)
     )
-    return 0 if verification is not None and verification.successful else 1
+    return 0 if review is not None and review.successful else 1
 
 
 def _handle_status(args: argparse.Namespace) -> int:

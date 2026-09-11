@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ReviewResult",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": [
+        "PASS",
+        "CORRECTIONS_REQUIRED",
+        "HUMAN_REVIEW_REQUIRED"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "confidence": {
+      "type": "string",
+      "enum": [
+        "LOW",
+        "MEDIUM",
+        "HIGH"
+      ]
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/finding"
+      }
+    }
+  },
+  "required": [
+    "verdict",
+    "summary",
+    "confidence",
+    "findings"
+  ],
+  "$defs": {
+    "finding": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "LOW",
+            "MEDIUM",
+            "HIGH",
+            "CRITICAL"
+          ]
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "TICKET_COMPLETENESS",
+            "CORRECTNESS",
+            "FUNCTIONAL_CORRECTNESS",
+            "SCIENTIFIC_CORRECTNESS",
+            "ARCHITECTURE",
+            "PUBLIC_API",
+            "VALIDATION",
+            "PROVENANCE",
+            "TESTS",
+            "DOCUMENTATION",
+            "REGRESSION_RISK",
+            "SCOPE_DISCIPLINE",
+            "OTHER"
+          ]
+        },
+        "disposition": {
+          "type": "string",
+          "enum": [
+            "REQUIRED",
+            "ADVISORY",
+            "FOLLOW_UP"
+          ]
+        },
+        "scope_relation": {
+          "type": "string",
+          "enum": [
+            "TICKET",
+            "IMPLEMENTATION",
+            "REPOSITORY_AUTHORITY",
+            "OUT_OF_SCOPE",
+            "AMBIGUOUS"
+          ]
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence": {
+          "type": "string",
+          "minLength": 1
+        },
+        "required_change": {
+          "type": "string",
+          "minLength": 1
+        },
+        "acceptance_criteria": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "required": [
+        "id",
+        "severity",
+        "category",
+        "disposition",
+        "scope_relation",
+        "title",
+        "description",
+        "evidence",
+        "required_change",
+        "acceptance_criteria"
+      ]
+    }
+  }
+}
