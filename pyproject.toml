@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ticket-automation"
+version = "0.1.0"
+description = "A standalone assistant runner for automating one implementation ticket at a time."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "TicketAutomation contributors" }]
+dependencies = []
+
+[project.scripts]
+ticket-automation = "ticket_automation.cli:main"

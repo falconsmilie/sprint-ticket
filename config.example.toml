@@ -1,0 +1,21 @@
+[project]
+name = "PhosPy"
+repo = "C:/Projects/phospy"
+protected_branches = ["main", "master"]
+
+[runner]
+max_correction_rounds = 3
+
+[codex]
+executable = "codex"
+implementation_sandbox = "workspace-write"
+review_sandbox = "read-only"
+
+[[verification.commands]]
+name = "tests"
+argv = ["python", "-m", "pytest"]
+
+[[verification.commands]]
+name = "typing"
+argv = ["pyright"]
+
