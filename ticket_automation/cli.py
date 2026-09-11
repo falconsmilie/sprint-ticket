@@ -1,10 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 from .config import ConfigError, format_config_summary, load_config
 from .preflight import format_preflight_result, run_preflight
+from .runs import (
+    RUNS_DIR_NAME,
+    RunError,
+    RunPreflightError,
+    TicketInputError,
+    create_run_snapshot,
+    format_status,
+    list_run_records,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -34,6 +44,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     preflight_parser.set_defaults(handler=_handle_preflight)
 
+    run_parser = subparsers.add_parser(
+        "run",
+        help="Create a ticket snapshot and baseline audit record.",
+    )
+    run_parser.add_argument(
+        "ticket",
+        type=Path,
+        help="Local Markdown ticket file to copy into the run directory.",
+    )
+    run_parser.set_defaults(handler=_handle_run)
+
+    status_parser = subparsers.add_parser(
+        "status",
+        help="List known ticket automation runs.",
+    )
+    status_parser.set_defaults(handler=_handle_status)
+
     return parser
 
 
@@ -57,3 +84,37 @@ def _handle_preflight(args: argparse.Namespace) -> int:
     result = run_preflight(config)
     print(format_preflight_result(result))
     return 0 if result.passed else 1
+
+
+def _handle_run(args: argparse.Namespace) -> int:
+    config = load_config(args.config_dir)
+    runs_dir = args.config_dir / RUNS_DIR_NAME
+    try:
+        result = create_run_snapshot(config, args.ticket, runs_dir=runs_dir)
+    except TicketInputError as error:
+        print(f"Ticket input error: {error}", file=sys.stderr)
+        return 2
+    except RunPreflightError as error:
+        print(format_preflight_result(error.result))
+        return 1
+    except RunError as error:
+        print(f"Run error: {error}", file=sys.stderr)
+        return 1
+
+    print(
+        "\n".join(
+            [
+                f"Snapshot created for run {result.run_record.run_id}.",
+                f"Run directory: {result.run_dir}",
+                "State: SNAPSHOT",
+                "No implementation has been attempted; Codex was not invoked.",
+            ]
+        )
+    )
+    return 0
+
+
+def _handle_status(args: argparse.Namespace) -> int:
+    runs_dir = args.config_dir / RUNS_DIR_NAME
+    print(format_status(list_run_records(runs_dir), runs_dir=runs_dir))
+    return 0

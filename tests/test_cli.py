@@ -17,6 +17,8 @@ def test_cli_help_succeeds(tmp_path):
     assert result.returncode == 0
     assert "config" in result.stdout
     assert "preflight" in result.stdout
+    assert "run" in result.stdout
+    assert "status" in result.stdout
 
 
 def test_cli_config_output(tmp_path):
@@ -60,3 +62,57 @@ def test_cli_preflight_failure_returns_nonzero(tmp_path):
     assert "Codex CLI" in result.stdout
     assert "ticket-automation-missing-codex" in result.stdout
     assert "PREFLIGHT FAILED" in result.stdout
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for run CLI tests")
+def test_cli_run_creates_snapshot_and_stops_before_implementation(tmp_path):
+    config_dir = tmp_path / "config"
+    repo = create_git_repo(tmp_path / "repo")
+    ticket = tmp_path / "QDEB-003.md"
+    ticket.write_text("# Ticket\n\nDo the thing.\n", encoding="utf-8")
+    config_dir.mkdir()
+    write_preflight_config(config_dir, repo)
+
+    result = run_cli("--config-dir", str(config_dir), "run", str(ticket), cwd=config_dir)
+
+    assert result.returncode == 0
+    assert "Snapshot created for run" in result.stdout
+    assert "State: SNAPSHOT" in result.stdout
+    assert "No implementation has been attempted" in result.stdout
+    assert "Codex was not invoked" in result.stdout
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for status CLI tests")
+def test_cli_status_reads_multiple_run_records(tmp_path):
+    config_dir = tmp_path / "config"
+    repo = create_git_repo(tmp_path / "repo")
+    first_ticket = tmp_path / "QDEB-003.md"
+    second_ticket = tmp_path / "QDEB-004.md"
+    first_ticket.write_text("# First\n", encoding="utf-8")
+    second_ticket.write_text("# Second\n", encoding="utf-8")
+    config_dir.mkdir()
+    write_preflight_config(config_dir, repo)
+
+    first_result = run_cli(
+        "--config-dir",
+        str(config_dir),
+        "run",
+        str(first_ticket),
+        cwd=config_dir,
+    )
+    second_result = run_cli(
+        "--config-dir",
+        str(config_dir),
+        "run",
+        str(second_ticket),
+        cwd=config_dir,
+    )
+    status_result = run_cli("--config-dir", str(config_dir), "status", cwd=config_dir)
+
+    assert first_result.returncode == 0
+    assert second_result.returncode == 0
+    assert status_result.returncode == 0
+    assert "QDEB-003" in status_result.stdout
+    assert "QDEB-004" in status_result.stdout
+    assert "SNAPSHOT" in status_result.stdout
+    assert "feature/example" in status_result.stdout

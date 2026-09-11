@@ -71,6 +71,7 @@ def make_config(
     *,
     protected_branches: tuple[str, ...] = ("main", "master"),
     codex_executable: str = sys.executable,
+    max_correction_rounds: int = 1,
 ) -> AppConfig:
     executable = (
         Path(codex_executable).as_posix()
@@ -83,7 +84,7 @@ def make_config(
             repo=repo,
             protected_branches=protected_branches,
         ),
-        runner=RunnerSettings(max_correction_rounds=1),
+        runner=RunnerSettings(max_correction_rounds=max_correction_rounds),
         codex=CodexSettings(
             executable=executable,
             implementation_sandbox="workspace-write",
@@ -106,6 +107,7 @@ def write_preflight_config(
     repo: Path,
     *,
     codex: str | None = None,
+    max_correction_rounds: int = 1,
 ) -> None:
     executable = codex or Path(sys.executable).as_posix()
     config_dir.joinpath("config.example.toml").write_text(
@@ -117,7 +119,7 @@ def write_preflight_config(
                 'protected_branches = ["main", "master"]',
                 "",
                 "[runner]",
-                "max_correction_rounds = 1",
+                f"max_correction_rounds = {max_correction_rounds}",
                 "",
                 "[codex]",
                 f"executable = {json.dumps(executable)}",
