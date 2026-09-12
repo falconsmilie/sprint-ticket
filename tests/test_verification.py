@@ -55,14 +55,14 @@ class TimeoutRunner:
         )
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for verification tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for verification tests"
+)
 def test_one_passing_command_moves_run_to_verify_and_writes_round_zero(tmp_path):
     repo, run_dir = implementation_ready_run(tmp_path)
     config = make_config(
         repo,
-        verification_commands=(
-            python_gate("tests", "print('verification passed')"),
-        ),
+        verification_commands=(python_gate("tests", "print('verification passed')"),),
     )
 
     result = run_verification_stage(config, run_dir, clock=fixed_clock)
@@ -80,7 +80,9 @@ def test_one_passing_command_moves_run_to_verify_and_writes_round_zero(tmp_path)
     assert data["commands"][0]["stdout"] == "verification passed\n"
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for verification tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for verification tests"
+)
 @pytest.mark.parametrize(
     "state",
     [
@@ -102,7 +104,9 @@ def test_verification_rejects_untrusted_starting_states(tmp_path, state):
         run_verification_stage(make_config(repo), run_dir)
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for verification tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for verification tests"
+)
 def test_multiple_passing_commands_all_run(tmp_path):
     repo, run_dir = implementation_ready_run(tmp_path)
     config = make_config(
@@ -126,7 +130,9 @@ def test_multiple_passing_commands_all_run(tmp_path):
     ]
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for verification tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for verification tests"
+)
 @pytest.mark.parametrize(
     ("failing_indexes", "expected_failed"),
     [
@@ -153,7 +159,9 @@ def test_failing_gates_move_run_to_correct_and_preserve_all_failures(
 
     assert result.run_record.state == WorkflowState.CORRECT
     assert result.round_result.status == VerificationStatus.FAIL
-    assert [command.name for command in result.round_result.failed_commands] == expected_failed
+    assert [
+        command.name for command in result.round_result.failed_commands
+    ] == expected_failed
     assert len(result.round_result.commands) == 3
     assert [
         reason.to_dict()["kind"] for reason in result.round_result.correction_reasons
@@ -165,7 +173,9 @@ def test_failing_gates_move_run_to_correct_and_preserve_all_failures(
     ] == expected_failed
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for verification tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for verification tests"
+)
 def test_command_timeout_is_an_error_and_preserves_partial_output(tmp_path):
     repo, run_dir = implementation_ready_run(tmp_path)
     config = make_config(
@@ -193,7 +203,9 @@ def test_command_timeout_is_an_error_and_preserves_partial_output(tmp_path):
     assert runner.timeout_seconds == 3
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for verification tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for verification tests"
+)
 def test_passing_command_that_mutates_worktree_becomes_human_required(tmp_path):
     repo, run_dir = implementation_ready_run(tmp_path)
     config = make_config(
@@ -224,7 +236,9 @@ def test_passing_command_that_mutates_worktree_becomes_human_required(tmp_path):
     )
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for verification tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for verification tests"
+)
 def test_executable_unavailable_is_an_error_not_a_correction_reason(tmp_path):
     repo, run_dir = implementation_ready_run(tmp_path)
     config = make_config(
@@ -248,7 +262,9 @@ def test_executable_unavailable_is_an_error_not_a_correction_reason(tmp_path):
     assert result.round_result.correction_reasons == ()
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for verification tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for verification tests"
+)
 def test_stdout_and_stderr_are_captured_for_successful_commands(tmp_path):
     repo, run_dir = implementation_ready_run(tmp_path)
     config = make_config(
@@ -274,7 +290,9 @@ def test_stdout_and_stderr_are_captured_for_successful_commands(tmp_path):
     assert "err" in result.round_result.log_path.read_text(encoding="utf-8")
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for verification tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for verification tests"
+)
 def test_arguments_are_preserved_without_shell_interpretation(tmp_path):
     repo, run_dir = implementation_ready_run(tmp_path)
     config = make_config(
@@ -307,7 +325,9 @@ def test_arguments_are_preserved_without_shell_interpretation(tmp_path):
     assert command.stdout == "two words|&&|$HOME\n"
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for verification tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for verification tests"
+)
 def test_repository_is_used_as_command_cwd(tmp_path):
     repo, run_dir = implementation_ready_run(tmp_path)
     config = make_config(
@@ -339,7 +359,9 @@ def test_repository_is_used_as_command_cwd(tmp_path):
     assert command.stdout == f"{repo.name}\n"
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for verification tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for verification tests"
+)
 def test_correction_reason_contains_gate_command_summary_output_and_exit_code(tmp_path):
     repo, run_dir = implementation_ready_run(tmp_path)
     config = make_config(
@@ -362,9 +384,7 @@ def test_correction_reason_contains_gate_command_summary_output_and_exit_code(tm
     assert reason.log_path == run_dir / "verification" / "round-0.log"
     data = json.loads(result.round_result.json_path.read_text(encoding="utf-8"))
     assert data["correction_reasons"][0]["kind"] == "VerificationFailure"
-    assert "ReviewFinding" not in {
-        item["kind"] for item in data["correction_reasons"]
-    }
+    assert "ReviewFinding" not in {item["kind"] for item in data["correction_reasons"]}
 
 
 def test_correction_reason_kinds_distinguish_review_findings():
@@ -375,15 +395,18 @@ def test_correction_reason_kinds_distinguish_review_findings():
     )
 
     assert finding.to_dict()["kind"] == "ReviewFinding"
-    assert VerificationFailure(
-        gate_name="tests",
-        command=("pytest",),
-        failure_summary="tests failed",
-        stdout_excerpt="",
-        stderr_excerpt="",
-        exit_code=1,
-        log_path=Path("round-0.log"),
-    ).to_dict()["kind"] == "VerificationFailure"
+    assert (
+        VerificationFailure(
+            gate_name="tests",
+            command=("pytest",),
+            failure_summary="tests failed",
+            stdout_excerpt="",
+            stderr_excerpt="",
+            exit_code=1,
+            log_path=Path("round-0.log"),
+        ).to_dict()["kind"]
+        == "VerificationFailure"
+    )
 
 
 def implementation_ready_run(tmp_path):

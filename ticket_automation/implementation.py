@@ -129,6 +129,12 @@ def run_implementation_stage(
             clock=clock,
         )
 
+    active_record = run_record.with_state(
+        WorkflowState.IMPLEMENT,
+        updated_timestamp=_timestamp(clock),
+        last_completed_state=WorkflowState.SNAPSHOT,
+    )
+    save_run_record(active_record, run_record_path)
     prompt = _render_implementation_prompt(ticket_text)
 
     try:
@@ -144,7 +150,7 @@ def run_implementation_stage(
     except CodexExecutionFailure as error:
         safety_violations = _inspect_safety(
             repository,
-            run_record,
+            active_record,
             phase=_SafetyInspectionPhase.AFTER_IMPLEMENTATION,
         )
         state = (
@@ -156,7 +162,7 @@ def run_implementation_stage(
             else error.execution.failure_message or str(error)
         )
         return _finish(
-            run_record=run_record,
+            run_record=active_record,
             run_record_path=run_record_path,
             run_dir=run_path,
             artifact_directory=implementation_dir,
@@ -174,12 +180,12 @@ def run_implementation_stage(
     agent_result = _require_agent_result(execution.structured_result)
     safety_violations = _inspect_safety(
         repository,
-        run_record,
+        active_record,
         phase=_SafetyInspectionPhase.AFTER_IMPLEMENTATION,
     )
     if safety_violations:
         return _finish(
-            run_record=run_record,
+            run_record=active_record,
             run_record_path=run_record_path,
             run_dir=run_path,
             artifact_directory=implementation_dir,
@@ -195,10 +201,10 @@ def run_implementation_stage(
         )
 
     try:
-        changed_files = _changed_files(repository, run_record.baseline_sha)
+        changed_files = _changed_files(repository, active_record.baseline_sha)
     except ImplementationError as error:
         return _finish(
-            run_record=run_record,
+            run_record=active_record,
             run_record_path=run_record_path,
             run_dir=run_path,
             artifact_directory=implementation_dir,
@@ -215,7 +221,7 @@ def run_implementation_stage(
     agent_status = agent_result["status"]
     if agent_status == "BLOCKED":
         return _finish(
-            run_record=run_record,
+            run_record=active_record,
             run_record_path=run_record_path,
             run_dir=run_path,
             artifact_directory=implementation_dir,
@@ -232,7 +238,7 @@ def run_implementation_stage(
 
     if not changed_files:
         return _finish(
-            run_record=run_record,
+            run_record=active_record,
             run_record_path=run_record_path,
             run_dir=run_path,
             artifact_directory=implementation_dir,
@@ -251,11 +257,11 @@ def run_implementation_stage(
         patch_path, diff_stats_path = _capture_diff(
             repository,
             run_path,
-            run_record.baseline_sha,
+            active_record.baseline_sha,
         )
     except ImplementationError as error:
         return _finish(
-            run_record=run_record,
+            run_record=active_record,
             run_record_path=run_record_path,
             run_dir=run_path,
             artifact_directory=implementation_dir,
@@ -270,7 +276,7 @@ def run_implementation_stage(
             clock=clock,
         )
     return _finish(
-        run_record=run_record,
+        run_record=active_record,
         run_record_path=run_record_path,
         run_dir=run_path,
         artifact_directory=implementation_dir,
@@ -571,12 +577,7 @@ def _timestamp(clock: Callable[[], datetime] | None) -> str:
     now = datetime.now(UTC) if clock is None else clock()
     if now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
-    return (
-        now.astimezone(UTC)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+    return now.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 __all__ = [

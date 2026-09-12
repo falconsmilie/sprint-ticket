@@ -2,7 +2,7 @@
 
 TicketAutomation is a standalone Python project for coordinating automation around implementation tickets. It is independent of the repositories it works on: target projects are configured through local settings and are not part of this package.
 
-V1 is scoped to one implementation ticket at a time. TicketAutomation now runs the complete mechanical loop for one ticket: preflight, snapshot, implementation, deterministic verification, independent review, bounded correction, reverification, and fresh rereview until the run reaches `READY_FOR_HUMAN`, `HUMAN_REQUIRED`, or `FAILED`.
+V1 is scoped to one implementation ticket at a time. TicketAutomation now runs the complete mechanical loop for one ticket: preflight, snapshot, implementation, deterministic verification, independent review, bounded correction, reverification, fresh rereview, final reporting, and audit handoff until the run reaches `READY_FOR_HUMAN`, `HUMAN_REQUIRED`, or `FAILED`.
 
 Human control remains explicit. TicketAutomation does not commit, push, change branches, stage files, reset work, stash work, or clean a target repository. The implementation agent may edit the working tree, and TicketAutomation verifies the branch, HEAD, and staging area after that writable boundary. The review agent runs in a separate read-only Codex invocation and must not edit the repository.
 
@@ -42,12 +42,18 @@ Create a persistent run record from a local Markdown ticket and run the complete
 python -m ticket_automation run tickets/example.md
 ```
 
-The `run` command performs preflight, copies the ticket verbatim into `runs/<run-id>/ticket.md`, records the starting branch and baseline HEAD SHA, invokes Codex with a `workspace-write` sandbox for implementation, runs all configured deterministic verification commands, and invokes a fresh Codex reviewer with a `read-only` sandbox when verification passes. A passing review transitions directly to `READY_FOR_HUMAN` with a concise terminal handoff. Final rich reporting, `final-report.md`, and safe resumability are still planned for TA-010.
+The `run` command performs preflight, copies the ticket verbatim into `runs/<run-id>/ticket.md`, records the starting branch and baseline HEAD SHA, invokes Codex with a `workspace-write` sandbox for implementation, runs all configured deterministic verification commands, and invokes a fresh Codex reviewer with a `read-only` sandbox when verification passes. A passing review transitions through `REPORT`, writes `diffs/final.patch` and `final-report.md`, then reaches `READY_FOR_HUMAN` only if final verification, review, and Git safety evidence still hold.
 
 List known run records:
 
 ```powershell
 python -m ticket_automation status
+```
+
+Resume a non-terminal run from an explicitly safe persisted checkpoint:
+
+```powershell
+python -m ticket_automation resume <run-id>
 ```
 
 The verification commands in `config.example.toml` are examples only. They are not assumed to be the final commands for any target repository. Each command uses an argument array and an explicit timeout:
@@ -69,7 +75,9 @@ The target repository must start clean. TicketAutomation deliberately does not s
 
 Run snapshots are stored under `runs/`. A run ID uses a timestamp plus a sanitized ticket identifier, such as `20260911-130512_QDEB-003`. Existing run directories are not overwritten; a numeric suffix is added if a timestamp collision occurs.
 
-Each run directory contains `run.json`, `ticket.md`, and `baseline.json`. These records are enough to reconstruct the original ticket boundary for later workflow stages: the original ticket path, the copied ticket path, the target repository path, the starting branch, the baseline HEAD SHA, the current state, the last completed state, correction and review round counters, timestamps, and a terminal reason when the run reaches `READY_FOR_HUMAN`, `HUMAN_REQUIRED`, or `FAILED`.
+Each run directory contains `run.json`, `ticket.md`, and `baseline.json`. These records are enough to reconstruct the original ticket boundary for later workflow stages: the original ticket path, the copied ticket path, the target repository path, the starting branch, the baseline HEAD SHA, the current state, the last completed state, correction and review round counters, timestamps, and a terminal reason when the run reaches `HUMAN_REQUIRED` or `FAILED`.
+
+A successful run also contains `diffs/final.patch` and `final-report.md`. The final patch is always relative to the original baseline SHA and the complete current working tree. The final report separates controller-observed facts from implementation-agent claims, so runner verification and Git evidence are not confused with agent-reported targeted tests.
 
 ## Mechanical V1 Loop
 
@@ -81,6 +89,7 @@ PREFLIGHT
   -> IMPLEMENT
   -> VERIFY
   -> REVIEW
+  -> REPORT
   -> READY_FOR_HUMAN
 ```
 
@@ -89,6 +98,14 @@ If deterministic verification fails, TicketAutomation skips review and generates
 Verification-driven and review-driven corrections share the same `[runner].max_correction_rounds` limit. With the default value of `3`, TicketAutomation allows implementation, review 1, correction 1, review 2, correction 2, review 3, correction 3, and review 4. If review 4 still requires correction, the run becomes `HUMAN_REQUIRED`; correction round 4 is not started.
 
 Python owns all orchestration decisions. Codex may edit source files during writable implementation or correction phases, and Codex may return structured implementation and review judgments. TicketAutomation decides transitions from typed state only: implementation status, deterministic verification results, review verdict, correction count, and Git safety checks. It does not infer acceptance or correction needs from prose, stdout, reviewer narrative, or summary wording.
+
+## Final Reporting And Resume
+
+`REPORT` is a read-only target-repository phase. It gathers already persisted evidence, captures the final Git state, writes `runs/<run-id>/diffs/final.patch`, writes `runs/<run-id>/final-report.md`, and prints a concise terminal handoff. It does not stage files, commit, switch branches, or alter target source code.
+
+`READY_FOR_HUMAN` is entered only when deterministic verification currently passes, the final independent review verdict is `PASS`, the current source diff still matches the last verified writable checkpoint, Git safety invariants still hold, and both final report artifacts were persisted. `HUMAN_REQUIRED` and `FAILED` runs get a best-effort report where enough state exists.
+
+`resume <run-id>` resumes only from explicit checkpoints recorded in `run.json` and the run artifacts. It does not infer safety from a run directory alone. If implementation or correction was interrupted after a writable phase was marked active but before completion was proven, resume stops at `HUMAN_REQUIRED` and explains that the working tree may contain partial modifications. Interrupted read-only review can be rerun with a fresh review when repository state and verification evidence still match the checkpoint.
 
 ## Implementation Stage
 
@@ -128,4 +145,8 @@ After every writable correction invocation, TicketAutomation independently verif
 
 Completed corrections capture `runs/<run-id>/diffs/after-correction-<round>.patch`. That patch is always the full diff from the original baseline SHA to the complete current working tree, including valid existing implementation work, rather than only the incremental correction delta. The next step is always deterministic verification before any further review.
 
-Development through TA-009 may still use manual human review of TicketAutomation changes. The tool itself is operational as a one-ticket runner, while TA-010 remains the first recommended candidate for optional TicketAutomation dogfooding and will add the richer final report and resumability work.
+## V1 Safety Boundary
+
+V1 does not create branches, switch branches, stage files, commit, amend commits, reset, stash, clean, push, merge, retrieve GitHub issues, update GitHub issues, orchestrate multiple tickets, orchestrate epics, manage releases, create pull requests, or perform automatic acceptance.
+
+After `READY_FOR_HUMAN`, the user still inspects the final diff, accepts or rejects the implementation, commits manually if accepted, and selects the next ticket. TicketAutomation is an audit-producing assistant, not the final authority.

@@ -73,7 +73,9 @@ class MutatingRunner:
         )
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for implementation tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
 def test_prompt_contains_full_original_ticket_verbatim(tmp_path):
     repo = create_git_repo(tmp_path / "repo")
     ticket = tmp_path / "TA-005.md"
@@ -112,7 +114,9 @@ def test_prompt_contains_full_original_ticket_verbatim(tmp_path):
     assert "Do not reset or revert existing work." in prompt
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for implementation tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
 def test_completed_implementation_is_accepted_and_artifacts_are_stored(tmp_path):
     repo, run_dir, config = snapshot(tmp_path)
     runner = MutatingRunner(
@@ -142,13 +146,16 @@ def test_completed_implementation_is_accepted_and_artifacts_are_stored(tmp_path)
     assert implementation_dir.joinpath("prompt.md").is_file()
     assert implementation_dir.joinpath("events.jsonl").is_file()
     assert implementation_dir.joinpath("stderr.log").is_file()
-    assert json.loads(implementation_dir.joinpath("result.json").read_text())[
-        "status"
-    ] == "COMPLETED"
+    assert (
+        json.loads(implementation_dir.joinpath("result.json").read_text())["status"]
+        == "COMPLETED"
+    )
     assert result.changed_files == ("file.txt",)
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for implementation tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
 def test_snapshotted_ticket_bytes_are_preserved_in_prompt_artifact(tmp_path):
     repo = create_git_repo(tmp_path / "repo")
     ticket = tmp_path / "TA-005.md"
@@ -181,7 +188,9 @@ def test_snapshotted_ticket_bytes_are_preserved_in_prompt_artifact(tmp_path):
     assert ticket_bytes in prompt_bytes
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for implementation tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
 def test_dirty_worktree_before_implementation_blocks_without_invoking_codex(tmp_path):
     repo, run_dir, config = snapshot(tmp_path)
     repo.joinpath("file.txt").write_text("preexisting drift\n", encoding="utf-8")
@@ -197,7 +206,9 @@ def test_dirty_worktree_before_implementation_blocks_without_invoking_codex(tmp_
     assert run_git(repo, "diff", "--name-only") == "file.txt"
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for implementation tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
 def test_changed_branch_before_implementation_blocks_without_invoking_codex(tmp_path):
     repo, run_dir, config = snapshot(tmp_path)
     run_git(repo, "checkout", "-b", "preexisting-branch")
@@ -212,7 +223,9 @@ def test_changed_branch_before_implementation_blocks_without_invoking_codex(tmp_
     assert run_git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "preexisting-branch"
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for implementation tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
 def test_wrong_run_state_is_rejected_before_invocation(tmp_path):
     _repo, run_dir, config = snapshot(tmp_path)
     run_record_path = run_dir / "run.json"
@@ -230,7 +243,9 @@ def test_wrong_run_state_is_rejected_before_invocation(tmp_path):
         )
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for implementation tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
 def test_baseline_mismatch_is_rejected_before_invocation(tmp_path):
     _repo, run_dir, config = snapshot(tmp_path)
     baseline_path = run_dir / "baseline.json"
@@ -246,7 +261,9 @@ def test_baseline_mismatch_is_rejected_before_invocation(tmp_path):
         )
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for implementation tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
 def test_blocked_result_becomes_human_required_and_preserves_explanation(tmp_path):
     _repo, run_dir, config = snapshot(tmp_path)
     runner = MutatingRunner(result=implementation_result(status="BLOCKED"))
@@ -262,7 +279,9 @@ def test_blocked_result_becomes_human_required_and_preserves_explanation(tmp_pat
     assert "BLOCKED" in result.controller_message
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for implementation tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
 def test_changed_head_is_human_required(tmp_path):
     _repo, run_dir, config = snapshot(tmp_path)
 
@@ -274,17 +293,21 @@ def test_changed_head_is_human_required(tmp_path):
     result = run_implementation_stage(
         config,
         run_dir,
-        codex_runner=MutatingRunner(result=implementation_result(), mutation=commit_change),
+        codex_runner=MutatingRunner(
+            result=implementation_result(), mutation=commit_change
+        ),
     )
 
     assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
     assert "HEAD" in {violation.name for violation in result.safety_violations}
-    assert run_git(Path(result.run_record.target_repository_path), "rev-parse", "HEAD") != (
-        result.run_record.baseline_sha
-    )
+    assert run_git(
+        Path(result.run_record.target_repository_path), "rev-parse", "HEAD"
+    ) != (result.run_record.baseline_sha)
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for implementation tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
 def test_changed_branch_is_human_required(tmp_path):
     _repo, run_dir, config = snapshot(tmp_path)
 
@@ -299,12 +322,17 @@ def test_changed_branch_is_human_required(tmp_path):
 
     assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
     assert "branch" in {violation.name for violation in result.safety_violations}
-    assert run_git(Path(result.run_record.target_repository_path), "rev-parse", "--abbrev-ref", "HEAD") == (
-        "agent-branch"
-    )
+    assert run_git(
+        Path(result.run_record.target_repository_path),
+        "rev-parse",
+        "--abbrev-ref",
+        "HEAD",
+    ) == ("agent-branch")
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for implementation tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
 def test_staged_files_are_human_required(tmp_path):
     _repo, run_dir, config = snapshot(tmp_path)
 
@@ -315,14 +343,18 @@ def test_staged_files_are_human_required(tmp_path):
     result = run_implementation_stage(
         config,
         run_dir,
-        codex_runner=MutatingRunner(result=implementation_result(), mutation=stage_change),
+        codex_runner=MutatingRunner(
+            result=implementation_result(), mutation=stage_change
+        ),
     )
 
     assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
     assert "staging" in {violation.name for violation in result.safety_violations}
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for implementation tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
 def test_unstaged_source_changes_are_accepted(tmp_path):
     _repo, run_dir, config = snapshot(tmp_path)
 
@@ -342,7 +374,9 @@ def test_unstaged_source_changes_are_accepted(tmp_path):
     assert result.safety_violations == ()
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for implementation tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
 def test_no_change_completed_implementation_is_human_required(tmp_path):
     _repo, run_dir, config = snapshot(tmp_path)
 
@@ -357,7 +391,9 @@ def test_no_change_completed_implementation_is_human_required(tmp_path):
     assert "without repository changes" in result.controller_message
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for implementation tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
 def test_patch_and_diff_statistics_are_captured_from_git(tmp_path):
     _repo, run_dir, config = snapshot(tmp_path)
 
@@ -380,7 +416,9 @@ def test_patch_and_diff_statistics_are_captured_from_git(tmp_path):
     assert "file.txt" in result.diff_stats_path.read_text()
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for implementation tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
 def test_untracked_files_are_accepted_and_included_in_patch(tmp_path):
     _repo, run_dir, config = snapshot(tmp_path)
 
@@ -405,7 +443,9 @@ def test_untracked_files_are_accepted_and_included_in_patch(tmp_path):
     assert "added.txt" in result.diff_stats_path.read_text()
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for implementation tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
 def test_process_failure_becomes_failed_state(tmp_path):
     _repo, run_dir, config = snapshot(tmp_path)
     runner = MutatingRunner(returncode=2, stderr="boom\n")
@@ -414,7 +454,9 @@ def test_process_failure_becomes_failed_state(tmp_path):
 
     assert result.run_record.state == WorkflowState.FAILED
     assert result.codex_execution.failure_message == "Codex exited with code 2."
-    assert result.codex_execution.stderr_log_path.read_text(encoding="utf-8") == "boom\n"
+    assert (
+        result.codex_execution.stderr_log_path.read_text(encoding="utf-8") == "boom\n"
+    )
     assert not result.codex_execution.result_json_path.exists()
 
 
@@ -478,23 +520,26 @@ def implementation_result(status: str = "COMPLETED") -> dict[str, object]:
 
 
 def event_stream(result: dict[str, object]) -> str:
-    return "\n".join(
-        [
-            json.dumps({"type": "thread.started", "thread_id": "thread"}),
-            json.dumps({"type": "turn.started"}),
-            json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {
-                        "id": "item_1",
-                        "type": "agent_message",
-                        "text": json.dumps(result),
-                    },
-                }
-            ),
-            json.dumps({"type": "turn.completed"}),
-        ]
-    ) + "\n"
+    return (
+        "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "thread"}),
+                json.dumps({"type": "turn.started"}),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "item_1",
+                            "type": "agent_message",
+                            "text": json.dumps(result),
+                        },
+                    }
+                ),
+                json.dumps({"type": "turn.completed"}),
+            ]
+        )
+        + "\n"
+    )
 
 
 def sandbox_value(argv: tuple[str, ...]) -> str:

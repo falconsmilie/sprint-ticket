@@ -8,7 +8,11 @@ from pathlib import Path
 from .codex import CodexProcessRunner
 from .config import AppConfig
 from .corrections import (
+    CorrectionError,
     CorrectionStageResult,
+    VerificationFailure,
+    correction_reason_from_dict,
+    review_findings_from_result,
     run_correction_stage,
 )
 from .git import GitCommandError, GitRepository
@@ -18,16 +22,30 @@ from .implementation import (
 )
 from .models import WorkflowState
 from .preflight import PreflightResult
+from .reporting import (
+    ReportStageResult,
+    collect_report_context,
+    diff_including_untracked,
+    generate_terminal_report_best_effort,
+    inspect_git_safety,
+    latest_review_result,
+    latest_verification_round,
+    latest_writable_checkpoint_patch,
+    run_report_stage,
+)
 from .review import (
     ReviewStageResult,
     ReviewVerdict,
     run_review_stage,
 )
 from .runs import (
+    BASELINE_RECORD_FILE,
     RUN_RECORD_FILE,
+    RUN_TICKET_FILE,
     RunError,
     RunRecord,
     create_run_snapshot,
+    load_baseline_record,
     load_run_record,
     save_run_record,
 )
@@ -63,6 +81,7 @@ class LifecycleResult:
     verification_results: tuple[VerificationStageResult, ...]
     review_results: tuple[ReviewStageResult, ...]
     correction_results: tuple[CorrectionStageResult, ...]
+    report_result: ReportStageResult | None = None
     safety_violations: tuple[LifecycleSafetyViolation, ...] = ()
     controller_error: str | None = None
 
@@ -102,87 +121,18 @@ def run_ticket_lifecycle(
             codex_runner=codex_runner,
             clock=clock,
         )
-        run_record = implementation_result.run_record
-
-        while run_record.state not in TERMINAL_STATES:
-            if run_record.state == WorkflowState.IMPLEMENT:
-                verification = run_verification_stage(
-                    config,
-                    snapshot.run_dir,
-                    process_runner=verification_runner,
-                    clock=clock,
-                )
-                verification_results.append(verification)
-                run_record = verification.run_record
-                continue
-
-            if run_record.state == WorkflowState.VERIFY:
-                if run_record.last_completed_state == WorkflowState.CORRECT:
-                    verification = run_verification_stage(
-                        config,
-                        snapshot.run_dir,
-                        process_runner=verification_runner,
-                        clock=clock,
-                    )
-                    verification_results.append(verification)
-                    run_record = verification.run_record
-                    continue
-
-                if run_record.last_completed_state == WorkflowState.VERIFY:
-                    review = run_review_stage(
-                        config,
-                        snapshot.run_dir,
-                        codex_runner=codex_runner,
-                        clock=clock,
-                    )
-                    review_results.append(review)
-                    run_record = review.run_record
-                    continue
-
-            if run_record.state == WorkflowState.CORRECT:
-                if (
-                    run_record.current_correction_round
-                    >= run_record.max_correction_rounds
-                ):
-                    run_record = _mark_human_required(
-                        snapshot.run_dir,
-                        terminal_reason=(
-                            "Maximum corrective rounds exhausted; human intervention "
-                            "is required."
-                        ),
-                        clock=clock,
-                    )
-                    continue
-                correction = run_correction_stage(
-                    config,
-                    snapshot.run_dir,
-                    codex_runner=codex_runner,
-                    clock=clock,
-                )
-                correction_results.append(correction)
-                run_record = correction.run_record
-                continue
-
-            raise RunError(
-                "Lifecycle reached an unsupported non-terminal state: "
-                f"{run_record.state.value} after "
-                f"{run_record.last_completed_state.value}."
-            )
-
-        run_record, safety_violations = _finalize_ready_for_human_if_safe(
+        return _drive_lifecycle(
+            config,
             snapshot.run_dir,
-            run_record,
-            clock=clock,
-        )
-        return LifecycleResult(
-            run_dir=snapshot.run_dir,
-            run_record=run_record,
-            preflight_result=snapshot.preflight_result,
+            snapshot.preflight_result,
+            implementation_result.run_record,
             implementation_result=implementation_result,
-            verification_results=tuple(verification_results),
-            review_results=tuple(review_results),
-            correction_results=tuple(correction_results),
-            safety_violations=safety_violations,
+            verification_results=verification_results,
+            review_results=review_results,
+            correction_results=correction_results,
+            codex_runner=codex_runner,
+            verification_runner=verification_runner,
+            clock=clock,
         )
     except RunError as error:
         run_record = _mark_failed(
@@ -190,6 +140,7 @@ def run_ticket_lifecycle(
             terminal_reason=str(error),
             clock=clock,
         )
+        generate_terminal_report_best_effort(snapshot.run_dir)
         return LifecycleResult(
             run_dir=snapshot.run_dir,
             run_record=run_record,
@@ -202,14 +153,14 @@ def run_ticket_lifecycle(
         )
     except Exception as error:  # noqa: BLE001 - internal errors must persist FAILED.
         controller_error = (
-            "Internal TicketAutomation exception: "
-            f"{type(error).__name__}: {error}"
+            f"Internal TicketAutomation exception: {type(error).__name__}: {error}"
         )
         run_record = _mark_failed(
             snapshot.run_dir,
             terminal_reason=controller_error,
             clock=clock,
         )
+        generate_terminal_report_best_effort(snapshot.run_dir)
         return LifecycleResult(
             run_dir=snapshot.run_dir,
             run_record=run_record,
@@ -222,117 +173,537 @@ def run_ticket_lifecycle(
         )
 
 
+def resume_ticket_lifecycle(
+    config: AppConfig,
+    run_id: str,
+    *,
+    runs_dir: Path | str,
+    codex_runner: CodexProcessRunner | None = None,
+    verification_runner: VerificationProcessRunner | None = None,
+    clock: Callable[[], datetime] | None = None,
+) -> LifecycleResult:
+    run_dir = Path(runs_dir) / run_id
+    if not run_dir.is_dir():
+        raise RunError(f"Run directory does not exist: {run_dir}")
+
+    preflight_result = PreflightResult(())
+    run_record = load_run_record(run_dir / RUN_RECORD_FILE)
+    if run_record.state in TERMINAL_STATES:
+        return LifecycleResult(
+            run_dir=run_dir,
+            run_record=run_record,
+            preflight_result=preflight_result,
+            implementation_result=None,
+            verification_results=(),
+            review_results=(),
+            correction_results=(),
+        )
+
+    resume_problem = _resume_preflight_problem(run_dir, run_record)
+    if resume_problem is not None:
+        run_record = _mark_human_required(
+            run_dir,
+            terminal_reason=resume_problem,
+            clock=clock,
+        )
+        generate_terminal_report_best_effort(run_dir)
+        return LifecycleResult(
+            run_dir=run_dir,
+            run_record=run_record,
+            preflight_result=preflight_result,
+            implementation_result=None,
+            verification_results=(),
+            review_results=(),
+            correction_results=(),
+        )
+
+    checkpoint_problem = _resume_checkpoint_problem(run_dir, run_record)
+    if checkpoint_problem is not None:
+        run_record = _mark_human_required(
+            run_dir,
+            terminal_reason=checkpoint_problem,
+            clock=clock,
+        )
+        generate_terminal_report_best_effort(run_dir)
+        return LifecycleResult(
+            run_dir=run_dir,
+            run_record=run_record,
+            preflight_result=preflight_result,
+            implementation_result=None,
+            verification_results=(),
+            review_results=(),
+            correction_results=(),
+        )
+
+    implementation_result: ImplementationStageResult | None = None
+    verification_results: list[VerificationStageResult] = []
+    review_results: list[ReviewStageResult] = []
+    correction_results: list[CorrectionStageResult] = []
+
+    try:
+        if run_record.state == WorkflowState.SNAPSHOT:
+            implementation_result = run_implementation_stage(
+                config,
+                run_dir,
+                codex_runner=codex_runner,
+                clock=clock,
+            )
+            run_record = implementation_result.run_record
+
+        return _drive_lifecycle(
+            config,
+            run_dir,
+            preflight_result,
+            run_record,
+            implementation_result=implementation_result,
+            verification_results=verification_results,
+            review_results=review_results,
+            correction_results=correction_results,
+            codex_runner=codex_runner,
+            verification_runner=verification_runner,
+            clock=clock,
+        )
+    except RunError as error:
+        run_record = _mark_failed(
+            run_dir,
+            terminal_reason=str(error),
+            clock=clock,
+        )
+        generate_terminal_report_best_effort(run_dir)
+        return LifecycleResult(
+            run_dir=run_dir,
+            run_record=run_record,
+            preflight_result=preflight_result,
+            implementation_result=implementation_result,
+            verification_results=tuple(verification_results),
+            review_results=tuple(review_results),
+            correction_results=tuple(correction_results),
+            controller_error=str(error),
+        )
+    except Exception as error:  # noqa: BLE001 - internal errors must persist FAILED.
+        controller_error = (
+            "Internal TicketAutomation exception during resume: "
+            f"{type(error).__name__}: {error}"
+        )
+        run_record = _mark_failed(
+            run_dir,
+            terminal_reason=controller_error,
+            clock=clock,
+        )
+        generate_terminal_report_best_effort(run_dir)
+        return LifecycleResult(
+            run_dir=run_dir,
+            run_record=run_record,
+            preflight_result=preflight_result,
+            implementation_result=implementation_result,
+            verification_results=tuple(verification_results),
+            review_results=tuple(review_results),
+            correction_results=tuple(correction_results),
+            controller_error=controller_error,
+        )
+
+
 def format_lifecycle_result(result: LifecycleResult) -> str:
     record = result.run_record
+    context = _safe_report_context(result.run_dir, record)
     title = f"{record.ticket_id} - {_terminal_label(record.state)}"
     lines = [
+        "----------------------------------------",
         title,
+        "----------------------------------------",
         "",
-        "Run:",
+        "Run",
         f"  {result.run_dir}",
         "",
-        "Branch:",
+        "Branch",
         f"  {record.starting_branch}",
         "",
-        "Baseline:",
+        "Baseline",
         f"  {record.baseline_sha}",
         "",
+        "Files changed",
+        f"  {_changed_file_count(context, result)}",
+        "",
+        "Diff",
+        f"  {_diff_line_summary(context, result)}",
+        "",
         "Verification:",
-        f"  {_verification_summary(result)}",
+        *_verification_lines(context, result),
         "",
         "Review:",
-        f"  {_review_summary(result)}",
+        f"  {_review_summary(context, result)}",
         "",
-        "Correction rounds:",
+        "Correction rounds",
         f"  {record.current_correction_round} / {record.max_correction_rounds}",
         "",
-        "Review rounds:",
+        "Review rounds",
         f"  {record.current_review_round}",
         "",
-        "Git safety:",
-        *_git_safety_lines(result),
+        "Advisory findings",
+        f"  {_advisory_count(context)}",
+        "",
+        "Git safety",
+        *_git_safety_lines(result, context),
     ]
     if record.terminal_reason:
-        lines.extend(["", "Reason:", f"  {record.terminal_reason}"])
+        lines.extend(["", "Reason", f"  {record.terminal_reason}"])
     if result.controller_error:
-        lines.extend(["", "Controller error:", f"  {result.controller_error}"])
+        lines.extend(["", "Controller error", f"  {result.controller_error}"])
     if result.successful:
         lines.extend(["", "No files have been staged or committed."])
+    report_path = result.run_dir / "final-report.md"
+    if report_path.is_file():
+        lines.extend(["", "Report", f"  {report_path}"])
+    lines.append("----------------------------------------")
     return "\n".join(lines)
 
 
-def _finalize_ready_for_human_if_safe(
+def _drive_lifecycle(
+    config: AppConfig,
     run_dir: Path,
+    preflight_result: PreflightResult,
     run_record: RunRecord,
     *,
+    implementation_result: ImplementationStageResult | None,
+    verification_results: list[VerificationStageResult],
+    review_results: list[ReviewStageResult],
+    correction_results: list[CorrectionStageResult],
+    codex_runner: CodexProcessRunner | None,
+    verification_runner: VerificationProcessRunner | None,
     clock: Callable[[], datetime] | None,
-) -> tuple[RunRecord, tuple[LifecycleSafetyViolation, ...]]:
+) -> LifecycleResult:
+    report_result: ReportStageResult | None = None
+
+    while run_record.state not in TERMINAL_STATES:
+        if run_record.state == WorkflowState.IMPLEMENT:
+            if run_record.last_completed_state != WorkflowState.IMPLEMENT:
+                raise RunError(
+                    "Implementation was interrupted before a completed writable "
+                    "checkpoint was persisted."
+                )
+            verification = run_verification_stage(
+                config,
+                run_dir,
+                process_runner=verification_runner,
+                clock=clock,
+            )
+            verification_results.append(verification)
+            run_record = verification.run_record
+            continue
+
+        if run_record.state == WorkflowState.VERIFY:
+            if run_record.last_completed_state == WorkflowState.CORRECT:
+                verification = run_verification_stage(
+                    config,
+                    run_dir,
+                    process_runner=verification_runner,
+                    clock=clock,
+                )
+                verification_results.append(verification)
+                run_record = verification.run_record
+                continue
+
+            if run_record.last_completed_state == WorkflowState.VERIFY:
+                review = run_review_stage(
+                    config,
+                    run_dir,
+                    codex_runner=codex_runner,
+                    clock=clock,
+                )
+                review_results.append(review)
+                run_record = review.run_record
+                continue
+
+        if run_record.state == WorkflowState.CORRECT:
+            if run_record.last_completed_state == WorkflowState.CORRECT:
+                run_record = _mark_human_required(
+                    run_dir,
+                    terminal_reason=(
+                        "Writable correction was interrupted before completion; "
+                        "the working tree may contain partial source modifications."
+                    ),
+                    clock=clock,
+                )
+                continue
+
+            if run_record.current_correction_round >= run_record.max_correction_rounds:
+                run_record = _mark_human_required(
+                    run_dir,
+                    terminal_reason=(
+                        "Maximum corrective rounds exhausted; human intervention "
+                        "is required."
+                    ),
+                    clock=clock,
+                )
+                continue
+
+            correction = run_correction_stage(
+                config,
+                run_dir,
+                codex_runner=codex_runner,
+                clock=clock,
+            )
+            correction_results.append(correction)
+            run_record = correction.run_record
+            continue
+
+        if run_record.state == WorkflowState.REPORT:
+            report_result = run_report_stage(run_dir, clock=clock)
+            run_record = report_result.run_record
+            continue
+
+        raise RunError(
+            "Lifecycle reached an unsupported non-terminal state: "
+            f"{run_record.state.value} after "
+            f"{run_record.last_completed_state.value}."
+        )
+
     if run_record.state != WorkflowState.READY_FOR_HUMAN:
-        return run_record, ()
+        generate_terminal_report_best_effort(run_dir)
 
-    violations = _inspect_lifecycle_safety(run_record)
-    if not violations:
-        return run_record, ()
-
-    updated_record = run_record.with_state(
-        WorkflowState.HUMAN_REQUIRED,
-        updated_timestamp=_timestamp(clock),
-        last_completed_state=run_record.last_completed_state,
-        terminal_reason=(
-            "Repository safety invariants were violated before human handoff."
-        ),
+    return LifecycleResult(
+        run_dir=run_dir,
+        run_record=run_record,
+        preflight_result=preflight_result,
+        implementation_result=implementation_result,
+        verification_results=tuple(verification_results),
+        review_results=tuple(review_results),
+        correction_results=tuple(correction_results),
+        report_result=report_result,
     )
-    save_run_record(updated_record, run_dir / RUN_RECORD_FILE)
-    return updated_record, violations
 
 
-def _inspect_lifecycle_safety(
+def _resume_preflight_problem(run_dir: Path, run_record: RunRecord) -> str | None:
+    baseline_path = run_dir / BASELINE_RECORD_FILE
+    ticket_path = run_dir / RUN_TICKET_FILE
+    if not baseline_path.is_file():
+        return f"Required baseline artifact is missing: {baseline_path}"
+    if not ticket_path.is_file():
+        return f"Required snapshotted ticket artifact is missing: {ticket_path}"
+
+    try:
+        baseline = load_baseline_record(baseline_path)
+    except RunError as error:
+        return f"Baseline artifact is not internally consistent: {error}"
+    if baseline.branch != run_record.starting_branch:
+        return "Run record and baseline artifact disagree on starting branch."
+    if baseline.head_sha != run_record.baseline_sha:
+        return "Run record and baseline artifact disagree on baseline HEAD."
+
+    repository = GitRepository(Path(run_record.target_repository_path))
+    if not repository.path.exists():
+        return f"Target repository no longer exists: {repository.path}"
+    try:
+        if not repository.is_repository():
+            return f"Target path is no longer a Git repository: {repository.path}"
+    except OSError as error:
+        return f"Could not inspect target repository: {error}"
+
+    safety = inspect_git_safety(run_record)
+    if not safety.safe:
+        return _resume_safety_reason(safety)
+    return None
+
+
+def _resume_checkpoint_problem(run_dir: Path, run_record: RunRecord) -> str | None:
+    if run_record.state == WorkflowState.SNAPSHOT:
+        return None
+
+    if run_record.state == WorkflowState.IMPLEMENT:
+        if run_record.last_completed_state == WorkflowState.SNAPSHOT:
+            return (
+                "Writable implementation was interrupted before completion; the "
+                "working tree may contain partial source modifications."
+            )
+        if run_record.last_completed_state != WorkflowState.IMPLEMENT:
+            return "Run record does not describe a safe implementation checkpoint."
+        return _require_completed_implementation_checkpoint(run_dir, run_record)
+
+    if run_record.state == WorkflowState.VERIFY:
+        if run_record.last_completed_state == WorkflowState.CORRECT:
+            return _require_completed_correction_checkpoint(run_dir, run_record)
+        if run_record.last_completed_state == WorkflowState.VERIFY:
+            verification = latest_verification_round(run_dir)
+            if (
+                not isinstance(verification, dict)
+                or verification.get("status") != "PASS"
+            ):
+                return (
+                    "Review cannot resume because the latest verification did not pass."
+                )
+            return _require_current_diff_matches_checkpoint(run_dir, run_record)
+        return "Run record does not describe a safe verification checkpoint."
+
+    if run_record.state == WorkflowState.CORRECT:
+        if run_record.last_completed_state == WorkflowState.CORRECT:
+            return (
+                "Writable correction was interrupted before completion; the "
+                "working tree may contain partial source modifications."
+            )
+        if run_record.last_completed_state not in (
+            WorkflowState.REVIEW,
+            WorkflowState.VERIFY,
+        ):
+            return "Run record does not describe a safe correction checkpoint."
+        checkpoint_problem = _require_current_diff_matches_checkpoint(
+            run_dir,
+            run_record,
+        )
+        if checkpoint_problem is not None:
+            return checkpoint_problem
+        return _require_correction_source_checkpoint(run_dir, run_record)
+
+    if run_record.state == WorkflowState.REPORT:
+        if run_record.last_completed_state != WorkflowState.REVIEW:
+            return "Run record does not describe a safe report checkpoint."
+        review = latest_review_result(run_dir)
+        if not isinstance(review, dict) or review.get("verdict") != "PASS":
+            return "Report cannot resume because the final review did not pass."
+        verification = latest_verification_round(run_dir)
+        if not isinstance(verification, dict) or verification.get("status") != "PASS":
+            return (
+                "Report cannot resume because deterministic verification did not pass."
+            )
+        return _require_current_diff_matches_checkpoint(run_dir, run_record)
+
+    return f"Run state is not resumable in V1: {run_record.state.value}"
+
+
+def _require_completed_implementation_checkpoint(
+    run_dir: Path,
     run_record: RunRecord,
-) -> tuple[LifecycleSafetyViolation, ...]:
+) -> str | None:
+    result_path = run_dir / "implementation" / "result.json"
+    result = _read_json_dict(result_path)
+    if result is None or result.get("status") != "COMPLETED":
+        return "Implementation checkpoint is missing a completed agent result."
+    return _require_current_diff_matches_checkpoint(run_dir, run_record)
+
+
+def _require_completed_correction_checkpoint(
+    run_dir: Path,
+    run_record: RunRecord,
+) -> str | None:
+    result_path = (
+        run_dir
+        / "correction-executions"
+        / f"round-{run_record.current_correction_round}"
+        / "result.json"
+    )
+    result = _read_json_dict(result_path)
+    if result is None or result.get("status") != "COMPLETED":
+        return "Correction checkpoint is missing a completed agent result."
+    return _require_current_diff_matches_checkpoint(run_dir, run_record)
+
+
+def _require_correction_source_checkpoint(
+    run_dir: Path,
+    run_record: RunRecord,
+) -> str | None:
+    if run_record.last_completed_state == WorkflowState.VERIFY:
+        verification = latest_verification_round(run_dir)
+        if not isinstance(verification, dict) or verification.get("status") != "FAIL":
+            return (
+                "Verification correction source is not internally consistent: "
+                "latest verification did not fail."
+            )
+        if "correction_reasons" in verification:
+            reasons = verification["correction_reasons"]
+            if not isinstance(reasons, list):
+                return (
+                    "Verification correction source is not internally consistent: "
+                    "correction_reasons must be a list."
+                )
+            try:
+                parsed_reasons = tuple(
+                    correction_reason_from_dict(reason)
+                    for reason in reasons
+                    if isinstance(reason, dict)
+                )
+            except CorrectionError as error:
+                return (
+                    "Verification correction source is not internally consistent: "
+                    f"{error}"
+                )
+            if len(parsed_reasons) != len(reasons):
+                return (
+                    "Verification correction source is not internally consistent: "
+                    "correction reasons must be objects."
+                )
+            if not all(isinstance(reason, VerificationFailure) for reason in parsed_reasons):
+                return (
+                    "Verification correction source is not internally consistent: "
+                    "verification correction reasons must describe verification failures."
+                )
+            if parsed_reasons:
+                return None
+        commands = verification.get("commands")
+        if isinstance(commands, list) and any(
+            isinstance(command, dict) and command.get("status") == "FAIL"
+            for command in commands
+        ):
+            return None
+        return (
+            "Verification correction source is not internally consistent: "
+            "no failed verification command was persisted."
+        )
+
+    if run_record.last_completed_state == WorkflowState.REVIEW:
+        review = latest_review_result(run_dir)
+        if (
+            not isinstance(review, dict)
+            or review.get("verdict") != ReviewVerdict.CORRECTIONS_REQUIRED.value
+        ):
+            return (
+                "Review correction source is not internally consistent: "
+                "latest review did not require corrections."
+            )
+        try:
+            findings = review_findings_from_result(review)
+        except CorrectionError as error:
+            return (
+                "Review correction source is not internally consistent: "
+                f"{error}"
+            )
+        if not findings:
+            return (
+                "Review correction source is not internally consistent: "
+                "no required review findings were persisted."
+            )
+        return None
+
+    return "Run record does not describe a known correction source checkpoint."
+
+
+def _require_current_diff_matches_checkpoint(
+    run_dir: Path,
+    run_record: RunRecord,
+) -> str | None:
+    checkpoint = latest_writable_checkpoint_patch(run_dir, run_record)
+    if checkpoint is None:
+        return "Required writable checkpoint patch is missing."
     repository = GitRepository(Path(run_record.target_repository_path))
     try:
-        current_branch = repository.current_branch()
-        current_head = repository.head_sha()
-        staged_files = repository.staged_files()
-    except GitCommandError as error:
+        current_patch = diff_including_untracked(repository, run_record.baseline_sha)
+        checkpoint_patch = checkpoint.read_text(encoding="utf-8")
+    except (GitCommandError, OSError, ValueError) as error:
+        return f"Could not compare current diff to checkpoint: {error}"
+    if current_patch != checkpoint_patch:
         return (
-            LifecycleSafetyViolation(
-                name="git-inspection",
-                expected="Git inspection succeeds",
-                actual=str(error),
-                message="Could not inspect repository safety invariants.",
-            ),
+            "Current source diff no longer matches the last verified writable "
+            "checkpoint."
         )
+    return None
 
-    violations: list[LifecycleSafetyViolation] = []
-    if current_branch != run_record.starting_branch:
-        violations.append(
-            LifecycleSafetyViolation(
-                name="branch",
-                expected=run_record.starting_branch,
-                actual="<detached>" if current_branch is None else current_branch,
-                message="Current branch no longer matches the starting branch.",
-            )
-        )
-    if current_head != run_record.baseline_sha:
-        violations.append(
-            LifecycleSafetyViolation(
-                name="HEAD",
-                expected=run_record.baseline_sha,
-                actual=current_head,
-                message="HEAD no longer matches the baseline SHA.",
-            )
-        )
-    if staged_files:
-        violations.append(
-            LifecycleSafetyViolation(
-                name="staging",
-                expected="empty",
-                actual=_format_files(staged_files),
-                message="Staging area is not empty.",
-            )
-        )
-    return tuple(violations)
+
+def _read_json_dict(path: Path) -> dict[str, object] | None:
+    try:
+        import json
+
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _mark_failed(
@@ -381,13 +752,95 @@ def _terminal_label(state: WorkflowState) -> str:
     return state.value
 
 
-def _verification_summary(result: LifecycleResult) -> str:
-    if not result.verification_results:
-        return "NOT RUN"
-    return result.verification_results[-1].round_result.status.value
+def _safe_report_context(run_dir: Path, record: RunRecord) -> dict[str, object] | None:
+    try:
+        return collect_report_context(run_dir, record)
+    except (GitCommandError, KeyError, OSError, RunError, TypeError, ValueError):
+        return None
 
 
-def _review_summary(result: LifecycleResult) -> str:
+def _changed_file_count(
+    context: dict[str, object] | None,
+    result: LifecycleResult,
+) -> int:
+    if context is not None:
+        controller = context["controller"]
+        if isinstance(controller, dict):
+            changed_files = controller.get("changed_files", ())
+            if isinstance(changed_files, tuple | list):
+                return len(changed_files)
+    if result.implementation_result is not None:
+        return len(result.implementation_result.changed_files)
+    return 0
+
+
+def _diff_line_summary(
+    context: dict[str, object] | None,
+    result: LifecycleResult,
+) -> str:
+    if result.report_result is not None:
+        return f"+{result.report_result.additions} / -{result.report_result.deletions}"
+    if context is not None:
+        controller = context["controller"]
+        if isinstance(controller, dict):
+            return (
+                f"+{controller.get('additions', 0)} / -{controller.get('deletions', 0)}"
+            )
+    return "not available"
+
+
+def _verification_lines(
+    context: dict[str, object] | None,
+    result: LifecycleResult,
+) -> list[str]:
+    verification: dict[str, object] | None = None
+    if context is not None:
+        controller = context["controller"]
+        if isinstance(controller, dict):
+            rounds = controller.get("verification_rounds", ())
+            if isinstance(rounds, tuple | list) and rounds:
+                latest = rounds[-1]
+                if isinstance(latest, dict):
+                    data = latest.get("data")
+                    if isinstance(data, dict):
+                        verification = data
+    if verification is None and result.verification_results:
+        round_result = result.verification_results[-1].round_result
+        return [
+            f"  {round_result.status.value}",
+            *(
+                f"  {command.name:<10} {command.status.value}"
+                for command in round_result.commands
+            ),
+        ]
+    if verification is None:
+        return ["  NOT RUN"]
+
+    status = verification.get("status", "UNKNOWN")
+    commands = verification.get("commands", [])
+    lines = [f"  {status}"]
+    if isinstance(commands, list) and commands:
+        for command in commands:
+            if isinstance(command, dict):
+                lines.append(
+                    f"  {command.get('name', '<unnamed>'):<10} "
+                    f"{command.get('status', 'UNKNOWN')}"
+                )
+    return lines
+
+
+def _review_summary(
+    context: dict[str, object] | None,
+    result: LifecycleResult,
+) -> str:
+    if context is not None:
+        controller = context["controller"]
+        if isinstance(controller, dict):
+            final_review = controller.get("final_review")
+            if isinstance(final_review, dict):
+                verdict = final_review.get("verdict")
+                if isinstance(verdict, str):
+                    return verdict
     if not result.review_results:
         return "NOT RUN"
     review_result = result.review_results[-1].review_result
@@ -397,7 +850,20 @@ def _review_summary(result: LifecycleResult) -> str:
     return verdict.value
 
 
-def _git_safety_lines(result: LifecycleResult) -> list[str]:
+def _advisory_count(context: dict[str, object] | None) -> int:
+    if context is None:
+        return 0
+    controller = context["controller"]
+    if not isinstance(controller, dict):
+        return 0
+    findings = controller.get("advisory_findings", ())
+    return len(findings) if isinstance(findings, tuple | list) else 0
+
+
+def _git_safety_lines(
+    result: LifecycleResult,
+    context: dict[str, object] | None,
+) -> list[str]:
     violations = []
     if result.implementation_result is not None:
         violations.extend(result.implementation_result.safety_violations)
@@ -413,6 +879,17 @@ def _git_safety_lines(result: LifecycleResult) -> list[str]:
             f"  {violation.name}: expected {violation.expected}, got {violation.actual}"
             for violation in violations
         ]
+
+    if context is not None:
+        controller = context["controller"]
+        if isinstance(controller, dict):
+            safety = controller.get("git_safety")
+            if safety is not None:
+                return [
+                    f"  HEAD {'unchanged' if safety.head_ok else 'changed'}",
+                    f"  branch {'unchanged' if safety.branch_ok else 'changed'}",
+                    f"  staging {'empty' if safety.staging_ok else 'not empty'}",
+                ]
     return [
         "  HEAD unchanged",
         "  branch unchanged",
@@ -420,14 +897,21 @@ def _git_safety_lines(result: LifecycleResult) -> list[str]:
     ]
 
 
-def _format_files(files: tuple[str, ...]) -> str:
-    if not files:
-        return "empty"
-    shown = ", ".join(files[:5])
-    hidden_count = len(files) - 5
-    if hidden_count > 0:
-        shown = f"{shown}, and {hidden_count} more"
-    return shown
+def _resume_safety_reason(safety: object) -> str:
+    problems: list[str] = []
+    if getattr(safety, "inspection_error", None):
+        problems.append(f"Git inspection failed: {safety.inspection_error}")
+    if not getattr(safety, "branch_ok", False):
+        problems.append(
+            f"branch is {safety.branch_actual}, expected {safety.branch_expected}"
+        )
+    if not getattr(safety, "head_ok", False):
+        problems.append(
+            f"HEAD is {safety.head_actual}, expected {safety.head_expected}"
+        )
+    if not getattr(safety, "staging_ok", False):
+        problems.append("staging area is not empty")
+    return "Resume preflight failed: " + "; ".join(problems)
 
 
 def _timestamp(clock: Callable[[], datetime] | None) -> str:
@@ -442,5 +926,6 @@ __all__ = [
     "LifecycleResult",
     "LifecycleSafetyViolation",
     "format_lifecycle_result",
+    "resume_ticket_lifecycle",
     "run_ticket_lifecycle",
 ]

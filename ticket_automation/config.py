@@ -73,7 +73,9 @@ def load_config(config_dir: Path | str | None = None) -> AppConfig:
     return parse_config(raw_config, source_files=tuple(source_files))
 
 
-def parse_config(raw_config: dict[str, Any], *, source_files: tuple[Path, ...] = ()) -> AppConfig:
+def parse_config(
+    raw_config: dict[str, Any], *, source_files: tuple[Path, ...] = ()
+) -> AppConfig:
     project = _require_table(raw_config, "project")
     runner = _require_table(raw_config, "runner")
     codex = _require_table(raw_config, "codex")
@@ -113,7 +115,9 @@ def parse_config(raw_config: dict[str, Any], *, source_files: tuple[Path, ...] =
 
 
 def format_config_summary(config: AppConfig) -> str:
-    source_files = ", ".join(str(path) for path in config.source_files) or "in-memory config"
+    source_files = (
+        ", ".join(str(path) for path in config.source_files) or "in-memory config"
+    )
     verification = "\n".join(
         f"  - {command.name} ({command.timeout_seconds}s): {_format_argv(command.argv)}"
         for command in config.verification.commands
@@ -212,7 +216,9 @@ def _require_sandbox(table: dict[str, Any], dotted_name: str) -> str:
     return value
 
 
-def _parse_verification_commands(verification: dict[str, Any]) -> tuple[VerificationCommand, ...]:
+def _parse_verification_commands(
+    verification: dict[str, Any],
+) -> tuple[VerificationCommand, ...]:
     commands = verification.get("commands")
     if not isinstance(commands, list) or not commands:
         raise ConfigError("verification.commands must contain at least one command.")
@@ -221,7 +227,9 @@ def _parse_verification_commands(verification: dict[str, Any]) -> tuple[Verifica
     for index, command in enumerate(commands, start=1):
         if not isinstance(command, dict):
             raise ConfigError(f"verification.commands[{index}] must be a table.")
-        name = _require_non_empty_string(command, f"verification.commands[{index}].name")
+        name = _require_non_empty_string(
+            command, f"verification.commands[{index}].name"
+        )
         argv = _require_string_tuple(
             command,
             "argv",

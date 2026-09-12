@@ -156,14 +156,19 @@ def test_persists_jsonl_stderr_prompt_and_structured_result(tmp_path):
 
 def test_accepts_trusted_turn_completed_result_shape(tmp_path):
     schema = write_schema(tmp_path / "schema.json")
-    events = "\n".join(
-        [
-            json.dumps({"type": "thread.started", "thread_id": "thread"}),
-            json.dumps({"type": "turn.started"}),
-            json.dumps({"type": "turn.completed", "result": {"status": "ok"}}),
-        ]
-    ) + "\n"
-    runner = FakeRunner(result=CodexProcessResult(returncode=0, stdout=events, stderr=""))
+    events = (
+        "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "thread"}),
+                json.dumps({"type": "turn.started"}),
+                json.dumps({"type": "turn.completed", "result": {"status": "ok"}}),
+            ]
+        )
+        + "\n"
+    )
+    runner = FakeRunner(
+        result=CodexProcessResult(returncode=0, stdout=events, stderr="")
+    )
 
     result = execute(
         prompt="prompt",
@@ -180,29 +185,34 @@ def test_accepts_trusted_turn_completed_result_shape(tmp_path):
 
 def test_accepts_trusted_agent_message_content_shape(tmp_path):
     schema = write_schema(tmp_path / "schema.json")
-    events = "\n".join(
-        [
-            json.dumps({"type": "thread.started", "thread_id": "thread"}),
-            json.dumps({"type": "turn.started"}),
-            json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {
-                        "id": "item_1",
-                        "type": "agent_message",
-                        "content": [
-                            {
-                                "type": "output_text",
-                                "text": json.dumps({"status": "ok"}),
-                            }
-                        ],
-                    },
-                }
-            ),
-            json.dumps({"type": "turn.completed"}),
-        ]
-    ) + "\n"
-    runner = FakeRunner(result=CodexProcessResult(returncode=0, stdout=events, stderr=""))
+    events = (
+        "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "thread"}),
+                json.dumps({"type": "turn.started"}),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "item_1",
+                            "type": "agent_message",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": json.dumps({"status": "ok"}),
+                                }
+                            ],
+                        },
+                    }
+                ),
+                json.dumps({"type": "turn.completed"}),
+            ]
+        )
+        + "\n"
+    )
+    runner = FakeRunner(
+        result=CodexProcessResult(returncode=0, stdout=events, stderr="")
+    )
 
     result = execute(
         prompt="prompt",
@@ -242,7 +252,9 @@ def test_nonzero_exit_is_typed_failure_and_not_fake_result(tmp_path):
     assert raised.value.execution.status == CodexExecutionStatus.FAILED
     assert raised.value.execution.process_exit_code == 2
     assert raised.value.execution.events_jsonl_path.read_text(encoding="utf-8")
-    assert raised.value.execution.stderr_log_path.read_text(encoding="utf-8") == "boom\n"
+    assert (
+        raised.value.execution.stderr_log_path.read_text(encoding="utf-8") == "boom\n"
+    )
     assert not raised.value.execution.result_json_path.exists()
 
 
@@ -357,7 +369,10 @@ def test_timeout_preserves_available_logs(tmp_path):
         raised.value.execution.events_jsonl_path.read_text(encoding="utf-8")
         == '{"type":"turn.started"}\n'
     )
-    assert raised.value.execution.stderr_log_path.read_text(encoding="utf-8") == "still working\n"
+    assert (
+        raised.value.execution.stderr_log_path.read_text(encoding="utf-8")
+        == "still working\n"
+    )
     assert runner.timeout_seconds == 3
 
 
@@ -603,9 +618,7 @@ def test_authentication_or_service_failure_event_is_typed(tmp_path):
     runner = FakeRunner(
         result=CodexProcessResult(
             returncode=0,
-            stdout=json.dumps(
-                {"type": "error", "message": "authentication failed"}
-            )
+            stdout=json.dumps({"type": "error", "message": "authentication failed"})
             + "\n",
             stderr="",
         )
@@ -659,23 +672,26 @@ def successful_process(result: dict[str, object]) -> CodexProcessResult:
 
 
 def event_stream(result: dict[str, object]) -> str:
-    return "\n".join(
-        [
-            json.dumps({"type": "thread.started", "thread_id": "thread"}),
-            json.dumps({"type": "turn.started"}),
-            json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {
-                        "id": "item_1",
-                        "type": "agent_message",
-                        "text": json.dumps(result),
-                    },
-                }
-            ),
-            json.dumps({"type": "turn.completed"}),
-        ]
-    ) + "\n"
+    return (
+        "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "thread"}),
+                json.dumps({"type": "turn.started"}),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "item_1",
+                            "type": "agent_message",
+                            "text": json.dumps(result),
+                        },
+                    }
+                ),
+                json.dumps({"type": "turn.completed"}),
+            ]
+        )
+        + "\n"
+    )
 
 
 def write_schema(path):

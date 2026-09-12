@@ -101,7 +101,7 @@ def test_review_uses_read_only_sandbox_and_writes_round_one_artifacts(tmp_path):
     result = run_review_stage(config, run_dir, codex_runner=runner, clock=fixed_clock)
 
     assert result.successful
-    assert result.run_record.state == WorkflowState.READY_FOR_HUMAN
+    assert result.run_record.state == WorkflowState.REPORT
     assert runner.command is not None
     assert sandbox_value(runner.command.argv) == Sandbox.READ_ONLY.value
     review_dir = run_dir / REVIEW_DIR_NAME / ROUND_1
@@ -167,7 +167,7 @@ def test_pass_review_accepts_advisory_and_follow_up_observations(tmp_path):
         codex_runner=ReviewRunner(result=result_payload),
     )
 
-    assert result.run_record.state == WorkflowState.READY_FOR_HUMAN
+    assert result.run_record.state == WorkflowState.REPORT
     assert result.required_findings == ()
     assert [item["disposition"] for item in result.review_result["findings"]] == [
         "ADVISORY",
@@ -328,7 +328,7 @@ def test_disposable_repository_does_not_require_earlier_ticket_history(tmp_path)
         codex_runner=ReviewRunner(result=review_result()),
     )
 
-    assert result.run_record.state == WorkflowState.READY_FOR_HUMAN
+    assert result.run_record.state == WorkflowState.REPORT
     assert run_git(repo, "log", "--oneline").count("initial") == 1
 
 

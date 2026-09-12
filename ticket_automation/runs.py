@@ -347,13 +347,22 @@ def format_status(records: tuple[RunRecord, ...], *, runs_dir: Path | str) -> st
     if not records:
         return f"No runs found in {Path(runs_dir)}."
 
-    header = f"{'Run ID':<36} {'Ticket ID':<16} {'State':<12} {'Branch':<24} Updated"
+    header = (
+        f"{'Run ID':<36} {'Ticket ID':<16} {'State':<16} {'Branch':<24} "
+        f"{'Corr':<9} {'Review':<8} {'Updated':<20} Reason"
+    )
     rows = [header]
     for record in records:
+        reason = record.terminal_reason or ""
+        correction_round = (
+            f"{record.current_correction_round}/{record.max_correction_rounds}"
+        )
         rows.append(
             f"{record.run_id:<36} {record.ticket_id:<16} "
-            f"{record.state.value:<12} {record.starting_branch:<24} "
-            f"{record.updated_timestamp}"
+            f"{record.state.value:<16} {record.starting_branch:<24} "
+            f"{correction_round:<9} "
+            f"{record.current_review_round:<8} {record.updated_timestamp:<20} "
+            f"{reason}"
         )
     return "\n".join(rows)
 

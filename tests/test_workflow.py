@@ -12,13 +12,20 @@ import pytest
 from tests.helpers import GIT, create_git_repo, make_config, run_git
 from ticket_automation.codex import CodexCommand, CodexProcessResult, Sandbox
 from ticket_automation.config import VerificationCommand
+from ticket_automation.implementation import run_implementation_stage
 from ticket_automation.models import WorkflowState
-from ticket_automation.review import ReviewVerdict
+from ticket_automation.review import ReviewVerdict, run_review_stage
+from ticket_automation.runs import create_run_snapshot, load_run_record, save_run_record
 from ticket_automation.verification import (
     VerificationProcessCommand,
     VerificationProcessResult,
+    run_verification_stage,
 )
-from ticket_automation.workflow import format_lifecycle_result, run_ticket_lifecycle
+from ticket_automation.workflow import (
+    format_lifecycle_result,
+    resume_ticket_lifecycle,
+    run_ticket_lifecycle,
+)
 
 
 def fixed_clock() -> datetime:
@@ -125,7 +132,7 @@ def test_lifecycle_first_pass_success_reaches_ready_for_human(tmp_path):
 
     assert result.successful
     assert result.run_record.state == WorkflowState.READY_FOR_HUMAN
-    assert result.run_record.last_completed_state == WorkflowState.REVIEW
+    assert result.run_record.last_completed_state == WorkflowState.REPORT
     assert result.run_record.current_correction_round == 0
     assert result.run_record.current_review_round == 1
     assert [sandbox_value(command.argv) for command, _stdin in codex.calls] == [
@@ -135,6 +142,8 @@ def test_lifecycle_first_pass_success_reaches_ready_for_human(tmp_path):
     assert len(result.verification_results) == 1
     assert len(result.review_results) == 1
     assert result.correction_results == ()
+    assert result.run_dir.joinpath("diffs", "final.patch").is_file()
+    assert result.run_dir.joinpath("final-report.md").is_file()
     assert run_git(repo, "diff", "--name-only") == "file.txt"
     assert "QDEB-003 - READY FOR HUMAN REVIEW" in format_lifecycle_result(result)
     assert "No files have been staged or committed." in format_lifecycle_result(result)
@@ -506,6 +515,562 @@ def test_lifecycle_pass_with_advisory_findings_does_not_correct(tmp_path):
         item["disposition"]
         for item in result.review_results[0].review_result["findings"]
     ] == ["ADVISORY", "FOLLOW_UP"]
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_final_report_distinguishes_controller_facts_from_agent_claims(tmp_path):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+    codex = SequencedCodexRunner(
+        steps=[
+            CodexStep(
+                result=implementation_result(), mutation=write_file("implemented\n")
+            ),
+            CodexStep(
+                result=review_result(
+                    findings=[
+                        finding("R1-F1", disposition="ADVISORY"),
+                        finding("R1-F2", disposition="FOLLOW_UP"),
+                    ]
+                )
+            ),
+        ],
+        calls=[],
+    )
+
+    result = run_ticket_lifecycle(
+        config,
+        ticket,
+        runs_dir=tmp_path / "runs",
+        codex_runner=codex,
+        verification_runner=SequencedVerificationRunner(
+            steps=[VerificationStep()],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+
+    report = result.run_dir.joinpath("final-report.md").read_text(encoding="utf-8")
+    assert "Authoritative controller evidence" in report
+    assert "Agent-reported information" in report
+    assert (
+        "Implementation-agent targeted validation is reported here as an agent claim"
+        in report
+    )
+    assert "Final review verdict: PASS" in report
+    assert "Advisory findings: 1" in report
+    assert "Follow-up findings: 1" in report
+    assert "TicketAutomation did not intentionally stage" in report
+    assert "TicketAutomation did not intentionally commit" in report
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_final_patch_is_complete_baseline_relative_diff_after_correction(tmp_path):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+    codex = SequencedCodexRunner(
+        steps=[
+            CodexStep(
+                result=implementation_result(),
+                mutation=lambda cwd: (
+                    cwd.joinpath("file.txt").write_text(
+                        "implemented\n",
+                        encoding="utf-8",
+                    ),
+                    cwd.joinpath("kept.txt").write_text(
+                        "original implementation work\n",
+                        encoding="utf-8",
+                    ),
+                ),
+            ),
+            CodexStep(
+                result=review_result(verdict=ReviewVerdict.CORRECTIONS_REQUIRED.value)
+            ),
+            CodexStep(
+                result=implementation_result(), mutation=write_file("corrected\n")
+            ),
+            CodexStep(result=review_result()),
+        ],
+        calls=[],
+    )
+
+    result = run_ticket_lifecycle(
+        config,
+        ticket,
+        runs_dir=tmp_path / "runs",
+        codex_runner=codex,
+        verification_runner=SequencedVerificationRunner(
+            steps=[VerificationStep(), VerificationStep()],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+
+    patch = result.run_dir.joinpath("diffs", "final.patch").read_text(encoding="utf-8")
+    assert "diff --git a/file.txt b/file.txt" in patch
+    assert "+corrected" in patch
+    assert "diff --git a/kept.txt b/kept.txt" in patch
+    assert "+original implementation work" in patch
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_resume_from_completed_implementation_runs_verification_review_and_report(
+    tmp_path,
+):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+    runs_dir = tmp_path / "runs"
+    snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
+    run_implementation_stage(
+        config,
+        snapshot.run_dir,
+        codex_runner=SequencedCodexRunner(
+            steps=[
+                CodexStep(
+                    result=implementation_result(),
+                    mutation=write_file("implemented\n"),
+                )
+            ],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    codex = SequencedCodexRunner(steps=[CodexStep(result=review_result())], calls=[])
+    verification = SequencedVerificationRunner(steps=[VerificationStep()], calls=[])
+
+    result = resume_ticket_lifecycle(
+        config,
+        snapshot.run_record.run_id,
+        runs_dir=runs_dir,
+        codex_runner=codex,
+        verification_runner=verification,
+        clock=fixed_clock,
+    )
+
+    assert result.successful
+    assert len(verification.calls) == 1
+    assert [sandbox_value(command.argv) for command, _stdin in codex.calls] == [
+        Sandbox.READ_ONLY.value
+    ]
+    assert result.run_dir.joinpath("final-report.md").is_file()
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_resume_terminal_run_does_not_regenerate_report_artifacts(tmp_path):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+    result = run_ticket_lifecycle(
+        config,
+        ticket,
+        runs_dir=tmp_path / "runs",
+        codex_runner=SequencedCodexRunner(
+            steps=[
+                CodexStep(
+                    result=implementation_result(),
+                    mutation=write_file("implemented\n"),
+                ),
+                CodexStep(result=review_result()),
+            ],
+            calls=[],
+        ),
+        verification_runner=SequencedVerificationRunner(
+            steps=[VerificationStep()],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    final_patch = result.run_dir / "diffs" / "final.patch"
+    final_report = result.run_dir / "final-report.md"
+    final_patch.write_text("preserved patch\n", encoding="utf-8")
+    final_report.write_text("preserved report\n", encoding="utf-8")
+    codex = SequencedCodexRunner(steps=[CodexStep(result=review_result())], calls=[])
+    verification = SequencedVerificationRunner(steps=[VerificationStep()], calls=[])
+
+    resumed = resume_ticket_lifecycle(
+        config,
+        result.run_record.run_id,
+        runs_dir=tmp_path / "runs",
+        codex_runner=codex,
+        verification_runner=verification,
+        clock=fixed_clock,
+    )
+
+    assert resumed.run_record.state == WorkflowState.READY_FOR_HUMAN
+    assert final_patch.read_text(encoding="utf-8") == "preserved patch\n"
+    assert final_report.read_text(encoding="utf-8") == "preserved report\n"
+    assert codex.calls == []
+    assert verification.calls == []
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_resume_from_review_correction_checkpoint_uses_persisted_findings(tmp_path):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+    runs_dir = tmp_path / "runs"
+    snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
+    run_implementation_stage(
+        config,
+        snapshot.run_dir,
+        codex_runner=SequencedCodexRunner(
+            steps=[
+                CodexStep(
+                    result=implementation_result(),
+                    mutation=write_file("implemented\n"),
+                )
+            ],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    run_verification_stage(
+        config,
+        snapshot.run_dir,
+        process_runner=SequencedVerificationRunner(
+            steps=[VerificationStep()],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    run_review_stage(
+        config,
+        snapshot.run_dir,
+        codex_runner=SequencedCodexRunner(
+            steps=[
+                CodexStep(
+                    result=review_result(
+                        verdict=ReviewVerdict.CORRECTIONS_REQUIRED.value
+                    )
+                )
+            ],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    codex = SequencedCodexRunner(
+        steps=[
+            CodexStep(result=implementation_result(), mutation=write_file("fixed\n")),
+            CodexStep(result=review_result()),
+        ],
+        calls=[],
+    )
+
+    result = resume_ticket_lifecycle(
+        config,
+        snapshot.run_record.run_id,
+        runs_dir=runs_dir,
+        codex_runner=codex,
+        verification_runner=SequencedVerificationRunner(
+            steps=[VerificationStep()],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+
+    assert result.successful
+    assert result.run_record.current_correction_round == 1
+    assert [sandbox_value(command.argv) for command, _stdin in codex.calls] == [
+        Sandbox.WORKSPACE_WRITE.value,
+        Sandbox.READ_ONLY.value,
+    ]
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_resume_missing_review_correction_source_becomes_human_required(tmp_path):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+    runs_dir = tmp_path / "runs"
+    snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
+    run_implementation_stage(
+        config,
+        snapshot.run_dir,
+        codex_runner=SequencedCodexRunner(
+            steps=[
+                CodexStep(
+                    result=implementation_result(),
+                    mutation=write_file("implemented\n"),
+                )
+            ],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    run_verification_stage(
+        config,
+        snapshot.run_dir,
+        process_runner=SequencedVerificationRunner(
+            steps=[VerificationStep()],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    run_review_stage(
+        config,
+        snapshot.run_dir,
+        codex_runner=SequencedCodexRunner(
+            steps=[
+                CodexStep(
+                    result=review_result(
+                        verdict=ReviewVerdict.CORRECTIONS_REQUIRED.value
+                    )
+                )
+            ],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    snapshot.run_dir.joinpath("reviews", "round-1", "result.json").unlink()
+    codex = SequencedCodexRunner(
+        steps=[CodexStep(result=implementation_result())],
+        calls=[],
+    )
+
+    result = resume_ticket_lifecycle(
+        config,
+        snapshot.run_record.run_id,
+        runs_dir=runs_dir,
+        codex_runner=codex,
+        verification_runner=SequencedVerificationRunner(steps=[], calls=[]),
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert "Review correction source" in result.run_record.terminal_reason
+    assert codex.calls == []
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_resume_missing_verification_correction_source_becomes_human_required(tmp_path):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+    runs_dir = tmp_path / "runs"
+    snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
+    run_implementation_stage(
+        config,
+        snapshot.run_dir,
+        codex_runner=SequencedCodexRunner(
+            steps=[
+                CodexStep(
+                    result=implementation_result(),
+                    mutation=write_file("implemented\n"),
+                )
+            ],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    run_verification_stage(
+        config,
+        snapshot.run_dir,
+        process_runner=SequencedVerificationRunner(
+            steps=[
+                VerificationStep(
+                    returncode=7,
+                    stdout="runner failed\n",
+                    stderr="failure detail\n",
+                )
+            ],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    snapshot.run_dir.joinpath("verification", "round-0.json").unlink()
+    codex = SequencedCodexRunner(
+        steps=[CodexStep(result=implementation_result())],
+        calls=[],
+    )
+
+    result = resume_ticket_lifecycle(
+        config,
+        snapshot.run_record.run_id,
+        runs_dir=runs_dir,
+        codex_runner=codex,
+        verification_runner=SequencedVerificationRunner(steps=[], calls=[]),
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert "Verification correction source" in result.run_record.terminal_reason
+    assert codex.calls == []
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_resume_malformed_verification_correction_source_becomes_human_required(
+    tmp_path,
+):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+    runs_dir = tmp_path / "runs"
+    snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
+    run_implementation_stage(
+        config,
+        snapshot.run_dir,
+        codex_runner=SequencedCodexRunner(
+            steps=[
+                CodexStep(
+                    result=implementation_result(),
+                    mutation=write_file("implemented\n"),
+                )
+            ],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    run_verification_stage(
+        config,
+        snapshot.run_dir,
+        process_runner=SequencedVerificationRunner(
+            steps=[
+                VerificationStep(
+                    returncode=7,
+                    stdout="runner failed\n",
+                    stderr="failure detail\n",
+                )
+            ],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    verification_path = snapshot.run_dir / "verification" / "round-0.json"
+    verification_result = json.loads(verification_path.read_text(encoding="utf-8"))
+    verification_result["correction_reasons"] = "not a list"
+    verification_path.write_text(
+        json.dumps(verification_result),
+        encoding="utf-8",
+    )
+    codex = SequencedCodexRunner(
+        steps=[CodexStep(result=implementation_result())],
+        calls=[],
+    )
+
+    result = resume_ticket_lifecycle(
+        config,
+        snapshot.run_record.run_id,
+        runs_dir=runs_dir,
+        codex_runner=codex,
+        verification_runner=SequencedVerificationRunner(steps=[], calls=[]),
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert "correction_reasons must be a list" in result.run_record.terminal_reason
+    assert codex.calls == []
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_resume_interrupted_implementation_becomes_human_required(tmp_path):
+    repo, ticket, config = workflow_inputs(tmp_path)
+    runs_dir = tmp_path / "runs"
+    snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
+    repo.joinpath("file.txt").write_text("partial implementation\n", encoding="utf-8")
+    record_path = snapshot.run_dir / "run.json"
+    save_run_record(
+        load_run_record(record_path).with_state(
+            WorkflowState.IMPLEMENT,
+            updated_timestamp="2026-09-11T13:05:18Z",
+            last_completed_state=WorkflowState.SNAPSHOT,
+        ),
+        record_path,
+    )
+    codex = SequencedCodexRunner(steps=[CodexStep(result=review_result())], calls=[])
+
+    result = resume_ticket_lifecycle(
+        config,
+        snapshot.run_record.run_id,
+        runs_dir=runs_dir,
+        codex_runner=codex,
+        verification_runner=SequencedVerificationRunner(steps=[], calls=[]),
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert (
+        "Writable implementation was interrupted" in result.run_record.terminal_reason
+    )
+    assert codex.calls == []
+    assert result.run_dir.joinpath("final-report.md").is_file()
+    report = result.run_dir.joinpath("final-report.md").read_text(encoding="utf-8")
+    assert "Last completed state: SNAPSHOT" in report
+    assert "Source changes may be incomplete" in report
+    assert "What requires human inspection: Writable implementation" in report
+    assert "### Relevant artifact/log paths" in report
+    assert "- run.json" in report
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_resume_interrupted_correction_becomes_human_required(tmp_path):
+    repo, ticket, config = workflow_inputs(tmp_path)
+    runs_dir = tmp_path / "runs"
+    snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
+    repo.joinpath("file.txt").write_text("partial correction\n", encoding="utf-8")
+    record_path = snapshot.run_dir / "run.json"
+    save_run_record(
+        load_run_record(record_path).with_state(
+            WorkflowState.CORRECT,
+            updated_timestamp="2026-09-11T13:05:18Z",
+            last_completed_state=WorkflowState.CORRECT,
+        ),
+        record_path,
+    )
+
+    result = resume_ticket_lifecycle(
+        config,
+        snapshot.run_record.run_id,
+        runs_dir=runs_dir,
+        codex_runner=SequencedCodexRunner(
+            steps=[CodexStep(result=implementation_result())],
+            calls=[],
+        ),
+        verification_runner=SequencedVerificationRunner(steps=[], calls=[]),
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert "Writable correction was interrupted" in result.run_record.terminal_reason
+    assert result.run_dir.joinpath("final-report.md").is_file()
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_resume_restarts_interrupted_read_only_review_with_fresh_review(tmp_path):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+    runs_dir = tmp_path / "runs"
+    snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
+    run_implementation_stage(
+        config,
+        snapshot.run_dir,
+        codex_runner=SequencedCodexRunner(
+            steps=[
+                CodexStep(
+                    result=implementation_result(),
+                    mutation=write_file("implemented\n"),
+                )
+            ],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    run_verification_stage(
+        config,
+        snapshot.run_dir,
+        process_runner=SequencedVerificationRunner(
+            steps=[VerificationStep()],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    partial_review_dir = snapshot.run_dir / "reviews" / "round-1"
+    partial_review_dir.mkdir(parents=True)
+    partial_review_dir.joinpath("prompt.md").write_text(
+        "partial read-only review\n",
+        encoding="utf-8",
+    )
+    codex = SequencedCodexRunner(steps=[CodexStep(result=review_result())], calls=[])
+
+    result = resume_ticket_lifecycle(
+        config,
+        snapshot.run_record.run_id,
+        runs_dir=runs_dir,
+        codex_runner=codex,
+        verification_runner=SequencedVerificationRunner(steps=[], calls=[]),
+        clock=fixed_clock,
+    )
+
+    assert result.successful
+    assert [sandbox_value(command.argv) for command, _stdin in codex.calls] == [
+        Sandbox.READ_ONLY.value
+    ]
+    assert result.run_dir.joinpath("reviews", "round-1", "result.json").is_file()
 
 
 def workflow_inputs(

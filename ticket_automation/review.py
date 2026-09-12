@@ -90,7 +90,7 @@ class ReviewStageResult:
 
     @property
     def successful(self) -> bool:
-        return self.run_record.state == WorkflowState.READY_FOR_HUMAN
+        return self.run_record.state == WorkflowState.REPORT
 
     @property
     def required_findings(self) -> tuple[dict[str, Any], ...]:
@@ -127,7 +127,12 @@ def run_review_stage(
     repository = GitRepository(Path(run_record.target_repository_path))
     review_round = run_record.current_review_round + REVIEW_ROUND_OFFSET
     artifact_directory = run_path / REVIEW_DIR_NAME / f"round-{review_round}"
-    if artifact_directory.exists() and any(artifact_directory.iterdir()):
+    result_path = artifact_directory / "result.json"
+    if (
+        artifact_directory.exists()
+        and any(artifact_directory.iterdir())
+        and result_path.exists()
+    ):
         raise ReviewError(f"Review artifacts already exist for round-{review_round}.")
 
     starting_violations = _inspect_review_invariants(repository, run_record)
@@ -224,8 +229,8 @@ def run_review_stage(
 
     verdict = ReviewVerdict(review_result["verdict"])
     if verdict == ReviewVerdict.PASS:
-        state = WorkflowState.READY_FOR_HUMAN
-        controller_message = "Review passed; ready for human handoff."
+        state = WorkflowState.REPORT
+        controller_message = "Review passed; final report can start."
     elif verdict == ReviewVerdict.CORRECTIONS_REQUIRED:
         state = WorkflowState.CORRECT
         controller_message = "Review found required corrections."
@@ -491,12 +496,7 @@ def _timestamp(clock: Callable[[], datetime] | None) -> str:
     now = datetime.now(UTC) if clock is None else clock()
     if now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
-    return (
-        now.astimezone(UTC)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+    return now.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 __all__ = [

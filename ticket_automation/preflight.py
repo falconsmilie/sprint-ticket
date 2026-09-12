@@ -96,7 +96,9 @@ def format_preflight_result(result: PreflightResult) -> str:
     return "\n".join(rows)
 
 
-def _check_working_tree(repository: GitRepository, checks: list[PreflightCheck]) -> None:
+def _check_working_tree(
+    repository: GitRepository, checks: list[PreflightCheck]
+) -> None:
     changed_files = repository.unstaged_files()
     untracked_files = repository.untracked_files()
     if changed_files or untracked_files:
@@ -113,7 +115,9 @@ def _check_working_tree(repository: GitRepository, checks: list[PreflightCheck])
     checks.append(_pass("Working tree"))
 
 
-def _check_staging_area(repository: GitRepository, checks: list[PreflightCheck]) -> None:
+def _check_staging_area(
+    repository: GitRepository, checks: list[PreflightCheck]
+) -> None:
     staged_files = repository.staged_files()
     if staged_files:
         checks.append(
@@ -126,7 +130,9 @@ def _check_staging_area(repository: GitRepository, checks: list[PreflightCheck])
     checks.append(_pass("Staging area"))
 
 
-def _check_branch(repository: GitRepository, checks: list[PreflightCheck]) -> str | None:
+def _check_branch(
+    repository: GitRepository, checks: list[PreflightCheck]
+) -> str | None:
     branch = repository.current_branch()
     if branch is None:
         checks.append(_fail("Branch", "Repository is in detached HEAD state."))
@@ -180,7 +186,9 @@ def _executable_exists(executable: str, *, cwd: Path) -> bool:
         separator in executable for separator in (os.sep, os.altsep) if separator
     )
     if has_path_part:
-        candidate = executable_path if executable_path.is_absolute() else cwd / executable_path
+        candidate = (
+            executable_path if executable_path.is_absolute() else cwd / executable_path
+        )
         return candidate.is_file()
     return shutil.which(executable) is not None
 

@@ -18,7 +18,10 @@ def test_loads_example_config(tmp_path):
     assert config.codex.executable == "codex"
     assert config.codex.implementation_sandbox == "workspace-write"
     assert config.codex.review_sandbox == "read-only"
-    assert [command.name for command in config.verification.commands] == ["tests", "typing"]
+    assert [command.name for command in config.verification.commands] == [
+        "tests",
+        "typing",
+    ]
     assert [command.timeout_seconds for command in config.verification.commands] == [
         1800,
         1800,
@@ -71,9 +74,7 @@ def test_missing_local_config_is_acceptable(tmp_path):
         (
             {
                 "verification": {
-                    "commands": [
-                        {"name": "tests", "argv": ["python", "-m", "pytest"]}
-                    ]
+                    "commands": [{"name": "tests", "argv": ["python", "-m", "pytest"]}]
                 }
             },
             r"verification.commands\[1\].timeout_seconds",

@@ -240,9 +240,15 @@ def run_correction_stage(
         reasons=reasons,
         run_dir=run_path,
     )
+    active_record = run_record.with_state(
+        WorkflowState.CORRECT,
+        updated_timestamp=_timestamp(clock),
+        last_completed_state=WorkflowState.CORRECT,
+    )
+    save_run_record(active_record, run_record_path)
     ticket_path = _write_correction_ticket(
         run_path=run_path,
-        ticket_id=run_record.ticket_id,
+        ticket_id=active_record.ticket_id,
         round_number=correction_round,
         markdown=ticket_markdown,
     )
@@ -252,7 +258,7 @@ def run_correction_stage(
         correction_ticket=ticket_markdown,
         repository_context=_render_repository_context(
             repository,
-            run_record,
+            active_record,
             correction_round=correction_round,
         ),
     )
@@ -273,13 +279,13 @@ def run_correction_stage(
         )
         safety_violations = _inspect_correction_invariants(
             repository,
-            run_record,
+            active_record,
             phase="after correction",
         )
         patch_path, _patch_error = _try_capture_correction_diff(
             repository,
             run_path,
-            baseline_sha=run_record.baseline_sha,
+            baseline_sha=active_record.baseline_sha,
             round_number=correction_round,
         )
         state = (
@@ -296,7 +302,7 @@ def run_correction_stage(
                 f"{result_artifact_error}"
             )
         return _finish(
-            run_record=run_record,
+            run_record=active_record,
             run_record_path=run_record_path,
             run_dir=run_path,
             correction_round=correction_round,
@@ -315,18 +321,18 @@ def run_correction_stage(
     agent_result = _require_agent_result(execution.structured_result)
     safety_violations = _inspect_correction_invariants(
         repository,
-        run_record,
+        active_record,
         phase="after correction",
     )
     patch_path, patch_error = _try_capture_correction_diff(
         repository,
         run_path,
-        baseline_sha=run_record.baseline_sha,
+        baseline_sha=active_record.baseline_sha,
         round_number=correction_round,
     )
     if safety_violations:
         return _finish(
-            run_record=run_record,
+            run_record=active_record,
             run_record_path=run_record_path,
             run_dir=run_path,
             correction_round=correction_round,
@@ -344,7 +350,7 @@ def run_correction_stage(
 
     if agent_result["status"] == "BLOCKED":
         return _finish(
-            run_record=run_record,
+            run_record=active_record,
             run_record_path=run_record_path,
             run_dir=run_path,
             correction_round=correction_round,
@@ -362,7 +368,7 @@ def run_correction_stage(
 
     if patch_error is not None:
         return _finish(
-            run_record=run_record,
+            run_record=active_record,
             run_record_path=run_record_path,
             run_dir=run_path,
             correction_round=correction_round,
@@ -379,7 +385,7 @@ def run_correction_stage(
         )
 
     return _finish(
-        run_record=run_record,
+        run_record=active_record,
         run_record_path=run_record_path,
         run_dir=run_path,
         correction_round=correction_round,

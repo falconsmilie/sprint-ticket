@@ -7,7 +7,9 @@ from tests.helpers import GIT, create_git_repo, run_git
 from ticket_automation.git import GitRepository, GitSafetySnapshot
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for Git inspection tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for Git inspection tests"
+)
 def test_detects_git_repository_branch_and_sha(tmp_path):
     repo = create_git_repo(tmp_path / "repo", branch="feature/example")
     repository = GitRepository(repo)
@@ -18,7 +20,9 @@ def test_detects_git_repository_branch_and_sha(tmp_path):
     assert repository.head_sha() == run_git(repository.path, "rev-parse", "HEAD")
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for Git inspection tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for Git inspection tests"
+)
 def test_changed_files_relative_to_baseline(tmp_path):
     repo = create_git_repo(tmp_path / "repo")
     repository = GitRepository(repo)
@@ -30,7 +34,9 @@ def test_changed_files_relative_to_baseline(tmp_path):
     assert set(repository.changed_files(baseline)) == {"added.txt", "file.txt"}
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for Git inspection tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for Git inspection tests"
+)
 def test_diff_and_stats_relative_to_baseline(tmp_path):
     repo = create_git_repo(tmp_path / "repo")
     repository = GitRepository(repo)
@@ -66,7 +72,9 @@ def test_api_does_not_expose_mutation_operations():
     assert not forbidden_names.intersection(git_module.__all__)
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for Git inspection tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for Git inspection tests"
+)
 def test_safety_snapshot_detects_branch_head_and_staging_changes(tmp_path):
     repo = create_git_repo(tmp_path / "repo")
     repository = GitRepository(repo)

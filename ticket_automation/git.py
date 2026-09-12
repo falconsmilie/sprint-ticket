@@ -116,7 +116,9 @@ class GitRepository:
         return result.returncode == 0 and result.stdout.strip() == "true"
 
     def current_branch(self) -> str | None:
-        result = _git(self.path, ("symbolic-ref", "--quiet", "--short", "HEAD"), check=False)
+        result = _git(
+            self.path, ("symbolic-ref", "--quiet", "--short", "HEAD"), check=False
+        )
         if result.returncode == 0:
             return result.stdout.strip()
         if result.returncode == 1:
@@ -178,12 +180,16 @@ class GitRepository:
         return _git(self.path, ("diff", "--stat", baseline, "--")).stdout
 
 
-def _git(repo_path: Path, args: Iterable[str], *, check: bool = True) -> GitCommandResult:
+def _git(
+    repo_path: Path, args: Iterable[str], *, check: bool = True
+) -> GitCommandResult:
     argv = tuple(args)
     if not argv:
         raise ValueError("Git inspection command cannot be empty.")
     if argv[0] in _MUTATING_SUBCOMMANDS:
-        raise ValueError(f"Git subcommand is not available in read-only V1 support: {argv[0]}")
+        raise ValueError(
+            f"Git subcommand is not available in read-only V1 support: {argv[0]}"
+        )
 
     command = ("git", *argv)
     completed = subprocess.run(

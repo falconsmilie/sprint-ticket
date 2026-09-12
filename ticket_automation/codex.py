@@ -45,37 +45,40 @@ JSON_SCHEMA_ANNOTATION_KEYS = frozenset(
         "title",
     }
 )
-JSON_SCHEMA_SUPPORTED_KEYS = frozenset(
-    {
-        "$defs",
-        "$ref",
-        "additionalProperties",
-        "allOf",
-        "anyOf",
-        "const",
-        "definitions",
-        "enum",
-        "exclusiveMaximum",
-        "exclusiveMinimum",
-        "items",
-        "maxItems",
-        "maxLength",
-        "maxProperties",
-        "maximum",
-        "minItems",
-        "minLength",
-        "minProperties",
-        "minimum",
-        "multipleOf",
-        "not",
-        "oneOf",
-        "pattern",
-        "properties",
-        "required",
-        "type",
-        "uniqueItems",
-    }
-) | JSON_SCHEMA_ANNOTATION_KEYS
+JSON_SCHEMA_SUPPORTED_KEYS = (
+    frozenset(
+        {
+            "$defs",
+            "$ref",
+            "additionalProperties",
+            "allOf",
+            "anyOf",
+            "const",
+            "definitions",
+            "enum",
+            "exclusiveMaximum",
+            "exclusiveMinimum",
+            "items",
+            "maxItems",
+            "maxLength",
+            "maxProperties",
+            "maximum",
+            "minItems",
+            "minLength",
+            "minProperties",
+            "minimum",
+            "multipleOf",
+            "not",
+            "oneOf",
+            "pattern",
+            "properties",
+            "required",
+            "type",
+            "uniqueItems",
+        }
+    )
+    | JSON_SCHEMA_ANNOTATION_KEYS
+)
 JSON_TYPES = frozenset(
     {
         "array",
@@ -150,8 +153,7 @@ class CodexProcessRunner(Protocol):
         *,
         stdin: str,
         timeout_seconds: float | None,
-    ) -> CodexProcessResult:
-        ...
+    ) -> CodexProcessResult: ...
 
 
 @dataclass(frozen=True)
@@ -290,7 +292,9 @@ class CodexExecutor:
             )
         except FileNotFoundError as error:
             artifact_paths.events.write_text("", encoding="utf-8", newline="\n")
-            artifact_paths.stderr.write_text(f"{error}\n", encoding="utf-8", newline="\n")
+            artifact_paths.stderr.write_text(
+                f"{error}\n", encoding="utf-8", newline="\n"
+            )
             return _fail(
                 kind=CodexFailureKind.EXECUTABLE_UNAVAILABLE,
                 message=f"Codex executable is unavailable: {self.executable}",
@@ -324,7 +328,9 @@ class CodexExecutor:
             )
         except OSError as error:
             artifact_paths.events.write_text("", encoding="utf-8", newline="\n")
-            artifact_paths.stderr.write_text(f"{error}\n", encoding="utf-8", newline="\n")
+            artifact_paths.stderr.write_text(
+                f"{error}\n", encoding="utf-8", newline="\n"
+            )
             return _fail(
                 kind=CodexFailureKind.PROCESS_START_FAILED,
                 message=f"Could not start Codex process: {error}",
@@ -1143,7 +1149,9 @@ def _assert_object_schema(
     additional_properties = schema.get("additionalProperties")
     if additional_properties not in (None, True, False):
         if not isinstance(additional_properties, dict):
-            raise ValueError(f"{path}.additionalProperties must be a boolean or object.")
+            raise ValueError(
+                f"{path}.additionalProperties must be a boolean or object."
+            )
         _assert_supported_schema(
             additional_properties,
             root_schema=root_schema,

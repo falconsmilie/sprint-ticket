@@ -14,4 +14,3 @@ class WorkflowState(StrEnum):
     READY_FOR_HUMAN = "READY_FOR_HUMAN"
     HUMAN_REQUIRED = "HUMAN_REQUIRED"
     FAILED = "FAILED"
-

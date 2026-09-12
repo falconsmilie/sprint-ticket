@@ -19,7 +19,7 @@ from ticket_automation.config import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 GIT = shutil.which("git")
-FAKE_CODEX_SCRIPT = r'''
+FAKE_CODEX_SCRIPT = r"""
 from __future__ import annotations
 
 import json
@@ -109,7 +109,7 @@ elif action == "branch":
 else:
     sys.stderr.write(f"unknown fake codex action: {action}\n")
     raise SystemExit(2)
-'''
+"""
 
 
 def run_cli(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:

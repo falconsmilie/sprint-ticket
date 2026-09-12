@@ -1,0 +1,778 @@
+from __future__ import annotations
+
+import json
+import subprocess
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from os import devnull
+from pathlib import Path
+from typing import Any
+
+from .git import GitCommandError, GitRepository
+from .models import WorkflowState
+from .runs import RUN_RECORD_FILE, RunError, RunRecord, load_run_record, save_run_record
+
+DIFFS_DIR_NAME = "diffs"
+FINAL_PATCH_FILE = "final.patch"
+FINAL_REPORT_FILE = "final-report.md"
+IMPLEMENTATION_DIR_NAME = "implementation"
+CORRECTIONS_DIR_NAME = "corrections"
+CORRECTION_EXECUTIONS_DIR_NAME = "correction-executions"
+REVIEWS_DIR_NAME = "reviews"
+VERIFICATION_DIR_NAME = "verification"
+RESULT_JSON = "result.json"
+
+
+class ReportError(RunError):
+    """Raised when the final audit report cannot be generated."""
+
+
+@dataclass(frozen=True)
+class GitSafetyStatus:
+    branch_expected: str
+    branch_actual: str
+    head_expected: str
+    head_actual: str
+    staged_files: tuple[str, ...]
+    inspection_error: str | None = None
+
+    @property
+    def branch_ok(self) -> bool:
+        return (
+            self.inspection_error is None and self.branch_expected == self.branch_actual
+        )
+
+    @property
+    def head_ok(self) -> bool:
+        return self.inspection_error is None and self.head_expected == self.head_actual
+
+    @property
+    def staging_ok(self) -> bool:
+        return self.inspection_error is None and not self.staged_files
+
+    @property
+    def safe(self) -> bool:
+        return self.branch_ok and self.head_ok and self.staging_ok
+
+
+@dataclass(frozen=True)
+class ReportStageResult:
+    run_dir: Path
+    run_record: RunRecord
+    final_patch_path: Path
+    final_report_path: Path
+    changed_files: tuple[str, ...]
+    additions: int
+    deletions: int
+    git_safety: GitSafetyStatus
+    controller_message: str
+
+    @property
+    def successful(self) -> bool:
+        return self.run_record.state == WorkflowState.READY_FOR_HUMAN
+
+
+def run_report_stage(
+    run_dir: Path | str,
+    *,
+    clock: Callable[[], datetime] | None = None,
+) -> ReportStageResult:
+    run_path = Path(run_dir)
+    record_path = run_path / RUN_RECORD_FILE
+    run_record = load_run_record(record_path)
+    if run_record.state != WorkflowState.REPORT:
+        raise ReportError(
+            f"Report requires run state REPORT; found {run_record.state.value}."
+        )
+
+    final_patch_path, patch_text = capture_final_patch(run_path, run_record)
+    context = collect_report_context(run_path, run_record, patch_text=patch_text)
+    acceptance_problem = _acceptance_problem(context)
+    if acceptance_problem is None:
+        updated_record = run_record.with_state(
+            WorkflowState.READY_FOR_HUMAN,
+            updated_timestamp=_timestamp(clock),
+            last_completed_state=WorkflowState.REPORT,
+            terminal_reason=None,
+        )
+        controller_message = "Final report generated; ready for human review."
+    else:
+        updated_record = run_record.with_state(
+            WorkflowState.HUMAN_REQUIRED,
+            updated_timestamp=_timestamp(clock),
+            last_completed_state=WorkflowState.REPORT,
+            terminal_reason=acceptance_problem,
+        )
+        controller_message = acceptance_problem
+
+    context["run_record"] = updated_record
+    report_text = render_final_report(context, terminal_reason=acceptance_problem)
+    final_report_path = run_path / FINAL_REPORT_FILE
+    _write_text(final_report_path, report_text)
+
+    refreshed_safety = inspect_git_safety(run_record)
+    if (
+        not refreshed_safety.safe
+        and updated_record.state == WorkflowState.READY_FOR_HUMAN
+    ):
+        acceptance_problem = "Repository safety invariants changed during reporting."
+        updated_record = run_record.with_state(
+            WorkflowState.HUMAN_REQUIRED,
+            updated_timestamp=_timestamp(clock),
+            last_completed_state=WorkflowState.REPORT,
+            terminal_reason=acceptance_problem,
+        )
+        context = collect_report_context(
+            run_path, updated_record, patch_text=patch_text
+        )
+        context["run_record"] = updated_record
+        _write_text(
+            final_report_path,
+            render_final_report(context, terminal_reason=acceptance_problem),
+        )
+        controller_message = acceptance_problem
+
+    save_run_record(updated_record, record_path)
+    return ReportStageResult(
+        run_dir=run_path,
+        run_record=updated_record,
+        final_patch_path=final_patch_path,
+        final_report_path=final_report_path,
+        changed_files=tuple(context["controller"]["changed_files"]),
+        additions=int(context["controller"]["additions"]),
+        deletions=int(context["controller"]["deletions"]),
+        git_safety=refreshed_safety,
+        controller_message=controller_message,
+    )
+
+
+def generate_terminal_report_best_effort(run_dir: Path | str) -> Path | None:
+    run_path = Path(run_dir)
+    try:
+        run_record = load_run_record(run_path / RUN_RECORD_FILE)
+        _final_patch_path, patch_text = capture_final_patch(run_path, run_record)
+        context = collect_report_context(run_path, run_record, patch_text=patch_text)
+        report_text = render_final_report(
+            context,
+            terminal_reason=run_record.terminal_reason,
+        )
+        final_report_path = run_path / FINAL_REPORT_FILE
+        _write_text(final_report_path, report_text)
+        return final_report_path
+    except (
+        GitCommandError,
+        KeyError,
+        OSError,
+        ReportError,
+        RunError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+
+def capture_final_patch(
+    run_dir: Path | str,
+    run_record: RunRecord,
+) -> tuple[Path, str]:
+    repository = GitRepository(Path(run_record.target_repository_path))
+    diffs_dir = Path(run_dir) / DIFFS_DIR_NAME
+    diffs_dir.mkdir(parents=True, exist_ok=True)
+    patch_path = diffs_dir / FINAL_PATCH_FILE
+    try:
+        patch = diff_including_untracked(repository, run_record.baseline_sha)
+    except (GitCommandError, OSError, ValueError) as error:
+        raise ReportError(f"Could not capture final diff: {error}") from error
+    _write_text(patch_path, patch)
+    return patch_path, patch
+
+
+def collect_report_context(
+    run_dir: Path | str,
+    run_record: RunRecord,
+    *,
+    patch_text: str | None = None,
+) -> dict[str, Any]:
+    run_path = Path(run_dir)
+    repository = GitRepository(Path(run_record.target_repository_path))
+    patch = patch_text
+    if patch is None:
+        try:
+            patch = diff_including_untracked(repository, run_record.baseline_sha)
+        except (GitCommandError, OSError, ValueError):
+            patch = ""
+
+    changed_files, diff_stats = _git_diff_facts(repository, run_record)
+    additions, deletions = count_patch_changes(patch)
+    implementation_result = _read_json_if_exists(
+        run_path / IMPLEMENTATION_DIR_NAME / RESULT_JSON
+    )
+    verification_rounds = _read_numbered_json_files(run_path / VERIFICATION_DIR_NAME)
+    review_results = _read_review_results(run_path)
+    correction_ticket_paths = tuple(
+        sorted(
+            str(path.relative_to(run_path))
+            for path in (run_path / CORRECTIONS_DIR_NAME).glob("*.md")
+        )
+        if (run_path / CORRECTIONS_DIR_NAME).is_dir()
+        else ()
+    )
+    final_review = review_results[-1]["data"] if review_results else None
+    advisory_findings = _findings_with_disposition(final_review, "ADVISORY")
+    follow_up_findings = _findings_with_disposition(final_review, "FOLLOW_UP")
+    safety = inspect_git_safety(run_record)
+    checkpoint_patch_path = latest_writable_checkpoint_patch(run_path, run_record)
+    checkpoint_patch_matches = _checkpoint_patch_matches(checkpoint_patch_path, patch)
+
+    return {
+        "run_dir": run_path,
+        "run_record": run_record,
+        "controller": {
+            "artifact_paths": _existing_artifact_paths(run_path),
+            "changed_files": changed_files,
+            "diff_stats": diff_stats,
+            "additions": additions,
+            "deletions": deletions,
+            "verification_rounds": verification_rounds,
+            "review_results": review_results,
+            "correction_ticket_paths": correction_ticket_paths,
+            "final_review": final_review,
+            "advisory_findings": advisory_findings,
+            "follow_up_findings": follow_up_findings,
+            "git_safety": safety,
+            "latest_writable_checkpoint_patch": (
+                None
+                if checkpoint_patch_path is None
+                else str(checkpoint_patch_path.relative_to(run_path))
+            ),
+            "current_diff_matches_checkpoint": checkpoint_patch_matches,
+            "final_patch_path": str(
+                (run_path / DIFFS_DIR_NAME / FINAL_PATCH_FILE).relative_to(run_path)
+            ),
+            "final_report_path": FINAL_REPORT_FILE,
+        },
+        "agent": {
+            "implementation": implementation_result,
+        },
+    }
+
+
+def render_final_report(
+    context: dict[str, Any],
+    *,
+    terminal_reason: str | None,
+) -> str:
+    record: RunRecord = context["run_record"]
+    controller: dict[str, Any] = context["controller"]
+    agent: dict[str, Any] = context["agent"]
+    safety: GitSafetyStatus = controller["git_safety"]
+    implementation = agent["implementation"]
+    final_review = controller["final_review"]
+
+    lines = [
+        f"# {record.ticket_id} final report",
+        "",
+        "## Run identity",
+        "",
+        f"- Run ID: {record.run_id}",
+        f"- Ticket ID: {record.ticket_id}",
+        f"- Original ticket path: {record.original_ticket_path}",
+        f"- Snapshotted ticket path: {record.run_ticket_copy_path}",
+        f"- Target repository path: {record.target_repository_path}",
+        f"- Starting branch: {record.starting_branch}",
+        f"- Baseline SHA: {record.baseline_sha}",
+        f"- Last completed state: {record.last_completed_state.value}",
+        f"- Terminal outcome: {record.state.value}",
+    ]
+    if terminal_reason:
+        lines.append(f"- Terminal reason: {terminal_reason}")
+    elif record.terminal_reason:
+        lines.append(f"- Terminal reason: {record.terminal_reason}")
+
+    lines.extend(
+        [
+            "",
+            "## Authoritative controller evidence",
+            "",
+            (
+                "These facts were observed by TicketAutomation from Git, persisted "
+                "runner artifacts, or structured review results."
+            ),
+            "",
+            "### Git",
+            "",
+            f"- Current branch: {safety.branch_actual}",
+            f"- Current HEAD: {safety.head_actual}",
+            f"- Branch unchanged: {_yes_no(safety.branch_ok)}",
+            f"- HEAD unchanged: {_yes_no(safety.head_ok)}",
+            f"- Staging empty: {_yes_no(safety.staging_ok)}",
+            (
+                "- Current source diff matches last verified writable checkpoint: "
+                f"{_yes_no(controller['current_diff_matches_checkpoint'])}"
+            ),
+            f"- Changed files: {len(controller['changed_files'])}",
+        ]
+    )
+    if controller["changed_files"]:
+        lines.extend(f"  - {file_path}" for file_path in controller["changed_files"])
+    else:
+        lines.append("  - none")
+
+    lines.extend(
+        [
+            f"- Diff line counts: +{controller['additions']} / -{controller['deletions']}",
+            "- Diff statistics:",
+            "",
+            "```text",
+            controller["diff_stats"] or "No diff statistics available.",
+            "```",
+            f"- Final patch: {controller['final_patch_path']}",
+        ]
+    )
+    if safety.inspection_error:
+        lines.append(f"- Git inspection error: {safety.inspection_error}")
+    checkpoint_patch = controller["latest_writable_checkpoint_patch"]
+    if checkpoint_patch is not None:
+        lines.append(f"- Latest writable checkpoint patch: {checkpoint_patch}")
+
+    lines.extend(
+        [
+            "",
+            "### Deterministic verification",
+            "",
+            f"- Verification rounds: {len(controller['verification_rounds'])}",
+        ]
+    )
+    if controller["verification_rounds"]:
+        for round_item in controller["verification_rounds"]:
+            data = round_item["data"]
+            lines.append(
+                f"- round-{data.get('round_index', '?')}: {data.get('status', 'UNKNOWN')}"
+            )
+            commands = data.get("commands", [])
+            if isinstance(commands, list):
+                for command in commands:
+                    if not isinstance(command, dict):
+                        continue
+                    lines.append(
+                        "  - "
+                        f"{command.get('name', '<unnamed>')}: "
+                        f"{command.get('status', 'UNKNOWN')} "
+                        f"(exit {command.get('exit_code', 'n/a')})"
+                    )
+    else:
+        lines.append("- No deterministic verification rounds were persisted.")
+
+    lines.extend(
+        [
+            "",
+            "### Independent review",
+            "",
+            f"- Review rounds: {len(controller['review_results'])}",
+            f"- Final review verdict: {_review_verdict(final_review)}",
+            f"- Advisory findings: {len(controller['advisory_findings'])}",
+            f"- Follow-up findings: {len(controller['follow_up_findings'])}",
+        ]
+    )
+    _append_findings(lines, "Advisory finding detail", controller["advisory_findings"])
+    _append_findings(
+        lines, "Follow-up finding detail", controller["follow_up_findings"]
+    )
+
+    lines.extend(
+        [
+            "",
+            "### Corrective work",
+            "",
+            f"- Corrective rounds completed: {record.current_correction_round}",
+            f"- Corrective round limit: {record.max_correction_rounds}",
+            f"- Generated corrective tickets: {len(controller['correction_ticket_paths'])}",
+        ]
+    )
+    if controller["correction_ticket_paths"]:
+        lines.extend(f"  - {path}" for path in controller["correction_ticket_paths"])
+    else:
+        lines.append("  - none")
+
+    lines.extend(
+        [
+            "",
+            "## Agent-reported information",
+            "",
+            (
+                "Implementation-agent targeted validation is reported here as an "
+                "agent claim. It is not treated as equivalent to deterministic "
+                "runner verification."
+            ),
+        ]
+    )
+    if isinstance(implementation, dict):
+        lines.extend(
+            [
+                "",
+                f"- Implementation-agent status: {implementation.get('status', 'UNKNOWN')}",
+                f"- Implementation-agent summary: {implementation.get('summary', '')}",
+                "- Implementation-agent targeted validation:",
+            ]
+        )
+        tests = implementation.get("tests_run", [])
+        if isinstance(tests, list) and tests:
+            for item in tests:
+                lines.append(f"  - {_format_agent_test(item)}")
+        else:
+            lines.append("  - none reported")
+    else:
+        lines.extend(["", "- No implementation-agent result artifact was available."])
+
+    lines.extend(
+        [
+            "",
+            "## Handoff notes",
+            "",
+            "- TicketAutomation did not intentionally stage target-repository changes.",
+            "- TicketAutomation did not intentionally commit target-repository changes.",
+        ]
+    )
+    if record.state == WorkflowState.HUMAN_REQUIRED:
+        lines.extend(
+            [
+                "- Automation stopped for human inspection.",
+                "- Source changes may be incomplete or may require manual judgment.",
+                "- Inspect the run artifacts and target repository before continuing.",
+                (
+                    "- What requires human inspection: "
+                    f"{terminal_reason or record.terminal_reason or 'See terminal outcome.'}"
+                ),
+            ]
+        )
+    elif record.state == WorkflowState.FAILED:
+        lines.extend(
+            [
+                "- Automation stopped because infrastructure or controller execution failed.",
+                "- Existing run artifacts should be inspected before retrying.",
+                (
+                    "- What requires human inspection: "
+                    f"{terminal_reason or record.terminal_reason or 'See terminal outcome.'}"
+                ),
+            ]
+        )
+
+    lines.extend(["", "### Relevant artifact/log paths", ""])
+    artifact_paths = controller["artifact_paths"]
+    if artifact_paths:
+        lines.extend(f"- {path}" for path in artifact_paths)
+    else:
+        lines.append("- none available")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def inspect_git_safety(run_record: RunRecord) -> GitSafetyStatus:
+    repository = GitRepository(Path(run_record.target_repository_path))
+    try:
+        branch = repository.current_branch()
+        head = repository.head_sha()
+        staged_files = repository.staged_files()
+    except (GitCommandError, OSError) as error:
+        return GitSafetyStatus(
+            branch_expected=run_record.starting_branch,
+            branch_actual="<unknown>",
+            head_expected=run_record.baseline_sha,
+            head_actual="<unknown>",
+            staged_files=(),
+            inspection_error=str(error),
+        )
+    return GitSafetyStatus(
+        branch_expected=run_record.starting_branch,
+        branch_actual="<detached>" if branch is None else branch,
+        head_expected=run_record.baseline_sha,
+        head_actual=head,
+        staged_files=staged_files,
+    )
+
+
+def diff_including_untracked(repository: GitRepository, baseline_sha: str) -> str:
+    parts = [repository.diff(baseline_sha).rstrip()]
+    for file_path in repository.untracked_files():
+        parts.append(
+            _git_no_index_diff(repository.path, file_path, stats=False).rstrip()
+        )
+    return _join_git_sections(parts)
+
+
+def diff_stats_including_untracked(repository: GitRepository, baseline_sha: str) -> str:
+    parts = [repository.diff_stats(baseline_sha).rstrip()]
+    for file_path in repository.untracked_files():
+        parts.append(
+            _git_no_index_diff(repository.path, file_path, stats=True).rstrip()
+        )
+    return _join_git_sections(parts)
+
+
+def changed_files_including_untracked(
+    repository: GitRepository,
+    baseline_sha: str,
+) -> tuple[str, ...]:
+    return _unique(
+        (*repository.changed_files(baseline_sha), *repository.untracked_files())
+    )
+
+
+def count_patch_changes(patch_text: str) -> tuple[int, int]:
+    additions = 0
+    deletions = 0
+    for line in patch_text.splitlines():
+        if line.startswith(("+++", "---")):
+            continue
+        if line.startswith("+"):
+            additions += 1
+        elif line.startswith("-"):
+            deletions += 1
+    return additions, deletions
+
+
+def latest_verification_round(run_dir: Path | str) -> dict[str, Any] | None:
+    rounds = _read_numbered_json_files(Path(run_dir) / VERIFICATION_DIR_NAME)
+    return None if not rounds else rounds[-1]["data"]
+
+
+def latest_review_result(run_dir: Path | str) -> dict[str, Any] | None:
+    results = _read_review_results(Path(run_dir))
+    return None if not results else results[-1]["data"]
+
+
+def latest_writable_checkpoint_patch(
+    run_dir: Path | str,
+    run_record: RunRecord,
+) -> Path | None:
+    run_path = Path(run_dir)
+    if run_record.current_correction_round > 0:
+        path = (
+            run_path
+            / DIFFS_DIR_NAME
+            / f"after-correction-{run_record.current_correction_round}.patch"
+        )
+        return path if path.is_file() else None
+    path = run_path / DIFFS_DIR_NAME / "after-implementation.patch"
+    return path if path.is_file() else None
+
+
+def _acceptance_problem(context: dict[str, Any]) -> str | None:
+    controller = context["controller"]
+    safety: GitSafetyStatus = controller["git_safety"]
+    verification = (
+        None
+        if not controller["verification_rounds"]
+        else controller["verification_rounds"][-1]["data"]
+    )
+    final_review = controller["final_review"]
+
+    if not safety.safe:
+        return "Repository safety invariants were violated before human handoff."
+    if not controller["current_diff_matches_checkpoint"]:
+        return (
+            "Current source diff no longer matches the last verified writable "
+            "checkpoint."
+        )
+    if not isinstance(verification, dict) or verification.get("status") != "PASS":
+        return "Deterministic verification is not currently passing."
+    if not isinstance(final_review, dict) or final_review.get("verdict") != "PASS":
+        return "Final independent review did not pass."
+    return None
+
+
+def _git_diff_facts(
+    repository: GitRepository,
+    run_record: RunRecord,
+) -> tuple[tuple[str, ...], str]:
+    try:
+        return (
+            changed_files_including_untracked(repository, run_record.baseline_sha),
+            diff_stats_including_untracked(repository, run_record.baseline_sha),
+        )
+    except (GitCommandError, OSError, ValueError):
+        return (), ""
+
+
+def _checkpoint_patch_matches(path: Path | None, current_patch: str) -> bool:
+    if path is None:
+        return False
+    try:
+        return path.read_text(encoding="utf-8") == current_patch
+    except OSError:
+        return False
+
+
+def _read_numbered_json_files(directory: Path) -> tuple[dict[str, Any], ...]:
+    if not directory.is_dir():
+        return ()
+    items: list[dict[str, Any]] = []
+    for path in sorted(directory.glob("round-*.json"), key=_round_sort_key):
+        data = _read_json_if_exists(path)
+        if isinstance(data, dict):
+            items.append({"path": path, "data": data})
+    return tuple(items)
+
+
+def _read_review_results(run_dir: Path) -> tuple[dict[str, Any], ...]:
+    review_root = run_dir / REVIEWS_DIR_NAME
+    if not review_root.is_dir():
+        return ()
+    items: list[dict[str, Any]] = []
+    for path in sorted(review_root.glob("round-*"), key=_round_sort_key):
+        result_path = path / RESULT_JSON
+        data = _read_json_if_exists(result_path)
+        if isinstance(data, dict):
+            items.append({"path": result_path, "data": data})
+    return tuple(items)
+
+
+def _read_json_if_exists(path: Path) -> Any | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+
+
+def _existing_artifact_paths(run_path: Path) -> tuple[str, ...]:
+    if not run_path.is_dir():
+        return ()
+    paths: list[str] = []
+    for path in run_path.rglob("*"):
+        if path.is_file():
+            paths.append(path.relative_to(run_path).as_posix())
+    return tuple(sorted(paths))
+
+
+def _findings_with_disposition(
+    review_result: dict[str, Any] | None,
+    disposition: str,
+) -> tuple[dict[str, Any], ...]:
+    if not isinstance(review_result, dict):
+        return ()
+    findings = review_result.get("findings", [])
+    if not isinstance(findings, list):
+        return ()
+    return tuple(
+        item
+        for item in findings
+        if isinstance(item, dict) and item.get("disposition") == disposition
+    )
+
+
+def _append_findings(
+    lines: list[str],
+    title: str,
+    findings: tuple[dict[str, Any], ...],
+) -> None:
+    if not findings:
+        return
+    lines.extend(["", f"### {title}", ""])
+    for finding in findings:
+        finding_id = finding.get("id", "<unknown>")
+        finding_title = finding.get("title", "Untitled finding")
+        lines.append(f"- {finding_id}: {finding_title}")
+
+
+def _format_agent_test(item: Any) -> str:
+    if not isinstance(item, dict):
+        return repr(item)
+    command = item.get("command", "<unknown command>")
+    result = item.get("result", "<unknown result>")
+    return f"{command} -> {result}"
+
+
+def _review_verdict(review_result: dict[str, Any] | None) -> str:
+    if not isinstance(review_result, dict):
+        return "NOT AVAILABLE"
+    verdict = review_result.get("verdict")
+    return verdict if isinstance(verdict, str) else "NOT AVAILABLE"
+
+
+def _git_no_index_diff(repo_path: Path, file_path: str, *, stats: bool) -> str:
+    null_candidates = (
+        ("/dev/null",) if devnull == "/dev/null" else ("/dev/null", devnull)
+    )
+    last_result: subprocess.CompletedProcess[str] | None = None
+    for null_path in null_candidates:
+        command = ["git", "diff", "--no-ext-diff", "--no-index"]
+        if stats:
+            command.append("--stat")
+        command.extend(("--", null_path, file_path))
+        result = subprocess.run(
+            command,
+            cwd=repo_path,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode in (0, 1):
+            return result.stdout
+        last_result = result
+    assert last_result is not None
+    message = last_result.stderr.strip() or last_result.stdout.strip() or "no output"
+    command_text = " ".join(str(argument) for argument in last_result.args)
+    raise GitCommandError(
+        f"{command_text} failed with exit code {last_result.returncode}: {message}"
+    )
+
+
+def _join_git_sections(parts: Iterable[str]) -> str:
+    content = "\n".join(part for part in parts if part)
+    if not content:
+        return ""
+    return f"{content}\n"
+
+
+def _unique(values: Iterable[str]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(values))
+
+
+def _round_sort_key(path: Path) -> tuple[int, str]:
+    stem = path.name
+    if path.is_file():
+        stem = path.stem
+    marker = stem.rsplit("-", maxsplit=1)[-1]
+    try:
+        return int(marker), path.as_posix()
+    except ValueError:
+        return 1_000_000, path.as_posix()
+
+
+def _yes_no(value: bool) -> str:
+    return "yes" if value else "no"
+
+
+def _write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8", newline="\n")
+
+
+def _timestamp(clock: Callable[[], datetime] | None) -> str:
+    now = datetime.now(UTC) if clock is None else clock()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    return now.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+__all__ = [
+    "FINAL_PATCH_FILE",
+    "FINAL_REPORT_FILE",
+    "ReportError",
+    "ReportStageResult",
+    "capture_final_patch",
+    "changed_files_including_untracked",
+    "collect_report_context",
+    "count_patch_changes",
+    "diff_including_untracked",
+    "diff_stats_including_untracked",
+    "generate_terminal_report_best_effort",
+    "inspect_git_safety",
+    "latest_review_result",
+    "latest_verification_round",
+    "latest_writable_checkpoint_patch",
+    "render_final_report",
+    "run_report_stage",
+]

@@ -14,7 +14,11 @@ from .runs import (
     format_status,
     list_run_records,
 )
-from .workflow import format_lifecycle_result, run_ticket_lifecycle
+from .workflow import (
+    format_lifecycle_result,
+    resume_ticket_lifecycle,
+    run_ticket_lifecycle,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -63,6 +67,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="List known ticket automation runs.",
     )
     status_parser.set_defaults(handler=_handle_status)
+
+    resume_parser = subparsers.add_parser(
+        "resume",
+        help="Resume a known run from an explicitly safe persisted checkpoint.",
+    )
+    resume_parser.add_argument(
+        "run_id",
+        help="Run ID under the configured runs directory.",
+    )
+    resume_parser.set_defaults(handler=_handle_resume)
 
     return parser
 
@@ -116,3 +130,20 @@ def _handle_status(args: argparse.Namespace) -> int:
     runs_dir = args.config_dir / RUNS_DIR_NAME
     print(format_status(list_run_records(runs_dir), runs_dir=runs_dir))
     return 0
+
+
+def _handle_resume(args: argparse.Namespace) -> int:
+    config = load_config(args.config_dir)
+    runs_dir = args.config_dir / RUNS_DIR_NAME
+    try:
+        result = resume_ticket_lifecycle(
+            config,
+            args.run_id,
+            runs_dir=runs_dir,
+        )
+    except RunError as error:
+        print(f"Run error: {error}", file=sys.stderr)
+        return 1
+
+    print(format_lifecycle_result(result))
+    return 0 if result.successful else 1

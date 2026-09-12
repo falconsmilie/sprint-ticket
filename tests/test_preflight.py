@@ -10,7 +10,9 @@ def check(result, name: str):
     return next(item for item in result.checks if item.name == name)
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for preflight tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for preflight tests"
+)
 def test_clean_feature_branch_passes(tmp_path):
     repo = create_git_repo(tmp_path / "repo")
 
@@ -20,7 +22,9 @@ def test_clean_feature_branch_passes(tmp_path):
     assert check(result, "Branch").message == "feature/example"
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for preflight tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for preflight tests"
+)
 def test_dirty_working_tree_fails_without_modifying_repository(tmp_path):
     repo = create_git_repo(tmp_path / "repo")
     (repo / "file.txt").write_text("dirty\n", encoding="utf-8")
@@ -34,7 +38,9 @@ def test_dirty_working_tree_fails_without_modifying_repository(tmp_path):
     assert run_git(repo, "status", "--short") == status_before
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for preflight tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for preflight tests"
+)
 def test_staged_files_fail(tmp_path):
     repo = create_git_repo(tmp_path / "repo")
     (repo / "file.txt").write_text("staged\n", encoding="utf-8")
@@ -47,7 +53,9 @@ def test_staged_files_fail(tmp_path):
     assert "file.txt" in check(result, "Staging area").message
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for preflight tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for preflight tests"
+)
 def test_protected_branch_fails(tmp_path):
     repo = create_git_repo(tmp_path / "repo", branch="main")
 
@@ -58,7 +66,9 @@ def test_protected_branch_fails(tmp_path):
     assert "main" in check(result, "Protected branch").message
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for preflight tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for preflight tests"
+)
 def test_detached_head_fails(tmp_path):
     repo = create_git_repo(tmp_path / "repo")
     run_git(repo, "checkout", "--detach", "HEAD")
@@ -70,7 +80,9 @@ def test_detached_head_fails(tmp_path):
     assert "detached HEAD" in check(result, "Branch").message
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for preflight tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for preflight tests"
+)
 def test_non_git_directory_fails(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -82,7 +94,9 @@ def test_non_git_directory_fails(tmp_path):
     assert "not a Git working tree" in check(result, "Git repository").message
 
 
-@pytest.mark.skipif(GIT is None, reason="git executable is required for preflight tests")
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for preflight tests"
+)
 def test_missing_codex_executable_fails_with_useful_reason(tmp_path):
     repo = create_git_repo(tmp_path / "repo")
 
