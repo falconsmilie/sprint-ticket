@@ -274,9 +274,6 @@ def run_correction_stage(
             runner=codex_runner,
         )
     except CodexExecutionFailure as error:
-        result_artifact_error = _write_correction_failure_result_artifact(
-            error.execution
-        )
         safety_violations = _inspect_correction_invariants(
             repository,
             active_record,
@@ -296,11 +293,6 @@ def run_correction_stage(
             if safety_violations
             else error.execution.failure_message or str(error)
         )
-        if result_artifact_error is not None:
-            message = (
-                f"{message} Could not persist correction result artifact: "
-                f"{result_artifact_error}"
-            )
         return _finish(
             run_record=active_record,
             run_record_path=run_record_path,
@@ -714,34 +706,6 @@ def _load_required_review_findings(
             "Review requested corrections but did not contain REQUIRED findings."
         )
     return findings
-
-
-def _write_correction_failure_result_artifact(
-    execution: CodexExecution,
-) -> str | None:
-    if execution.result_json_path.exists():
-        return None
-    result = {
-        "status": "FAILED",
-        "summary": (
-            execution.failure_message
-            or "Codex correction failed before returning a valid result."
-        ),
-        "failure_kind": (
-            None if execution.failure_kind is None else execution.failure_kind.value
-        ),
-        "process_exit_code": execution.process_exit_code,
-    }
-    try:
-        execution.result_json_path.parent.mkdir(parents=True, exist_ok=True)
-        execution.result_json_path.write_text(
-            json.dumps(result, indent=2) + "\n",
-            encoding="utf-8",
-            newline="\n",
-        )
-    except OSError as error:
-        return str(error)
-    return None
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:

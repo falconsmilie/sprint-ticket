@@ -23,7 +23,6 @@ from ticket_automation.implementation import (
 from ticket_automation.models import WorkflowState
 from ticket_automation.runs import create_run_snapshot, load_run_record, save_run_record
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 IMPLEMENTATION_DIR = "implementation"
 DIFFS_DIR = "diffs"
@@ -146,6 +145,13 @@ def test_completed_implementation_is_accepted_and_artifacts_are_stored(tmp_path)
     assert implementation_dir.joinpath("prompt.md").is_file()
     assert implementation_dir.joinpath("events.jsonl").is_file()
     assert implementation_dir.joinpath("stderr.log").is_file()
+    assert implementation_dir.joinpath("execution.json").is_file()
+    execution_record = json.loads(
+        implementation_dir.joinpath("execution.json").read_text()
+    )
+    assert execution_record["status"] == "SUCCESS"
+    assert execution_record["structured_result_present"] is True
+    assert execution_record["result_json_present"] is True
     assert (
         json.loads(implementation_dir.joinpath("result.json").read_text())["status"]
         == "COMPLETED"
@@ -457,6 +463,13 @@ def test_process_failure_becomes_failed_state(tmp_path):
     assert (
         result.codex_execution.stderr_log_path.read_text(encoding="utf-8") == "boom\n"
     )
+    execution_record = json.loads(
+        result.codex_execution.execution_json_path.read_text(encoding="utf-8")
+    )
+    assert execution_record["status"] == "FAILED"
+    assert execution_record["failure_kind"] == "NON_ZERO_EXIT"
+    assert execution_record["process_exit_code"] == 2
+    assert execution_record["result_json_present"] is False
     assert not result.codex_execution.result_json_path.exists()
 
 

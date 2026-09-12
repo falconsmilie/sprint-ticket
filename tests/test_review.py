@@ -109,6 +109,12 @@ def test_review_uses_read_only_sandbox_and_writes_round_one_artifacts(tmp_path):
     assert review_dir.joinpath("prompt.md").is_file()
     assert review_dir.joinpath("events.jsonl").is_file()
     assert review_dir.joinpath("stderr.log").is_file()
+    assert review_dir.joinpath("execution.json").is_file()
+    execution_record = json.loads(review_dir.joinpath("execution.json").read_text())
+    assert execution_record["status"] == "SUCCESS"
+    assert execution_record["sandbox"] == Sandbox.READ_ONLY.value
+    assert execution_record["structured_result_present"] is True
+    assert execution_record["result_json_present"] is True
     assert (
         json.loads(review_dir.joinpath("result.json").read_text())["verdict"] == "PASS"
     )

@@ -10,7 +10,12 @@ from pathlib import Path
 import pytest
 
 from tests.helpers import GIT, create_git_repo, make_config, run_git
-from ticket_automation.codex import CodexCommand, CodexProcessResult, Sandbox
+from ticket_automation.codex import (
+    CodexCommand,
+    CodexFailureKind,
+    CodexProcessResult,
+    Sandbox,
+)
 from ticket_automation.config import AppConfig, VerificationCommand
 from ticket_automation.corrections import (
     CORRECTION_EXECUTIONS_DIR_NAME,
@@ -223,7 +228,13 @@ def test_correction_runs_as_fresh_workspace_write_invocation(tmp_path):
     assert correction_dir.joinpath("prompt.md").is_file()
     assert correction_dir.joinpath("events.jsonl").is_file()
     assert correction_dir.joinpath("stderr.log").is_file()
+    assert correction_dir.joinpath("execution.json").is_file()
     assert correction_dir.joinpath("result.json").is_file()
+    execution_record = json.loads(correction_dir.joinpath("execution.json").read_text())
+    assert execution_record["status"] == "SUCCESS"
+    assert execution_record["sandbox"] == Sandbox.WORKSPACE_WRITE.value
+    assert execution_record["structured_result_present"] is True
+    assert execution_record["result_json_present"] is True
     assert correction_dir.joinpath("stderr.log").read_text() == "correction progress\n"
 
 
@@ -380,22 +391,27 @@ def test_oversized_logs_are_not_blindly_embedded(tmp_path):
 @pytest.mark.skipif(
     GIT is None, reason="git executable is required for correction tests"
 )
-def test_codex_boundary_failure_persists_correction_result_artifact(tmp_path):
+def test_codex_boundary_failure_persists_canonical_execution_artifact(tmp_path):
     _repo, run_dir, config = review_correct_run(tmp_path)
     runner = ProcessFailureRunner()
 
     result = run_correction_stage(config, run_dir, codex_runner=runner)
 
-    result_path = run_dir / CORRECTION_EXECUTIONS_DIR_NAME / ROUND_1 / "result.json"
-    saved = json.loads(result_path.read_text(encoding="utf-8"))
+    artifact_dir = run_dir / CORRECTION_EXECUTIONS_DIR_NAME / ROUND_1
+    execution_record = json.loads(
+        artifact_dir.joinpath("execution.json").read_text(encoding="utf-8")
+    )
     assert runner.calls == 1
     assert result.run_record.state == WorkflowState.FAILED
-    assert saved == {
-        "status": "FAILED",
-        "summary": "Codex exited with code 2.",
-        "failure_kind": "NON_ZERO_EXIT",
-        "process_exit_code": 2,
-    }
+    assert artifact_dir.joinpath("prompt.md").is_file()
+    assert artifact_dir.joinpath("events.jsonl").is_file()
+    assert artifact_dir.joinpath("stderr.log").is_file()
+    assert not artifact_dir.joinpath("result.json").exists()
+    assert execution_record["status"] == "FAILED"
+    assert execution_record["failure_kind"] == CodexFailureKind.NON_ZERO_EXIT.value
+    assert execution_record["process_exit_code"] == 2
+    assert execution_record["structured_result_present"] is False
+    assert execution_record["result_json_present"] is False
 
 
 @pytest.mark.skipif(

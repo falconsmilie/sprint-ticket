@@ -1,20 +1,22 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
-
 DEFAULT_CODEX_EXECUTABLE = "codex"
 DEFAULT_TIMEOUT_SECONDS = 60 * 60
 PROMPT_ARTIFACT = "prompt.md"
 EVENTS_ARTIFACT = "events.jsonl"
 STDERR_ARTIFACT = "stderr.log"
+_EXECUTION_ARTIFACT = "execution.json"
 RESULT_ARTIFACT = "result.json"
 
 
@@ -118,6 +120,10 @@ class CodexResultValidationError(ValueError):
     """Raised when the final structured result does not match the schema."""
 
 
+class _CodexStructuredResultDecodeError(CodexResultValidationError):
+    """Raised when Codex emits a structured result payload that cannot be decoded."""
+
+
 @dataclass(frozen=True)
 class CodexCommand:
     argv: tuple[str, ...]
@@ -166,12 +172,17 @@ class CodexExecution:
     prompt_path: Path
     events_jsonl_path: Path
     stderr_log_path: Path
+    execution_json_path: Path
     result_json_path: Path
     started_at: str
     ended_at: str
     duration_seconds: float
     status: CodexExecutionStatus
+    process_started: bool
     process_exit_code: int | None
+    timed_out: bool = False
+    timeout_seconds: float | None = None
+    structured_result_present: bool = False
     structured_result: Any | None = None
     failure_kind: CodexFailureKind | None = None
     failure_message: str | None = None
@@ -281,6 +292,7 @@ class CodexExecutor:
                 output_schema=output_schema,
                 artifacts=artifact_paths,
                 started_at=start,
+                process_started=False,
                 exit_code=None,
             )
 
@@ -303,6 +315,7 @@ class CodexExecutor:
                 output_schema=output_schema,
                 artifacts=artifact_paths,
                 started_at=start,
+                process_started=False,
                 exit_code=None,
             )
         except CodexProcessTimedOut as error:
@@ -324,7 +337,10 @@ class CodexExecutor:
                 output_schema=output_schema,
                 artifacts=artifact_paths,
                 started_at=start,
+                process_started=True,
                 exit_code=None,
+                timed_out=True,
+                timeout_seconds=error.result.timeout_seconds,
             )
         except OSError as error:
             artifact_paths.events.write_text("", encoding="utf-8", newline="\n")
@@ -339,6 +355,7 @@ class CodexExecutor:
                 output_schema=output_schema,
                 artifacts=artifact_paths,
                 started_at=start,
+                process_started=False,
                 exit_code=None,
             )
 
@@ -359,6 +376,7 @@ class CodexExecutor:
                 output_schema=output_schema,
                 artifacts=artifact_paths,
                 started_at=start,
+                process_started=True,
                 exit_code=process.returncode,
             )
 
@@ -373,6 +391,7 @@ class CodexExecutor:
                 output_schema=output_schema,
                 artifacts=artifact_paths,
                 started_at=start,
+                process_started=True,
                 exit_code=process.returncode,
             )
 
@@ -386,11 +405,25 @@ class CodexExecutor:
                 output_schema=output_schema,
                 artifacts=artifact_paths,
                 started_at=start,
+                process_started=True,
                 exit_code=process.returncode,
             )
 
         try:
             result = extract_structured_result(events)
+        except _CodexStructuredResultDecodeError as error:
+            return _fail(
+                kind=CodexFailureKind.INVALID_STRUCTURED_RESULT,
+                message=str(error),
+                command=command,
+                sandbox=sandbox,
+                output_schema=output_schema,
+                artifacts=artifact_paths,
+                started_at=start,
+                process_started=True,
+                exit_code=process.returncode,
+                structured_result_present=True,
+            )
         except CodexResultValidationError as error:
             return _fail(
                 kind=CodexFailureKind.MISSING_STRUCTURED_RESULT,
@@ -400,6 +433,7 @@ class CodexExecutor:
                 output_schema=output_schema,
                 artifacts=artifact_paths,
                 started_at=start,
+                process_started=True,
                 exit_code=process.returncode,
             )
 
@@ -414,12 +448,14 @@ class CodexExecutor:
                 output_schema=output_schema,
                 artifacts=artifact_paths,
                 started_at=start,
+                process_started=True,
                 exit_code=process.returncode,
+                structured_result_present=True,
             )
 
         _write_json_artifact(artifact_paths.result, result)
         ended = _utcnow()
-        return CodexExecution(
+        execution = CodexExecution(
             argv=command.argv,
             repo_path=command.cwd,
             sandbox=sandbox,
@@ -428,14 +464,19 @@ class CodexExecutor:
             prompt_path=artifact_paths.prompt,
             events_jsonl_path=artifact_paths.events,
             stderr_log_path=artifact_paths.stderr,
+            execution_json_path=artifact_paths.execution,
             result_json_path=artifact_paths.result,
             started_at=_format_timestamp(start),
             ended_at=_format_timestamp(ended),
             duration_seconds=_duration_seconds(start, ended),
             status=CodexExecutionStatus.SUCCESS,
+            process_started=True,
             process_exit_code=process.returncode,
+            structured_result_present=True,
             structured_result=result,
         )
+        _write_execution_artifact(execution)
+        return execution
 
 
 def execute(
@@ -526,6 +567,7 @@ class _ArtifactPaths:
     prompt: Path
     events: Path
     stderr: Path
+    execution: Path
     result: Path
 
 
@@ -543,6 +585,7 @@ def _artifact_paths(artifact_directory: Path) -> _ArtifactPaths:
         prompt=directory / PROMPT_ARTIFACT,
         events=directory / EVENTS_ARTIFACT,
         stderr=directory / STDERR_ARTIFACT,
+        execution=directory / _EXECUTION_ARTIFACT,
         result=directory / RESULT_ARTIFACT,
     )
 
@@ -556,7 +599,11 @@ def _fail(
     output_schema: Path,
     artifacts: _ArtifactPaths,
     started_at: datetime,
+    process_started: bool,
     exit_code: int | None,
+    timed_out: bool = False,
+    timeout_seconds: float | None = None,
+    structured_result_present: bool = False,
 ) -> CodexExecution:
     ended = _utcnow()
     if not artifacts.events.exists():
@@ -572,15 +619,21 @@ def _fail(
         prompt_path=artifacts.prompt,
         events_jsonl_path=artifacts.events,
         stderr_log_path=artifacts.stderr,
+        execution_json_path=artifacts.execution,
         result_json_path=artifacts.result,
         started_at=_format_timestamp(started_at),
         ended_at=_format_timestamp(ended),
         duration_seconds=_duration_seconds(started_at, ended),
         status=CodexExecutionStatus.FAILED,
+        process_started=process_started,
         process_exit_code=exit_code,
+        timed_out=timed_out,
+        timeout_seconds=timeout_seconds,
+        structured_result_present=structured_result_present,
         failure_kind=kind,
         failure_message=message,
     )
+    _write_execution_artifact(execution)
     raise CodexExecutionFailure(message, kind=kind, execution=execution)
 
 
@@ -594,11 +647,78 @@ def _load_schema(path: Path) -> dict[str, Any]:
 
 
 def _write_json_artifact(path: Path, data: Any) -> None:
-    path.write_text(
-        json.dumps(data, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
+    _atomic_write_json(path, data)
+
+
+def _write_execution_artifact(execution: CodexExecution) -> None:
+    _write_json_artifact(execution.execution_json_path, _execution_record(execution))
+
+
+def _execution_record(execution: CodexExecution) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "format": "ticket_automation.codex_execution",
+        "status": execution.status.value,
+        "process_started": execution.process_started,
+        "process_exit_code": execution.process_exit_code,
+        "timed_out": execution.timed_out,
+        "timeout_seconds": execution.timeout_seconds,
+        "failure_kind": (
+            None
+            if execution.failure_kind is None
+            else execution.failure_kind.value
+        ),
+        "failure_message": execution.failure_message,
+        "started_at": execution.started_at,
+        "ended_at": execution.ended_at,
+        "duration_seconds": execution.duration_seconds,
+        "sandbox": execution.sandbox.value,
+        "argv": list(execution.argv),
+        "repo_path": str(execution.repo_path),
+        "output_schema_path": str(execution.output_schema_path),
+        "structured_result_present": execution.structured_result_present,
+        "result_json_present": execution.result_json_path.is_file(),
+        "artifact_paths": {
+            "prompt_md": str(execution.prompt_path),
+            "events_jsonl": str(execution.events_jsonl_path),
+            "stderr_log": str(execution.stderr_log_path),
+            "execution_json": str(execution.execution_json_path),
+            "result_json": str(execution.result_json_path),
+        },
+    }
+
+
+def _atomic_write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(data, indent=2, sort_keys=True)
+    temp_path: Path | None = None
+    file_descriptor = -1
+    try:
+        file_descriptor, temp_name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            text=True,
+        )
+        temp_path = Path(temp_name)
+        with os.fdopen(
+            file_descriptor,
+            "w",
+            encoding="utf-8",
+            newline="\n",
+        ) as temp_file:
+            file_descriptor = -1
+            temp_file.write(payload)
+            temp_file.write("\n")
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_path, path)
+    except Exception:
+        if file_descriptor != -1:
+            os.close(file_descriptor)
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        raise
 
 
 def _structured_result_from_event(event: dict[str, Any]) -> Any:
@@ -641,7 +761,7 @@ def _decode_structured_result(value: Any) -> Any:
     try:
         return json.loads(value)
     except json.JSONDecodeError as error:
-        raise CodexResultValidationError(
+        raise _CodexStructuredResultDecodeError(
             "Codex final agent message was not valid structured JSON."
         ) from error
 
@@ -1294,6 +1414,12 @@ def _process_text(value: str | bytes | None) -> str:
 
 
 __all__ = [
+    "DEFAULT_CODEX_EXECUTABLE",
+    "DEFAULT_TIMEOUT_SECONDS",
+    "EVENTS_ARTIFACT",
+    "PROMPT_ARTIFACT",
+    "RESULT_ARTIFACT",
+    "STDERR_ARTIFACT",
     "CodexCommand",
     "CodexEventParseError",
     "CodexExecution",
@@ -1302,16 +1428,10 @@ __all__ = [
     "CodexExecutor",
     "CodexFailureKind",
     "CodexProcessResult",
+    "CodexProcessRunner",
     "CodexProcessTimedOut",
     "CodexProcessTimeout",
-    "CodexProcessRunner",
     "CodexResultValidationError",
-    "DEFAULT_CODEX_EXECUTABLE",
-    "DEFAULT_TIMEOUT_SECONDS",
-    "EVENTS_ARTIFACT",
-    "PROMPT_ARTIFACT",
-    "RESULT_ARTIFACT",
-    "STDERR_ARTIFACT",
     "Sandbox",
     "SubprocessCodexRunner",
     "build_codex_command",

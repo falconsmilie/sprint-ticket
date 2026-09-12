@@ -131,9 +131,10 @@ def test_persists_jsonl_stderr_prompt_and_structured_result(tmp_path):
     runner = FakeRunner(
         result=CodexProcessResult(returncode=0, stdout=events, stderr="progress\n")
     )
+    prompt = "generated prompt\nSECRET_TOKEN=do-not-persist"
 
     result = execute(
-        prompt="generated prompt",
+        prompt=prompt,
         repo_path=tmp_path,
         sandbox=Sandbox.READ_ONLY,
         output_schema=schema,
@@ -142,13 +143,30 @@ def test_persists_jsonl_stderr_prompt_and_structured_result(tmp_path):
         runner=runner,
     )
 
-    assert result.prompt_path.read_text(encoding="utf-8") == "generated prompt"
+    assert result.prompt_path.read_text(encoding="utf-8") == prompt
     assert result.events_jsonl_path.read_text(encoding="utf-8") == events
     assert result.stderr_log_path.read_text(encoding="utf-8") == "progress\n"
     assert json.loads(result.result_json_path.read_text(encoding="utf-8")) == {
         "notes": ["done"],
         "status": "ok",
     }
+    execution_record = read_execution_record(result)
+    assert execution_record["status"] == "SUCCESS"
+    assert execution_record["process_started"] is True
+    assert execution_record["process_exit_code"] == 0
+    assert execution_record["timed_out"] is False
+    assert execution_record["failure_kind"] is None
+    assert execution_record["structured_result_present"] is True
+    assert execution_record["result_json_present"] is True
+    assert execution_record["artifact_paths"] == {
+        "events_jsonl": str(result.events_jsonl_path),
+        "execution_json": str(result.execution_json_path),
+        "prompt_md": str(result.prompt_path),
+        "result_json": str(result.result_json_path),
+        "stderr_log": str(result.stderr_log_path),
+    }
+    assert "structured_result" not in execution_record
+    assert "SECRET_TOKEN" not in json.dumps(execution_record)
     assert result.structured_result == {"status": "ok", "notes": ["done"]}
     assert result.process_exit_code == 0
     assert result.successful
@@ -255,6 +273,12 @@ def test_nonzero_exit_is_typed_failure_and_not_fake_result(tmp_path):
     assert (
         raised.value.execution.stderr_log_path.read_text(encoding="utf-8") == "boom\n"
     )
+    assert_failure_execution_record(
+        raised.value.execution,
+        failure_kind=CodexFailureKind.NON_ZERO_EXIT,
+        process_started=True,
+        exit_code=2,
+    )
     assert not raised.value.execution.result_json_path.exists()
 
 
@@ -342,6 +366,54 @@ def test_non_agent_result_event_does_not_count_as_final_result(tmp_path):
     assert not raised.value.execution.result_json_path.exists()
 
 
+def test_present_but_malformed_structured_result_is_invalid_result(tmp_path):
+    schema = write_schema(tmp_path / "schema.json")
+    runner = FakeRunner(
+        result=CodexProcessResult(
+            returncode=0,
+            stdout="\n".join(
+                [
+                    json.dumps({"type": "thread.started", "thread_id": "thread"}),
+                    json.dumps({"type": "turn.started"}),
+                    json.dumps(
+                        {
+                            "type": "item.completed",
+                            "item": {
+                                "id": "item_1",
+                                "type": "agent_message",
+                                "text": "{not valid json",
+                            },
+                        }
+                    ),
+                    json.dumps({"type": "turn.completed"}),
+                ]
+            )
+            + "\n",
+            stderr="",
+        )
+    )
+
+    with pytest.raises(CodexExecutionFailure) as raised:
+        execute(
+            prompt="prompt",
+            repo_path=tmp_path,
+            sandbox=Sandbox.READ_ONLY,
+            output_schema=schema,
+            artifact_directory=tmp_path / "artifacts",
+            executable="codex",
+            runner=runner,
+        )
+
+    assert raised.value.kind == CodexFailureKind.INVALID_STRUCTURED_RESULT
+    assert_failure_execution_record(
+        raised.value.execution,
+        failure_kind=CodexFailureKind.INVALID_STRUCTURED_RESULT,
+        process_started=True,
+        exit_code=0,
+        structured_result_present=True,
+    )
+
+
 def test_timeout_preserves_available_logs(tmp_path):
     schema = write_schema(tmp_path / "schema.json")
     runner = FakeRunner(
@@ -373,6 +445,14 @@ def test_timeout_preserves_available_logs(tmp_path):
         raised.value.execution.stderr_log_path.read_text(encoding="utf-8")
         == "still working\n"
     )
+    execution_record = assert_failure_execution_record(
+        raised.value.execution,
+        failure_kind=CodexFailureKind.TIMEOUT,
+        process_started=True,
+        exit_code=None,
+        timed_out=True,
+    )
+    assert execution_record["timeout_seconds"] == 3
     assert runner.timeout_seconds == 3
 
 
@@ -424,6 +504,12 @@ def test_malformed_jsonl_is_typed_failure(tmp_path):
     assert raised.value.execution.events_jsonl_path.read_text(
         encoding="utf-8"
     ).endswith("nope\n")
+    assert_failure_execution_record(
+        raised.value.execution,
+        failure_kind=CodexFailureKind.MALFORMED_EVENT_STREAM,
+        process_started=True,
+        exit_code=0,
+    )
     assert not raised.value.execution.result_json_path.exists()
 
 
@@ -449,6 +535,12 @@ def test_missing_structured_result_is_typed_failure(tmp_path):
         )
 
     assert raised.value.kind == CodexFailureKind.MISSING_STRUCTURED_RESULT
+    assert_failure_execution_record(
+        raised.value.execution,
+        failure_kind=CodexFailureKind.MISSING_STRUCTURED_RESULT,
+        process_started=True,
+        exit_code=0,
+    )
 
 
 def test_schema_incompatible_result_is_typed_failure(tmp_path):
@@ -467,6 +559,13 @@ def test_schema_incompatible_result_is_typed_failure(tmp_path):
         )
 
     assert raised.value.kind == CodexFailureKind.INVALID_STRUCTURED_RESULT
+    assert_failure_execution_record(
+        raised.value.execution,
+        failure_kind=CodexFailureKind.INVALID_STRUCTURED_RESULT,
+        process_started=True,
+        exit_code=0,
+        structured_result_present=True,
+    )
     assert not raised.value.execution.result_json_path.exists()
 
 
@@ -566,6 +665,12 @@ def test_unsupported_schema_keywords_fail_without_running_codex(tmp_path):
 
     assert runner.calls == 0
     assert raised.value.kind == CodexFailureKind.INVALID_SCHEMA
+    assert_failure_execution_record(
+        raised.value.execution,
+        failure_kind=CodexFailureKind.INVALID_SCHEMA,
+        process_started=False,
+        exit_code=None,
+    )
 
 
 def test_paths_containing_spaces_retain_argument_boundaries(tmp_path):
@@ -611,6 +716,36 @@ def test_process_start_failure_is_typed(tmp_path):
     assert raised.value.kind == CodexFailureKind.EXECUTABLE_UNAVAILABLE
     assert raised.value.execution.prompt_path.read_text(encoding="utf-8") == "prompt"
     assert raised.value.execution.stderr_log_path.read_text(encoding="utf-8")
+    assert_failure_execution_record(
+        raised.value.execution,
+        failure_kind=CodexFailureKind.EXECUTABLE_UNAVAILABLE,
+        process_started=False,
+        exit_code=None,
+    )
+
+
+def test_subprocess_creation_failure_is_typed_and_persisted(tmp_path):
+    schema = write_schema(tmp_path / "schema.json")
+    runner = FakeRunner(error=OSError("permission denied"))
+
+    with pytest.raises(CodexExecutionFailure) as raised:
+        execute(
+            prompt="prompt",
+            repo_path=tmp_path,
+            sandbox=Sandbox.READ_ONLY,
+            output_schema=schema,
+            artifact_directory=tmp_path / "artifacts",
+            executable="codex",
+            runner=runner,
+        )
+
+    assert raised.value.kind == CodexFailureKind.PROCESS_START_FAILED
+    assert_failure_execution_record(
+        raised.value.execution,
+        failure_kind=CodexFailureKind.PROCESS_START_FAILED,
+        process_started=False,
+        exit_code=None,
+    )
 
 
 def test_authentication_or_service_failure_event_is_typed(tmp_path):
@@ -636,6 +771,12 @@ def test_authentication_or_service_failure_event_is_typed(tmp_path):
         )
 
     assert raised.value.kind == CodexFailureKind.AUTHENTICATION_OR_SERVICE
+    assert_failure_execution_record(
+        raised.value.execution,
+        failure_kind=CodexFailureKind.AUTHENTICATION_OR_SERVICE,
+        process_started=True,
+        exit_code=0,
+    )
 
 
 def test_subprocess_runner_does_not_use_shell(monkeypatch, tmp_path):
@@ -665,6 +806,45 @@ def test_subprocess_runner_does_not_use_shell(monkeypatch, tmp_path):
     assert captured["kwargs"]["cwd"] == tmp_path
     assert captured["kwargs"]["input"] == "prompt"
     assert captured["kwargs"]["shell"] is False
+
+
+def read_execution_record(execution) -> dict[str, object]:
+    assert execution.execution_json_path.is_file()
+    return json.loads(execution.execution_json_path.read_text(encoding="utf-8"))
+
+
+def assert_failure_execution_record(
+    execution,
+    *,
+    failure_kind: CodexFailureKind,
+    process_started: bool,
+    exit_code: int | None,
+    timed_out: bool = False,
+    structured_result_present: bool = False,
+) -> dict[str, object]:
+    assert execution.prompt_path.is_file()
+    assert execution.events_jsonl_path.is_file()
+    assert execution.stderr_log_path.is_file()
+    assert execution.execution_json_path.is_file()
+    assert not execution.result_json_path.exists()
+    record = read_execution_record(execution)
+    assert record["status"] == "FAILED"
+    assert record["process_started"] is process_started
+    assert record["process_exit_code"] == exit_code
+    assert record["timed_out"] is timed_out
+    assert record["failure_kind"] == failure_kind.value
+    assert isinstance(record["failure_message"], str)
+    assert record["structured_result_present"] is structured_result_present
+    assert record["result_json_present"] is False
+    assert record["artifact_paths"] == {
+        "events_jsonl": str(execution.events_jsonl_path),
+        "execution_json": str(execution.execution_json_path),
+        "prompt_md": str(execution.prompt_path),
+        "result_json": str(execution.result_json_path),
+        "stderr_log": str(execution.stderr_log_path),
+    }
+    assert "structured_result" not in record
+    return record
 
 
 def successful_process(result: dict[str, object]) -> CodexProcessResult:
