@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import shutil
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -12,8 +16,10 @@ from .codex import (
     CodexExecution,
     CodexExecutionFailure,
     CodexProcessRunner,
+    CodexResultValidationError,
     Sandbox,
     parse_sandbox,
+    validate_json_schema,
 )
 from .codex import (
     execute as execute_codex,
@@ -35,6 +41,10 @@ from .verification import VERIFICATION_DIR_NAME
 
 REVIEW_DIR_NAME = "reviews"
 REVIEW_ROUND_OFFSET = 1
+_REVIEW_CHECKPOINT_SCHEMA_VERSION = 1
+_REVIEW_CHECKPOINT_FORMAT = "ticket_automation.review_checkpoint"
+_REVIEW_CHECKPOINT_FILE = "checkpoint.json"
+_INCOMPLETE_ARTIFACT_DIR_NAME = "_incomplete"
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _REVIEW_PROMPT_TEMPLATE = _PROJECT_ROOT / "prompts" / "review.md"
 _REVIEW_RESULT_SCHEMA = _PROJECT_ROOT / "schemas" / "review-result.schema.json"
@@ -67,6 +77,12 @@ class FindingDisposition(StrEnum):
     REQUIRED = "REQUIRED"
     ADVISORY = "ADVISORY"
     FOLLOW_UP = "FOLLOW_UP"
+
+
+class _ReviewArtifactState(StrEnum):
+    MISSING = "MISSING"
+    PARTIAL = "PARTIAL"
+    COMPLETE = "COMPLETE"
 
 
 @dataclass(frozen=True)
@@ -128,12 +144,6 @@ def run_review_stage(
     review_round = run_record.current_review_round + REVIEW_ROUND_OFFSET
     artifact_directory = run_path / REVIEW_DIR_NAME / f"round-{review_round}"
     result_path = artifact_directory / "result.json"
-    if (
-        artifact_directory.exists()
-        and any(artifact_directory.iterdir())
-        and result_path.exists()
-    ):
-        raise ReviewError(f"Review artifacts already exist for round-{review_round}.")
 
     starting_violations = _inspect_review_invariants(repository, run_record)
     if starting_violations:
@@ -157,6 +167,55 @@ def run_review_stage(
         current_branch=_current_branch_label(repository),
         verification_results=_read_verification_results(run_path, run_record),
         implementation_summary=_read_implementation_summary(run_path),
+    )
+    artifact_state = _review_artifact_state(artifact_directory, result_path)
+    if artifact_state == _ReviewArtifactState.COMPLETE:
+        review_result, adoption_problem = _load_existing_review_result(
+            artifact_directory=artifact_directory,
+            result_path=result_path,
+            expected_prompt=prompt,
+            run_record=run_record,
+            review_round=review_round,
+        )
+        if adoption_problem is None and review_result is not None:
+            safety_violations = _inspect_review_invariants(repository, run_record)
+            if safety_violations:
+                return _finish(
+                    run_record=run_record,
+                    run_record_path=run_record_path,
+                    run_dir=run_path,
+                    artifact_directory=artifact_directory,
+                    execution=None,
+                    review_result=review_result,
+                    safety_violations=safety_violations,
+                    processing_error=None,
+                    state=WorkflowState.HUMAN_REQUIRED,
+                    controller_message=(
+                        "Repository safety invariants were violated before "
+                        "review checkpoint adoption."
+                    ),
+                    clock=clock,
+                )
+            return _finish_valid_review_result(
+                run_record=run_record,
+                run_record_path=run_record_path,
+                run_dir=run_path,
+                artifact_directory=artifact_directory,
+                execution=None,
+                review_result=review_result,
+                clock=clock,
+            )
+        _archive_review_artifacts(artifact_directory)
+    elif artifact_state == _ReviewArtifactState.PARTIAL:
+        _archive_review_artifacts(artifact_directory)
+
+    _write_review_checkpoint(
+        artifact_directory / _REVIEW_CHECKPOINT_FILE,
+        _review_checkpoint(
+            run_record,
+            review_round=review_round,
+            prompt=prompt,
+        ),
     )
 
     try:
@@ -210,45 +269,13 @@ def run_review_stage(
             clock=clock,
         )
 
-    try:
-        validate_review_result_semantics(review_result)
-    except ReviewResultConsistencyError as error:
-        return _finish(
-            run_record=run_record,
-            run_record_path=run_record_path,
-            run_dir=run_path,
-            artifact_directory=artifact_directory,
-            execution=execution,
-            review_result=review_result,
-            safety_violations=(),
-            processing_error=str(error),
-            state=WorkflowState.HUMAN_REQUIRED,
-            controller_message=f"Review result is logically contradictory: {error}",
-            clock=clock,
-        )
-
-    verdict = ReviewVerdict(review_result["verdict"])
-    if verdict == ReviewVerdict.PASS:
-        state = WorkflowState.REPORT
-        controller_message = "Review passed; final report can start."
-    elif verdict == ReviewVerdict.CORRECTIONS_REQUIRED:
-        state = WorkflowState.CORRECT
-        controller_message = "Review found required corrections."
-    else:
-        state = WorkflowState.HUMAN_REQUIRED
-        controller_message = "Review requires human attention."
-
-    return _finish(
+    return _finish_valid_review_result(
         run_record=run_record,
         run_record_path=run_record_path,
         run_dir=run_path,
         artifact_directory=artifact_directory,
         execution=execution,
         review_result=review_result,
-        safety_violations=(),
-        processing_error=None,
-        state=state,
-        controller_message=controller_message,
         clock=clock,
     )
 
@@ -287,6 +314,59 @@ def format_review_result(result: ReviewStageResult) -> str:
     return "\n".join(rows)
 
 
+def _finish_valid_review_result(
+    *,
+    run_record: RunRecord,
+    run_record_path: Path,
+    run_dir: Path,
+    artifact_directory: Path,
+    execution: CodexExecution | None,
+    review_result: dict[str, Any],
+    clock: Callable[[], datetime] | None,
+) -> ReviewStageResult:
+    try:
+        validate_review_result_semantics(review_result)
+    except ReviewResultConsistencyError as error:
+        return _finish(
+            run_record=run_record,
+            run_record_path=run_record_path,
+            run_dir=run_dir,
+            artifact_directory=artifact_directory,
+            execution=execution,
+            review_result=review_result,
+            safety_violations=(),
+            processing_error=str(error),
+            state=WorkflowState.HUMAN_REQUIRED,
+            controller_message=f"Review result is logically contradictory: {error}",
+            clock=clock,
+        )
+
+    verdict = ReviewVerdict(review_result["verdict"])
+    if verdict == ReviewVerdict.PASS:
+        state = WorkflowState.REPORT
+        controller_message = "Review passed; final report can start."
+    elif verdict == ReviewVerdict.CORRECTIONS_REQUIRED:
+        state = WorkflowState.CORRECT
+        controller_message = "Review found required corrections."
+    else:
+        state = WorkflowState.HUMAN_REQUIRED
+        controller_message = "Review requires human attention."
+
+    return _finish(
+        run_record=run_record,
+        run_record_path=run_record_path,
+        run_dir=run_dir,
+        artifact_directory=artifact_directory,
+        execution=execution,
+        review_result=review_result,
+        safety_violations=(),
+        processing_error=None,
+        state=state,
+        controller_message=controller_message,
+        clock=clock,
+    )
+
+
 def _finish(
     *,
     run_record: RunRecord,
@@ -319,6 +399,236 @@ def _finish(
         processing_error=processing_error,
         controller_message=controller_message,
     )
+
+
+def _review_artifact_state(
+    artifact_directory: Path,
+    result_path: Path,
+) -> _ReviewArtifactState:
+    if result_path.is_file():
+        return _ReviewArtifactState.COMPLETE
+    if artifact_directory.exists() and any(artifact_directory.iterdir()):
+        return _ReviewArtifactState.PARTIAL
+    return _ReviewArtifactState.MISSING
+
+
+def _load_existing_review_result(
+    *,
+    artifact_directory: Path,
+    result_path: Path,
+    expected_prompt: str,
+    run_record: RunRecord,
+    review_round: int,
+) -> tuple[dict[str, Any] | None, str | None]:
+    expected_checkpoint = _review_checkpoint(
+        run_record,
+        review_round=review_round,
+        prompt=expected_prompt,
+    )
+    checkpoint_problem = _existing_review_checkpoint_problem(
+        artifact_directory / _REVIEW_CHECKPOINT_FILE,
+        expected_checkpoint=expected_checkpoint,
+    )
+    if checkpoint_problem is not None:
+        return None, checkpoint_problem
+
+    prompt_problem = _existing_review_prompt_problem(
+        artifact_directory / "prompt.md",
+        expected_prompt=expected_prompt,
+    )
+    if prompt_problem is not None:
+        return None, prompt_problem
+
+    try:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        return None, f"Could not read existing review result: {error}"
+    if not isinstance(result, dict):
+        return None, "Existing review result is not a JSON object."
+
+    try:
+        validate_json_schema(result, _load_review_result_schema())
+    except (CodexResultValidationError, OSError, json.JSONDecodeError) as error:
+        return None, f"Existing review result is not schema-valid: {error}"
+
+    execution_problem = _existing_review_execution_problem(
+        artifact_directory / "execution.json",
+        result_path=result_path,
+        run_record=run_record,
+    )
+    if execution_problem is not None:
+        return None, execution_problem
+
+    return result, None
+
+
+def _existing_review_checkpoint_problem(
+    checkpoint_path: Path,
+    *,
+    expected_checkpoint: dict[str, Any],
+) -> str | None:
+    try:
+        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return "Existing review result is missing checkpoint metadata."
+    except (OSError, json.JSONDecodeError) as error:
+        return f"Could not read existing review checkpoint metadata: {error}"
+    if not isinstance(checkpoint, dict):
+        return "Existing review checkpoint metadata is not a JSON object."
+    for key, expected_value in expected_checkpoint.items():
+        if checkpoint.get(key) != expected_value:
+            return (
+                "Existing review checkpoint does not match current run metadata: "
+                f"{key}."
+            )
+    return None
+
+
+def _existing_review_prompt_problem(
+    prompt_path: Path,
+    *,
+    expected_prompt: str,
+) -> str | None:
+    try:
+        prompt = prompt_path.read_text(encoding="utf-8")
+    except OSError as error:
+        return f"Could not read existing review prompt: {error}"
+    if _normalize_prompt_text(prompt) != _normalize_prompt_text(expected_prompt):
+        return "Existing review prompt does not match the current run checkpoint."
+    return None
+
+
+def _normalize_prompt_text(value: str) -> str:
+    return value.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
+
+
+def _existing_review_execution_problem(
+    execution_path: Path,
+    *,
+    result_path: Path,
+    run_record: RunRecord,
+) -> str | None:
+    if not execution_path.exists():
+        return None
+    try:
+        execution = json.loads(execution_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        return f"Could not read existing review execution metadata: {error}"
+    if not isinstance(execution, dict):
+        return "Existing review execution metadata is not a JSON object."
+    expected_repo = Path(run_record.target_repository_path).resolve()
+    repo_path = execution.get("repo_path")
+    if not isinstance(repo_path, str) or Path(repo_path).resolve() != expected_repo:
+        return "Existing review execution metadata is for a different repository."
+    if execution.get("status") != "SUCCESS":
+        return "Existing review execution metadata is not successful."
+    if execution.get("sandbox") != Sandbox.READ_ONLY.value:
+        return "Existing review execution metadata is not read-only."
+    if execution.get("result_json_present") is not True:
+        return "Existing review execution metadata does not confirm result.json."
+    schema_path = execution.get("output_schema_path")
+    if (
+        isinstance(schema_path, str)
+        and Path(schema_path).resolve() != _REVIEW_RESULT_SCHEMA.resolve()
+    ):
+        return "Existing review execution metadata used a different result schema."
+    artifact_paths = execution.get("artifact_paths")
+    if isinstance(artifact_paths, dict):
+        recorded_result = artifact_paths.get("result_json")
+        if (
+            isinstance(recorded_result, str)
+            and Path(recorded_result).resolve() != result_path.resolve()
+        ):
+            return "Existing review execution metadata points at a different result."
+    return None
+
+
+def _load_review_result_schema() -> dict[str, Any]:
+    schema = json.loads(_REVIEW_RESULT_SCHEMA.read_text(encoding="utf-8"))
+    if not isinstance(schema, dict):
+        raise ReviewError("Review result schema root must be a JSON object.")
+    return schema
+
+
+def _archive_review_artifacts(artifact_directory: Path) -> None:
+    if not artifact_directory.exists():
+        return
+    archive_root = artifact_directory.parent / _INCOMPLETE_ARTIFACT_DIR_NAME
+    archive_root.mkdir(parents=True, exist_ok=True)
+    archive_path = _unique_archive_path(archive_root / artifact_directory.name)
+    shutil.move(str(artifact_directory), str(archive_path))
+
+
+def _unique_archive_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    for index in range(2, 1000):
+        candidate = path.with_name(f"{path.name}-{index}")
+        if not candidate.exists():
+            return candidate
+    raise ReviewError(f"Could not reserve recovery artifact directory: {path}")
+
+
+def _review_checkpoint(
+    run_record: RunRecord,
+    *,
+    review_round: int,
+    prompt: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": _REVIEW_CHECKPOINT_SCHEMA_VERSION,
+        "format": _REVIEW_CHECKPOINT_FORMAT,
+        "stage": WorkflowState.REVIEW.value,
+        "status": "STARTED",
+        "run_id": run_record.run_id,
+        "review_round": review_round,
+        "correction_round": run_record.current_correction_round,
+        "target_repository_path": str(
+            Path(run_record.target_repository_path).resolve()
+        ),
+        "starting_branch": run_record.starting_branch,
+        "baseline_sha": run_record.baseline_sha,
+        "prompt_sha256": _text_sha256(_normalize_prompt_text(prompt)),
+    }
+
+
+def _write_review_checkpoint(path: Path, checkpoint: dict[str, Any]) -> None:
+    _atomic_write_text(path, json.dumps(checkpoint, indent=2, sort_keys=True) + "\n")
+
+
+def _atomic_write_text(path: Path, contents: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    file_descriptor = -1
+    try:
+        file_descriptor, temp_name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            text=True,
+        )
+        temp_path = Path(temp_name)
+        with os.fdopen(
+            file_descriptor,
+            "w",
+            encoding="utf-8",
+            newline="\n",
+        ) as temp_file:
+            file_descriptor = -1
+            temp_file.write(contents)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_path, path)
+    except Exception:
+        if file_descriptor != -1:
+            os.close(file_descriptor)
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        raise
+
+
+def _text_sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _render_review_prompt(

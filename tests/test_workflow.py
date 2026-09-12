@@ -745,6 +745,474 @@ def test_resume_from_completed_implementation_runs_verification_review_and_repor
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_resume_adopts_completed_verification_artifact_when_run_state_is_stale(
+    tmp_path,
+):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+    runs_dir = tmp_path / "runs"
+    snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
+    run_implementation_stage(
+        config,
+        snapshot.run_dir,
+        codex_runner=SequencedCodexRunner(
+            steps=[
+                CodexStep(
+                    result=implementation_result(),
+                    mutation=write_file("implemented\n"),
+                )
+            ],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    record_path = snapshot.run_dir / "run.json"
+    stale_record = load_run_record(record_path)
+    completed_verification = SequencedVerificationRunner(
+        steps=[VerificationStep(stdout="persisted verification\n")],
+        calls=[],
+    )
+    run_verification_stage(
+        config,
+        snapshot.run_dir,
+        process_runner=completed_verification,
+        clock=fixed_clock,
+    )
+    save_run_record(stale_record, record_path)
+    codex = SequencedCodexRunner(steps=[CodexStep(result=review_result())], calls=[])
+    verification = SequencedVerificationRunner(steps=[VerificationStep()], calls=[])
+
+    result = resume_ticket_lifecycle(
+        config,
+        snapshot.run_record.run_id,
+        runs_dir=runs_dir,
+        codex_runner=codex,
+        verification_runner=verification,
+        clock=fixed_clock,
+    )
+
+    assert result.successful
+    assert completed_verification.calls
+    assert verification.calls == []
+    assert len(result.verification_results) == 1
+    assert (
+        result.verification_results[0].round_result.commands[0].stdout
+        == "persisted verification\n"
+    )
+    assert [sandbox_value(command.argv) for command, _stdin in codex.calls] == [
+        Sandbox.READ_ONLY.value
+    ]
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_resume_adopts_completed_review_result_when_run_state_is_stale(tmp_path):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+    runs_dir = tmp_path / "runs"
+    snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
+    run_implementation_stage(
+        config,
+        snapshot.run_dir,
+        codex_runner=SequencedCodexRunner(
+            steps=[
+                CodexStep(
+                    result=implementation_result(),
+                    mutation=write_file("implemented\n"),
+                )
+            ],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    run_verification_stage(
+        config,
+        snapshot.run_dir,
+        process_runner=SequencedVerificationRunner(
+            steps=[VerificationStep()],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    record_path = snapshot.run_dir / "run.json"
+    stale_record = load_run_record(record_path)
+    completed_review = SequencedCodexRunner(
+        steps=[CodexStep(result=review_result())],
+        calls=[],
+    )
+    run_review_stage(
+        config,
+        snapshot.run_dir,
+        codex_runner=completed_review,
+        clock=fixed_clock,
+    )
+    save_run_record(stale_record, record_path)
+    codex = SequencedCodexRunner(steps=[CodexStep(result=review_result())], calls=[])
+
+    result = resume_ticket_lifecycle(
+        config,
+        snapshot.run_record.run_id,
+        runs_dir=runs_dir,
+        codex_runner=codex,
+        verification_runner=SequencedVerificationRunner(steps=[], calls=[]),
+        clock=fixed_clock,
+    )
+
+    assert result.successful
+    assert completed_review.calls
+    assert codex.calls == []
+    assert len(result.review_results) == 1
+    assert result.review_results[0].review_result["verdict"] == ReviewVerdict.PASS.value
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_resume_adopts_review_result_without_execution_metadata_when_checkpoint_matches(
+    tmp_path,
+):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+    runs_dir = tmp_path / "runs"
+    snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
+    run_implementation_stage(
+        config,
+        snapshot.run_dir,
+        codex_runner=SequencedCodexRunner(
+            steps=[
+                CodexStep(
+                    result=implementation_result(),
+                    mutation=write_file("implemented\n"),
+                )
+            ],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    run_verification_stage(
+        config,
+        snapshot.run_dir,
+        process_runner=SequencedVerificationRunner(
+            steps=[VerificationStep()],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    record_path = snapshot.run_dir / "run.json"
+    stale_record = load_run_record(record_path)
+    run_review_stage(
+        config,
+        snapshot.run_dir,
+        codex_runner=SequencedCodexRunner(
+            steps=[CodexStep(result=review_result())],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    snapshot.run_dir.joinpath("reviews", "round-1", "execution.json").unlink()
+    save_run_record(stale_record, record_path)
+    codex = SequencedCodexRunner(steps=[CodexStep(result=review_result())], calls=[])
+
+    result = resume_ticket_lifecycle(
+        config,
+        snapshot.run_record.run_id,
+        runs_dir=runs_dir,
+        codex_runner=codex,
+        verification_runner=SequencedVerificationRunner(steps=[], calls=[]),
+        clock=fixed_clock,
+    )
+
+    assert result.successful
+    assert codex.calls == []
+    assert len(result.review_results) == 1
+    assert result.review_results[0].review_result["verdict"] == ReviewVerdict.PASS.value
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_resume_reruns_review_result_without_checkpoint_metadata(tmp_path):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+    runs_dir = tmp_path / "runs"
+    snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
+    run_implementation_stage(
+        config,
+        snapshot.run_dir,
+        codex_runner=SequencedCodexRunner(
+            steps=[
+                CodexStep(
+                    result=implementation_result(),
+                    mutation=write_file("implemented\n"),
+                )
+            ],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    run_verification_stage(
+        config,
+        snapshot.run_dir,
+        process_runner=SequencedVerificationRunner(
+            steps=[VerificationStep()],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    record_path = snapshot.run_dir / "run.json"
+    stale_record = load_run_record(record_path)
+    run_review_stage(
+        config,
+        snapshot.run_dir,
+        codex_runner=SequencedCodexRunner(
+            steps=[CodexStep(result=review_result(summary="old review"))],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    snapshot.run_dir.joinpath("reviews", "round-1", "checkpoint.json").unlink()
+    save_run_record(stale_record, record_path)
+    codex = SequencedCodexRunner(
+        steps=[CodexStep(result=review_result(summary="fresh review"))],
+        calls=[],
+    )
+
+    result = resume_ticket_lifecycle(
+        config,
+        snapshot.run_record.run_id,
+        runs_dir=runs_dir,
+        codex_runner=codex,
+        verification_runner=SequencedVerificationRunner(steps=[], calls=[]),
+        clock=fixed_clock,
+    )
+
+    assert result.successful
+    assert [sandbox_value(command.argv) for command, _stdin in codex.calls] == [
+        Sandbox.READ_ONLY.value
+    ]
+    assert (
+        result.run_dir.joinpath("reviews", "_incomplete", "round-1", "result.json")
+        .read_text(encoding="utf-8")
+        .find("old review")
+        != -1
+    )
+    assert result.review_results[0].review_result["summary"] == "fresh review"
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_resume_does_not_adopt_verification_artifact_for_changed_gate_config(
+    tmp_path,
+):
+    repo, ticket, config = workflow_inputs(tmp_path)
+    runs_dir = tmp_path / "runs"
+    snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
+    run_implementation_stage(
+        config,
+        snapshot.run_dir,
+        codex_runner=SequencedCodexRunner(
+            steps=[
+                CodexStep(
+                    result=implementation_result(),
+                    mutation=write_file("implemented\n"),
+                )
+            ],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    record_path = snapshot.run_dir / "run.json"
+    stale_record = load_run_record(record_path)
+    run_verification_stage(
+        config,
+        snapshot.run_dir,
+        process_runner=SequencedVerificationRunner(
+            steps=[VerificationStep()],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    save_run_record(stale_record, record_path)
+    changed_config = make_config(
+        repo,
+        verification_commands=(
+            VerificationCommand(
+                name="changed-tests",
+                argv=(Path(sys.executable).as_posix(), "-c", "raise SystemExit(0)"),
+                timeout_seconds=1800,
+            ),
+        ),
+    )
+    verification = SequencedVerificationRunner(steps=[VerificationStep()], calls=[])
+    codex = SequencedCodexRunner(steps=[CodexStep(result=review_result())], calls=[])
+
+    result = resume_ticket_lifecycle(
+        changed_config,
+        snapshot.run_record.run_id,
+        runs_dir=runs_dir,
+        codex_runner=codex,
+        verification_runner=verification,
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert "verification_commands_fingerprint" in result.run_record.terminal_reason
+    assert verification.calls == []
+    assert codex.calls == []
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_resume_does_not_reuse_review_result_after_repository_changed(tmp_path):
+    repo, ticket, config = workflow_inputs(tmp_path)
+    runs_dir = tmp_path / "runs"
+    snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
+    run_implementation_stage(
+        config,
+        snapshot.run_dir,
+        codex_runner=SequencedCodexRunner(
+            steps=[
+                CodexStep(
+                    result=implementation_result(),
+                    mutation=write_file("implemented\n"),
+                )
+            ],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    run_verification_stage(
+        config,
+        snapshot.run_dir,
+        process_runner=SequencedVerificationRunner(
+            steps=[VerificationStep()],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    record_path = snapshot.run_dir / "run.json"
+    stale_record = load_run_record(record_path)
+    run_review_stage(
+        config,
+        snapshot.run_dir,
+        codex_runner=SequencedCodexRunner(
+            steps=[CodexStep(result=review_result())],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    save_run_record(stale_record, record_path)
+    repo.joinpath("file.txt").write_text("changed after review\n", encoding="utf-8")
+    codex = SequencedCodexRunner(steps=[CodexStep(result=review_result())], calls=[])
+
+    result = resume_ticket_lifecycle(
+        config,
+        snapshot.run_record.run_id,
+        runs_dir=runs_dir,
+        codex_runner=codex,
+        verification_runner=SequencedVerificationRunner(steps=[], calls=[]),
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert "Current source diff no longer matches" in result.run_record.terminal_reason
+    assert codex.calls == []
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_resume_archives_partial_verification_artifact_and_reruns(tmp_path):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+    runs_dir = tmp_path / "runs"
+    snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
+    run_implementation_stage(
+        config,
+        snapshot.run_dir,
+        codex_runner=SequencedCodexRunner(
+            steps=[
+                CodexStep(
+                    result=implementation_result(),
+                    mutation=write_file("implemented\n"),
+                )
+            ],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    verification_dir = snapshot.run_dir / "verification"
+    verification_dir.mkdir()
+    verification_dir.joinpath("round-0.json").write_text(
+        '{"status": "PASS"',
+        encoding="utf-8",
+    )
+    codex = SequencedCodexRunner(steps=[CodexStep(result=review_result())], calls=[])
+    verification = SequencedVerificationRunner(
+        steps=[VerificationStep(stdout="fresh verification\n")],
+        calls=[],
+    )
+
+    result = resume_ticket_lifecycle(
+        config,
+        snapshot.run_record.run_id,
+        runs_dir=runs_dir,
+        codex_runner=codex,
+        verification_runner=verification,
+        clock=fixed_clock,
+    )
+
+    assert result.successful
+    assert len(verification.calls) == 1
+    assert (
+        result.verification_results[0].round_result.commands[0].stdout
+        == "fresh verification\n"
+    )
+    assert result.run_dir.joinpath("verification", "_incomplete", "round-0").is_dir()
+    assert result.run_dir.joinpath("verification", "round-0.json").is_file()
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_resume_does_not_reuse_verification_artifact_after_repository_changed(
+    tmp_path,
+):
+    repo, ticket, config = workflow_inputs(tmp_path)
+    runs_dir = tmp_path / "runs"
+    snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
+    run_implementation_stage(
+        config,
+        snapshot.run_dir,
+        codex_runner=SequencedCodexRunner(
+            steps=[
+                CodexStep(
+                    result=implementation_result(),
+                    mutation=write_file("implemented\n"),
+                )
+            ],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    record_path = snapshot.run_dir / "run.json"
+    stale_record = load_run_record(record_path)
+    run_verification_stage(
+        config,
+        snapshot.run_dir,
+        process_runner=SequencedVerificationRunner(
+            steps=[VerificationStep()],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    save_run_record(stale_record, record_path)
+    repo.joinpath("file.txt").write_text(
+        "changed after verification\n", encoding="utf-8"
+    )
+    codex = SequencedCodexRunner(steps=[CodexStep(result=review_result())], calls=[])
+    verification = SequencedVerificationRunner(steps=[VerificationStep()], calls=[])
+
+    result = resume_ticket_lifecycle(
+        config,
+        snapshot.run_record.run_id,
+        runs_dir=runs_dir,
+        codex_runner=codex,
+        verification_runner=verification,
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert "Current source diff no longer matches" in result.run_record.terminal_reason
+    assert verification.calls == []
+    assert codex.calls == []
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
 def test_resume_terminal_run_does_not_regenerate_report_artifacts(tmp_path):
     _repo, ticket, config = workflow_inputs(tmp_path)
     result = run_ticket_lifecycle(
@@ -1200,13 +1668,14 @@ def implementation_result(status: str = "COMPLETED") -> dict[str, object]:
 def review_result(
     *,
     verdict: str = ReviewVerdict.PASS.value,
+    summary: str = "review result",
     findings: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     if findings is None and verdict == ReviewVerdict.CORRECTIONS_REQUIRED.value:
         findings = [finding("R1-F1", disposition="REQUIRED")]
     return {
         "verdict": verdict,
-        "summary": "review result",
+        "summary": summary,
         "confidence": "HIGH",
         "findings": [] if findings is None else findings,
     }

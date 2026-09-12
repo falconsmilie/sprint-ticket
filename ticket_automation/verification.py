@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
 import subprocess
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -11,7 +14,12 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .config import AppConfig, VerificationCommand
-from .corrections import CorrectionReason, VerificationFailure
+from .corrections import (
+    CorrectionError,
+    CorrectionReason,
+    VerificationFailure,
+    correction_reason_from_dict,
+)
 from .git import GitCommandError, GitRepository
 from .models import WorkflowState
 from .runs import (
@@ -24,7 +32,10 @@ from .runs import (
 
 VERIFICATION_SCHEMA_VERSION = 1
 VERIFICATION_ROUND_FORMAT = "ticket_automation.verification_round"
+VERIFICATION_CHECKPOINT_SCHEMA_VERSION = 1
+VERIFICATION_CHECKPOINT_FORMAT = "ticket_automation.verification_checkpoint"
 VERIFICATION_DIR_NAME = "verification"
+_INCOMPLETE_ARTIFACT_DIR_NAME = "_incomplete"
 CORRECTION_EXCERPT_CHARS = 4000
 _TERMINAL_STATES = frozenset(
     {
@@ -49,6 +60,12 @@ class VerificationErrorKind(StrEnum):
     EXECUTABLE_UNAVAILABLE = "EXECUTABLE_UNAVAILABLE"
     PROCESS_START_FAILED = "PROCESS_START_FAILED"
     TIMEOUT = "TIMEOUT"
+
+
+class _VerificationArtifactState(StrEnum):
+    MISSING = "MISSING"
+    PARTIAL = "PARTIAL"
+    COMPLETE = "COMPLETE"
 
 
 @dataclass(frozen=True)
@@ -197,6 +214,7 @@ class VerificationRound:
     log_path: Path
     schema_version: int = VERIFICATION_SCHEMA_VERSION
     format: str = VERIFICATION_ROUND_FORMAT
+    checkpoint: dict[str, Any] | None = None
 
     @property
     def passed(self) -> bool:
@@ -211,7 +229,7 @@ class VerificationRound:
         return tuple(command for command in self.commands if command.errored)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "schema_version": self.schema_version,
             "format": self.format,
             "round_index": self.round_index,
@@ -227,6 +245,9 @@ class VerificationRound:
                 reason.to_dict() for reason in self.correction_reasons
             ],
         }
+        if self.checkpoint is not None:
+            data["checkpoint"] = self.checkpoint
+        return data
 
 
 @dataclass(frozen=True)
@@ -270,21 +291,89 @@ def run_verification_stage(
     round_name = f"round-{selected_round}"
     json_path = artifact_directory / f"{round_name}.json"
     log_path = artifact_directory / f"{round_name}.log"
-    if json_path.exists() or log_path.exists():
-        raise VerificationError(
-            f"Verification artifacts already exist for {round_name}."
-        )
 
-    runner = process_runner or SubprocessVerificationRunner()
     repository_snapshot, starting_violations = _capture_starting_repository_snapshot(
         repository,
         run_record,
     )
+    artifact_state = _verification_artifact_state(json_path, log_path)
+    if artifact_state == _VerificationArtifactState.COMPLETE:
+        if starting_violations:
+            return _finish_unadoptable_verification_checkpoint(
+                run_record=run_record,
+                run_record_path=run_record_path,
+                run_dir=run_path,
+                artifact_directory=artifact_directory,
+                json_path=json_path,
+                log_path=log_path,
+                round_index=selected_round,
+                reason=(
+                    "Existing verification artifacts cannot be adopted because "
+                    "repository safety invariants no longer hold."
+                ),
+                clock=clock,
+            )
+        assert repository_snapshot is not None
+        existing_round, checkpoint_problem = _load_existing_verification_round(
+            json_path=json_path,
+            log_path=log_path,
+            run_record=run_record,
+            round_index=selected_round,
+            repository_snapshot=repository_snapshot,
+            commands=config.verification.commands,
+        )
+        if checkpoint_problem is None and existing_round is not None:
+            return _finish_verification_round(
+                run_record=run_record,
+                run_record_path=run_record_path,
+                run_dir=run_path,
+                artifact_directory=artifact_directory,
+                round_result=existing_round,
+                clock=clock,
+            )
+        return _finish_unadoptable_verification_checkpoint(
+            run_record=run_record,
+            run_record_path=run_record_path,
+            run_dir=run_path,
+            artifact_directory=artifact_directory,
+            json_path=json_path,
+            log_path=log_path,
+            round_index=selected_round,
+            reason=checkpoint_problem or "Existing verification checkpoint is invalid.",
+            clock=clock,
+        )
+
+    if artifact_state == _VerificationArtifactState.PARTIAL:
+        if starting_violations:
+            return _finish_unadoptable_verification_checkpoint(
+                run_record=run_record,
+                run_record_path=run_record_path,
+                run_dir=run_path,
+                artifact_directory=artifact_directory,
+                json_path=json_path,
+                log_path=log_path,
+                round_index=selected_round,
+                reason=(
+                    "Partial verification artifacts cannot be retried because "
+                    "repository safety invariants no longer hold."
+                ),
+                clock=clock,
+            )
+        _archive_incomplete_verification_artifacts(
+            artifact_directory=artifact_directory,
+            round_name=round_name,
+            json_path=json_path,
+            log_path=log_path,
+        )
+
     if starting_violations:
         round_result = _write_controller_error_round(
+            run_record=run_record,
             round_index=selected_round,
             json_path=json_path,
             log_path=log_path,
+            repository_snapshot=repository_snapshot,
+            commands=config.verification.commands,
             safety_violations=starting_violations,
             clock=clock,
         )
@@ -307,6 +396,8 @@ def run_verification_stage(
             ),
         )
 
+    runner = process_runner or SubprocessVerificationRunner()
+    assert repository_snapshot is not None
     round_result = run_verification_round(
         config.verification.commands,
         cwd=repository.path,
@@ -317,9 +408,29 @@ def run_verification_stage(
         repository=repository,
         repository_snapshot=repository_snapshot,
         baseline_sha=run_record.baseline_sha,
+        run_record=run_record,
         clock=clock,
     )
 
+    return _finish_verification_round(
+        run_record=run_record,
+        run_record_path=run_record_path,
+        run_dir=run_path,
+        artifact_directory=artifact_directory,
+        round_result=round_result,
+        clock=clock,
+    )
+
+
+def _finish_verification_round(
+    *,
+    run_record: RunRecord,
+    run_record_path: Path,
+    run_dir: Path,
+    artifact_directory: Path,
+    round_result: VerificationRound,
+    clock: Callable[[], datetime] | None,
+) -> VerificationStageResult:
     if round_result.safety_violations:
         state = WorkflowState.HUMAN_REQUIRED
         controller_message = (
@@ -345,11 +456,58 @@ def run_verification_stage(
     )
     save_run_record(updated_record, run_record_path)
     return VerificationStageResult(
-        run_dir=run_path,
+        run_dir=run_dir,
         run_record=updated_record,
         artifact_directory=artifact_directory,
         round_result=round_result,
         controller_message=controller_message,
+    )
+
+
+def _finish_unadoptable_verification_checkpoint(
+    *,
+    run_record: RunRecord,
+    run_record_path: Path,
+    run_dir: Path,
+    artifact_directory: Path,
+    json_path: Path,
+    log_path: Path,
+    round_index: int,
+    reason: str,
+    clock: Callable[[], datetime] | None,
+) -> VerificationStageResult:
+    timestamp = _timestamp(clock)
+    violation = VerificationSafetyViolation(
+        name="verification-checkpoint",
+        expected="valid verification checkpoint for this run and repository state",
+        actual=reason,
+        message="Existing verification artifacts require human inspection.",
+    )
+    round_result = VerificationRound(
+        round_index=round_index,
+        started_at=timestamp,
+        ended_at=timestamp,
+        duration_seconds=0.0,
+        status=VerificationStatus.ERROR,
+        commands=(),
+        safety_violations=(violation,),
+        correction_reasons=(),
+        json_path=json_path,
+        log_path=log_path,
+    )
+    updated_record = run_record.with_state(
+        WorkflowState.HUMAN_REQUIRED,
+        updated_timestamp=timestamp,
+        last_completed_state=run_record.last_completed_state,
+        terminal_reason=reason,
+    )
+    save_run_record(updated_record, run_record_path)
+    return VerificationStageResult(
+        run_dir=run_dir,
+        run_record=updated_record,
+        artifact_directory=artifact_directory,
+        round_result=round_result,
+        controller_message=reason,
     )
 
 
@@ -364,6 +522,7 @@ def run_verification_round(
     repository: GitRepository | None = None,
     repository_snapshot: _RepositoryVerificationSnapshot | None = None,
     baseline_sha: str | None = None,
+    run_record: RunRecord | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> VerificationRound:
     runner = process_runner or SubprocessVerificationRunner()
@@ -391,6 +550,16 @@ def run_verification_round(
         correction_reasons=correction_reasons,
         json_path=json_path,
         log_path=log_path,
+        checkpoint=(
+            None
+            if run_record is None
+            else _verification_checkpoint(
+                run_record,
+                round_index=round_index,
+                repository_snapshot=repository_snapshot,
+                commands=commands,
+            )
+        ),
     )
     _write_json(json_path, round_result.to_dict())
     _write_log(log_path, round_result)
@@ -720,9 +889,12 @@ def _verification_safety_violations(
 
 def _write_controller_error_round(
     *,
+    run_record: RunRecord,
     round_index: int,
     json_path: Path,
     log_path: Path,
+    repository_snapshot: _RepositoryVerificationSnapshot | None,
+    commands: tuple[VerificationCommand, ...],
     safety_violations: tuple[VerificationSafetyViolation, ...],
     clock: Callable[[], datetime] | None,
 ) -> VerificationRound:
@@ -739,10 +911,319 @@ def _write_controller_error_round(
         correction_reasons=(),
         json_path=json_path,
         log_path=log_path,
+        checkpoint=_verification_checkpoint(
+            run_record,
+            round_index=round_index,
+            repository_snapshot=repository_snapshot,
+            commands=commands,
+        ),
     )
     _write_json(json_path, round_result.to_dict())
     _write_log(log_path, round_result)
     return round_result
+
+
+def _verification_artifact_state(
+    json_path: Path,
+    log_path: Path,
+) -> _VerificationArtifactState:
+    json_exists = json_path.is_file()
+    log_exists = log_path.is_file()
+    if json_exists and log_exists:
+        return _VerificationArtifactState.COMPLETE
+    if json_path.exists() or log_path.exists():
+        return _VerificationArtifactState.PARTIAL
+    return _VerificationArtifactState.MISSING
+
+
+def _load_existing_verification_round(
+    *,
+    json_path: Path,
+    log_path: Path,
+    run_record: RunRecord,
+    round_index: int,
+    repository_snapshot: _RepositoryVerificationSnapshot,
+    commands: tuple[VerificationCommand, ...],
+) -> tuple[VerificationRound | None, str | None]:
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        return None, f"Could not read existing verification artifact: {error}"
+    if not isinstance(data, dict):
+        return None, "Existing verification artifact is not a JSON object."
+
+    metadata_problem = _verification_checkpoint_problem(
+        data,
+        run_record=run_record,
+        round_index=round_index,
+        repository_snapshot=repository_snapshot,
+        commands=commands,
+    )
+    if metadata_problem is not None:
+        return None, metadata_problem
+
+    try:
+        if log_path.stat().st_size <= 0:
+            return None, "Existing verification log is empty."
+    except OSError as error:
+        return None, f"Could not inspect existing verification log: {error}"
+
+    try:
+        return _verification_round_from_dict(
+            data, json_path=json_path, log_path=log_path
+        ), None
+    except (CorrectionError, TypeError, ValueError) as error:
+        return None, f"Existing verification artifact is malformed: {error}"
+
+
+def _verification_checkpoint_problem(
+    data: dict[str, Any],
+    *,
+    run_record: RunRecord,
+    round_index: int,
+    repository_snapshot: _RepositoryVerificationSnapshot,
+    commands: tuple[VerificationCommand, ...],
+) -> str | None:
+    if data.get("schema_version") != VERIFICATION_SCHEMA_VERSION:
+        return "Existing verification artifact has an unsupported schema version."
+    if data.get("format") != VERIFICATION_ROUND_FORMAT:
+        return "Existing verification artifact has an unsupported format."
+    if data.get("round_index") != round_index:
+        return "Existing verification artifact is for a different round."
+
+    checkpoint = data.get("checkpoint")
+    if not isinstance(checkpoint, dict):
+        return "Existing verification artifact is missing checkpoint metadata."
+
+    expected = _verification_checkpoint(
+        run_record,
+        round_index=round_index,
+        repository_snapshot=repository_snapshot,
+        commands=commands,
+    )
+    for key, expected_value in expected.items():
+        if checkpoint.get(key) != expected_value:
+            return (
+                "Existing verification checkpoint does not match current run "
+                f"metadata: {key}."
+            )
+    return None
+
+
+def _verification_round_from_dict(
+    data: dict[str, Any],
+    *,
+    json_path: Path,
+    log_path: Path,
+) -> VerificationRound:
+    commands = tuple(
+        _verification_command_from_dict(item)
+        for item in _required_object_list(data, "commands")
+    )
+    safety_violations = tuple(
+        _verification_safety_violation_from_dict(item)
+        for item in _required_object_list(data, "safety_violations")
+    )
+    correction_reasons = tuple(
+        correction_reason_from_dict(item)
+        for item in _required_object_list(data, "correction_reasons")
+    )
+    return VerificationRound(
+        round_index=_required_int(data, "round_index"),
+        started_at=_required_string(data, "started_at"),
+        ended_at=_required_string(data, "ended_at"),
+        duration_seconds=_required_number(data, "duration_seconds"),
+        status=VerificationStatus(_required_string(data, "status")),
+        commands=commands,
+        safety_violations=safety_violations,
+        correction_reasons=correction_reasons,
+        json_path=json_path,
+        log_path=log_path,
+        checkpoint=data.get("checkpoint")
+        if isinstance(data.get("checkpoint"), dict)
+        else None,
+    )
+
+
+def _verification_command_from_dict(data: dict[str, Any]) -> VerificationCommandResult:
+    error_kind_value = data.get("error_kind")
+    error_kind = (
+        None if error_kind_value is None else VerificationErrorKind(error_kind_value)
+    )
+    return VerificationCommandResult(
+        name=_required_string(data, "name"),
+        argv=_required_string_tuple(data, "argv"),
+        cwd=Path(_required_string(data, "cwd")),
+        started_at=_required_string(data, "started_at"),
+        ended_at=_required_string(data, "ended_at"),
+        duration_seconds=_required_number(data, "duration_seconds"),
+        status=VerificationStatus(_required_string(data, "status")),
+        exit_code=_optional_int(data, "exit_code"),
+        stdout=_required_string(data, "stdout", allow_empty=True),
+        stderr=_required_string(data, "stderr", allow_empty=True),
+        error_kind=error_kind,
+        error_message=_optional_string(data, "error_message"),
+    )
+
+
+def _verification_safety_violation_from_dict(
+    data: dict[str, Any],
+) -> VerificationSafetyViolation:
+    return VerificationSafetyViolation(
+        name=_required_string(data, "name"),
+        expected=_required_string(data, "expected", allow_empty=True),
+        actual=_required_string(data, "actual", allow_empty=True),
+        message=_required_string(data, "message"),
+    )
+
+
+def _verification_checkpoint(
+    run_record: RunRecord,
+    *,
+    round_index: int,
+    repository_snapshot: _RepositoryVerificationSnapshot | None,
+    commands: tuple[VerificationCommand, ...],
+) -> dict[str, Any]:
+    checkpoint: dict[str, Any] = {
+        "schema_version": VERIFICATION_CHECKPOINT_SCHEMA_VERSION,
+        "format": VERIFICATION_CHECKPOINT_FORMAT,
+        "stage": WorkflowState.VERIFY.value,
+        "status": "COMPLETE",
+        "run_id": run_record.run_id,
+        "round_index": round_index,
+        "target_repository_path": str(
+            Path(run_record.target_repository_path).resolve()
+        ),
+        "starting_branch": run_record.starting_branch,
+        "baseline_sha": run_record.baseline_sha,
+        "verification_commands_fingerprint": _verification_commands_fingerprint(
+            commands
+        ),
+    }
+    if repository_snapshot is not None:
+        checkpoint["source_fingerprint"] = _repository_snapshot_fingerprint(
+            repository_snapshot
+        )
+    return checkpoint
+
+
+def _repository_snapshot_fingerprint(
+    snapshot: _RepositoryVerificationSnapshot,
+) -> str:
+    payload = {
+        "branch": snapshot.branch,
+        "head_sha": snapshot.head_sha,
+        "staged_files": list(snapshot.staged_files),
+        "tracked_diff_sha256": _text_sha256(snapshot.tracked_diff),
+        "untracked_files": list(snapshot.untracked_files),
+        "untracked_hashes": [list(item) for item in snapshot.untracked_hashes],
+    }
+    return _text_sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+
+
+def _verification_commands_fingerprint(
+    commands: tuple[VerificationCommand, ...],
+) -> str:
+    payload = [
+        {
+            "name": command.name,
+            "argv": list(command.argv),
+            "timeout_seconds": command.timeout_seconds,
+        }
+        for command in commands
+    ]
+    return _text_sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+
+
+def _archive_incomplete_verification_artifacts(
+    *,
+    artifact_directory: Path,
+    round_name: str,
+    json_path: Path,
+    log_path: Path,
+) -> None:
+    archive_dir = _unique_archive_path(
+        artifact_directory / _INCOMPLETE_ARTIFACT_DIR_NAME / round_name
+    )
+    archive_dir.mkdir(parents=True, exist_ok=False)
+    for path in (json_path, log_path):
+        if not path.exists():
+            continue
+        destination = archive_dir / path.name
+        if path.is_dir():
+            shutil.move(str(path), str(destination))
+        else:
+            path.replace(destination)
+
+
+def _unique_archive_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    for index in range(2, 1000):
+        candidate = path.with_name(f"{path.name}-{index}")
+        if not candidate.exists():
+            return candidate
+    raise VerificationError(f"Could not reserve recovery artifact directory: {path}")
+
+
+def _required_object_list(data: dict[str, Any], key: str) -> tuple[dict[str, Any], ...]:
+    value = data.get(key)
+    if not isinstance(value, list):
+        raise TypeError(f"{key} must be a list.")
+    if not all(isinstance(item, dict) for item in value):
+        raise TypeError(f"{key} entries must be objects.")
+    return tuple(value)
+
+
+def _required_string(
+    data: dict[str, Any],
+    key: str,
+    *,
+    allow_empty: bool = False,
+) -> str:
+    value = data.get(key)
+    if not isinstance(value, str) or (not allow_empty and not value):
+        raise ValueError(f"{key} must be a string.")
+    return value
+
+
+def _optional_string(data: dict[str, Any], key: str) -> str | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"{key} must be a string or null.")
+    return value
+
+
+def _required_string_tuple(data: dict[str, Any], key: str) -> tuple[str, ...]:
+    value = data.get(key)
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise TypeError(f"{key} must be a string list.")
+    return tuple(value)
+
+
+def _required_int(data: dict[str, Any], key: str) -> int:
+    value = data.get(key)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{key} must be an integer.")
+    return value
+
+
+def _optional_int(data: dict[str, Any], key: str) -> int | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{key} must be an integer or null.")
+    return value
+
+
+def _required_number(data: dict[str, Any], key: str) -> float:
+    value = data.get(key)
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        raise TypeError(f"{key} must be a number.")
+    return float(value)
 
 
 def _hash_untracked_files(
@@ -762,18 +1243,47 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _text_sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
 def _write_json(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(data, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
+    _atomic_write_text(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
 
 
 def _write_log(path: Path, round_result: VerificationRound) -> None:
+    _atomic_write_text(path, _format_round_log(round_result))
+
+
+def _atomic_write_text(path: Path, contents: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_format_round_log(round_result), encoding="utf-8", newline="\n")
+    temp_path: Path | None = None
+    file_descriptor = -1
+    try:
+        file_descriptor, temp_name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            text=True,
+        )
+        temp_path = Path(temp_name)
+        with os.fdopen(
+            file_descriptor,
+            "w",
+            encoding="utf-8",
+            newline="\n",
+        ) as temp_file:
+            file_descriptor = -1
+            temp_file.write(contents)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_path, path)
+    except Exception:
+        if file_descriptor != -1:
+            os.close(file_descriptor)
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        raise
 
 
 def _format_round_log(round_result: VerificationRound) -> str:
