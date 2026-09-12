@@ -37,6 +37,13 @@ from .runs import (
     load_run_record,
     save_run_record,
 )
+from .workspace_guard import (
+    WorkspaceGuardInspection,
+    capture_workspace_environment_snapshot,
+    format_workspace_hygiene_violation,
+    implementation_guard_artifact_path,
+    inspect_workspace_environment_change,
+)
 
 
 class _SafetyInspectionPhase:
@@ -88,6 +95,7 @@ class ImplementationStageResult:
     changed_files: tuple[str, ...]
     patch_path: Path | None
     diff_stats_path: Path | None
+    workspace_guard: WorkspaceGuardInspection | None
     controller_message: str
 
     @property
@@ -102,6 +110,7 @@ class _FailedWritableAudit:
     patch_path: Path | None
     diff_stats_path: Path | None
     patch_error: str | None
+    workspace_guard: WorkspaceGuardInspection | None
     human_required: bool
 
 
@@ -155,6 +164,7 @@ def run_implementation_stage(
     )
     save_run_record(active_record, run_record_path)
     prompt = _render_implementation_prompt(ticket_text)
+    environment_snapshot = capture_workspace_environment_snapshot(repository.path)
 
     try:
         execution = execute_codex(
@@ -167,11 +177,18 @@ def run_implementation_stage(
             runner=codex_runner,
         )
     except CodexExecutionFailure as error:
+        workspace_guard = inspect_workspace_environment_change(
+            before=environment_snapshot,
+            phase=WorkflowState.IMPLEMENT.value,
+            artifact_path=implementation_guard_artifact_path(run_path),
+            clock=clock,
+        )
         failed_audit = _audit_failed_writable_invocation(
             repository,
             run_path,
             active_record,
             execution=error.execution,
+            workspace_guard=workspace_guard,
         )
         state = (
             WorkflowState.HUMAN_REQUIRED
@@ -183,6 +200,7 @@ def run_implementation_stage(
                 operation="implementation",
                 execution=error.execution,
                 audit=failed_audit,
+                run_dir=run_path,
             )
             if failed_audit.human_required
             else error.execution.failure_message or str(error)
@@ -198,6 +216,7 @@ def run_implementation_stage(
             changed_files=failed_audit.changed_files,
             patch_path=failed_audit.patch_path,
             diff_stats_path=failed_audit.diff_stats_path,
+            workspace_guard=workspace_guard,
             state=state,
             controller_message=message,
             clock=clock,
@@ -205,11 +224,39 @@ def run_implementation_stage(
         )
 
     agent_result = _require_agent_result(execution.structured_result)
+    workspace_guard = inspect_workspace_environment_change(
+        before=environment_snapshot,
+        phase=WorkflowState.IMPLEMENT.value,
+        artifact_path=implementation_guard_artifact_path(run_path),
+        clock=clock,
+    )
     safety_violations = _inspect_safety(
         repository,
         active_record,
         phase=_SafetyInspectionPhase.AFTER_IMPLEMENTATION,
     )
+    if workspace_guard.has_violation:
+        return _finish(
+            run_record=active_record,
+            run_record_path=run_record_path,
+            run_dir=run_path,
+            artifact_directory=implementation_dir,
+            execution=execution,
+            agent_result=agent_result,
+            safety_violations=safety_violations,
+            changed_files=(),
+            patch_path=None,
+            diff_stats_path=None,
+            workspace_guard=workspace_guard,
+            state=WorkflowState.HUMAN_REQUIRED,
+            controller_message=format_workspace_hygiene_violation(
+                workspace_guard,
+                operation="implementation",
+                run_dir=run_path,
+                git_safety=_format_failure_safety(safety_violations),
+            ),
+            clock=clock,
+        )
     if safety_violations:
         return _finish(
             run_record=active_record,
@@ -222,6 +269,7 @@ def run_implementation_stage(
             changed_files=(),
             patch_path=None,
             diff_stats_path=None,
+            workspace_guard=workspace_guard,
             state=WorkflowState.HUMAN_REQUIRED,
             controller_message="Repository safety invariants were violated.",
             clock=clock,
@@ -241,6 +289,7 @@ def run_implementation_stage(
             changed_files=(),
             patch_path=None,
             diff_stats_path=None,
+            workspace_guard=workspace_guard,
             state=WorkflowState.HUMAN_REQUIRED,
             controller_message=str(error),
             clock=clock,
@@ -258,6 +307,7 @@ def run_implementation_stage(
             changed_files=changed_files,
             patch_path=None,
             diff_stats_path=None,
+            workspace_guard=workspace_guard,
             state=WorkflowState.HUMAN_REQUIRED,
             controller_message="Implementation agent returned BLOCKED.",
             clock=clock,
@@ -275,6 +325,7 @@ def run_implementation_stage(
             changed_files=(),
             patch_path=None,
             diff_stats_path=None,
+            workspace_guard=workspace_guard,
             state=WorkflowState.HUMAN_REQUIRED,
             controller_message="Implementation completed without repository changes.",
             clock=clock,
@@ -298,6 +349,7 @@ def run_implementation_stage(
             changed_files=changed_files,
             patch_path=None,
             diff_stats_path=None,
+            workspace_guard=workspace_guard,
             state=WorkflowState.HUMAN_REQUIRED,
             controller_message=str(error),
             clock=clock,
@@ -313,6 +365,7 @@ def run_implementation_stage(
         changed_files=changed_files,
         patch_path=patch_path,
         diff_stats_path=diff_stats_path,
+        workspace_guard=workspace_guard,
         state=WorkflowState.IMPLEMENT,
         controller_message="Implementation completed and Git safety checks passed.",
         clock=clock,
@@ -338,6 +391,15 @@ def format_implementation_result(result: ImplementationStageResult) -> str:
         rows.append(f"Patch: {result.patch_path}")
     if result.diff_stats_path is not None:
         rows.append(f"Diff stats: {result.diff_stats_path}")
+    if result.workspace_guard is not None and result.workspace_guard.has_violation:
+        rows.append(f"Workspace guard: {result.workspace_guard.artifact_path}")
+        rows.append("Workspace hygiene violations:")
+        rows.extend(
+            "  - "
+            f"{environment.root_path.relative_to(result.workspace_guard.after.repository_path)}: "
+            f"marker {environment.primary_marker_path.relative_to(result.workspace_guard.after.repository_path)}"
+            for environment in result.workspace_guard.new_environments
+        )
     if result.codex_execution is not None and not result.codex_execution.successful:
         rows.append(f"Codex execution: {result.codex_execution.execution_json_path}")
         rows.append(f"Codex events: {result.codex_execution.events_jsonl_path}")
@@ -363,6 +425,7 @@ def _finish(
     changed_files: tuple[str, ...],
     patch_path: Path | None,
     diff_stats_path: Path | None,
+    workspace_guard: WorkspaceGuardInspection | None = None,
     state: WorkflowState,
     controller_message: str,
     clock: Callable[[], datetime] | None,
@@ -385,6 +448,7 @@ def _finish(
         changed_files=changed_files,
         patch_path=patch_path,
         diff_stats_path=diff_stats_path,
+        workspace_guard=workspace_guard,
         controller_message=controller_message,
     )
 
@@ -531,6 +595,7 @@ def _audit_failed_writable_invocation(
     run_record: RunRecord,
     *,
     execution: CodexExecution,
+    workspace_guard: WorkspaceGuardInspection | None,
 ) -> _FailedWritableAudit:
     violations = list(
         _inspect_safety(
@@ -568,7 +633,11 @@ def _audit_failed_writable_invocation(
             )
         )
 
-    human_required = execution.process_started or bool(violations)
+    human_required = (
+        execution.process_started
+        or bool(violations)
+        or bool(workspace_guard is not None and workspace_guard.has_violation)
+    )
     patch_path: Path | None = None
     diff_stats_path: Path | None = None
     patch_error: str | None = None
@@ -588,6 +657,7 @@ def _audit_failed_writable_invocation(
         patch_path=patch_path,
         diff_stats_path=diff_stats_path,
         patch_error=patch_error,
+        workspace_guard=workspace_guard,
         human_required=human_required,
     )
 
@@ -618,6 +688,7 @@ def _failed_writable_message(
     operation: str,
     execution: CodexExecution,
     audit: _FailedWritableAudit,
+    run_dir: Path,
 ) -> str:
     rows = [
         (
@@ -644,6 +715,15 @@ def _failed_writable_message(
         rows.append(f"Failure diff stats: {audit.diff_stats_path}")
     if audit.patch_error is not None:
         rows.append(f"Failure patch capture error: {audit.patch_error}")
+    if audit.workspace_guard is not None and audit.workspace_guard.has_violation:
+        rows.append(
+            format_workspace_hygiene_violation(
+                audit.workspace_guard,
+                operation=operation,
+                run_dir=run_dir,
+                git_safety=_format_failure_safety(audit.safety_violations),
+            )
+        )
     return " ".join(rows)
 
 

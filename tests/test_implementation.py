@@ -127,6 +127,34 @@ def test_prompt_contains_full_original_ticket_verbatim(tmp_path):
 @pytest.mark.skipif(
     GIT is None, reason="git executable is required for implementation tests"
 )
+def test_implementation_prompt_contains_environment_tooling_policy(tmp_path):
+    _repo, run_dir, config = snapshot(tmp_path)
+    runner = MutatingRunner(
+        result=implementation_result(),
+        mutation=lambda cwd: cwd.joinpath("file.txt").write_text(
+            "implemented\n",
+            encoding="utf-8",
+        ),
+    )
+
+    run_implementation_stage(config, run_dir, codex_runner=runner)
+
+    assert runner.stdin is not None
+    prompt = runner.stdin.lower()
+    assert "existing configured development environment" in prompt
+    assert "project tooling" in prompt
+    assert "do not create a new virtual environment" in prompt
+    assert "conda environment" in prompt
+    assert "inside the target repository" in prompt
+    assert "do not install project dependencies globally" in prompt
+    assert "do not modify `.gitignore`" in prompt
+    assert "report the limitation" in prompt
+    assert "return `blocked`" in prompt
+
+
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
 def test_completed_implementation_is_accepted_and_artifacts_are_stored(tmp_path):
     repo, run_dir, config = snapshot(tmp_path)
     runner = MutatingRunner(
@@ -463,6 +491,97 @@ def test_untracked_files_are_accepted_and_included_in_patch(tmp_path):
 @pytest.mark.skipif(
     GIT is None, reason="git executable is required for implementation tests"
 )
+def test_new_environment_after_completed_implementation_is_human_required(tmp_path):
+    repo, run_dir, config = snapshot(tmp_path)
+
+    def create_environment_and_source_change(cwd: Path) -> None:
+        cwd.joinpath("file.txt").write_text("implemented\n", encoding="utf-8")
+        create_pyvenv(cwd / ".venv-correction")
+
+    result = run_implementation_stage(
+        config,
+        run_dir,
+        codex_runner=MutatingRunner(
+            result=implementation_result(),
+            mutation=create_environment_and_source_change,
+        ),
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.workspace_guard is not None
+    assert result.workspace_guard.has_violation
+    assert result.patch_path is None
+    assert "Workspace hygiene violation" in result.controller_message
+    assert ".venv-correction/" in result.controller_message
+    assert ".venv-correction/pyvenv.cfg" in result.controller_message
+    assert "did not exist before" in result.controller_message
+    assert "No files were deleted automatically" in result.controller_message
+    assert (
+        "branch unchanged; HEAD unchanged; staging empty" in result.controller_message
+    )
+    assert repo.joinpath(".venv-correction", "pyvenv.cfg").is_file()
+    assert repo.joinpath("file.txt").read_text(encoding="utf-8") == "implemented\n"
+    assert run_git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "feature/example"
+    assert run_git(repo, "rev-parse", "HEAD") == result.run_record.baseline_sha
+    assert run_git(repo, "diff", "--cached", "--name-only") == ""
+    guard_path = run_dir / "workspace-guard" / "implementation.json"
+    guard = json.loads(guard_path.read_text(encoding="utf-8"))
+    assert guard["phase"] == "IMPLEMENT"
+    assert guard["environments_before"] == []
+    assert guard["new_environments"][0]["root"] == ".venv-correction"
+    assert guard["new_environments"][0]["markers"] == [".venv-correction/pyvenv.cfg"]
+
+
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
+def test_preexisting_ignored_environment_does_not_block_implementation(tmp_path):
+    repo = create_git_repo(tmp_path / "repo")
+    repo.joinpath(".gitignore").write_text(".venv/\n", encoding="utf-8")
+    run_git(repo, "add", ".gitignore")
+    run_git(repo, "commit", "-m", "ignore project environment")
+    create_pyvenv(repo / ".venv")
+    ticket = tmp_path / "TA-005.md"
+    ticket.write_text("# TA-005\n\nImplement the ticket.\n", encoding="utf-8")
+    config = make_config(repo)
+    snapshot_result = create_run_snapshot(
+        config,
+        ticket,
+        runs_dir=tmp_path / "runs",
+        clock=fixed_clock,
+    )
+
+    result = run_implementation_stage(
+        config,
+        snapshot_result.run_dir,
+        codex_runner=MutatingRunner(
+            result=implementation_result(),
+            mutation=lambda cwd: cwd.joinpath("file.txt").write_text(
+                "implemented with existing env\n",
+                encoding="utf-8",
+            ),
+        ),
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.IMPLEMENT
+    assert result.workspace_guard is not None
+    assert not result.workspace_guard.has_violation
+    guard = json.loads(
+        snapshot_result.run_dir.joinpath(
+            "workspace-guard",
+            "implementation.json",
+        ).read_text(encoding="utf-8")
+    )
+    assert guard["environments_before"][0]["root"] == ".venv"
+    assert guard["environments_after"][0]["root"] == ".venv"
+    assert guard["new_environments"] == []
+
+
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
 def test_started_process_failure_becomes_human_required(tmp_path):
     _repo, run_dir, config = snapshot(tmp_path)
     runner = MutatingRunner(returncode=2, stderr="boom\n")
@@ -604,6 +723,50 @@ def test_failed_implementation_with_observed_changes_overrides_nonstart_metadata
 @pytest.mark.skipif(
     GIT is None, reason="git executable is required for implementation tests"
 )
+def test_failed_writable_implementation_records_environment_guard_finding(tmp_path):
+    repo, run_dir, config = snapshot(tmp_path)
+
+    def create_environment_and_partial_change(cwd: Path) -> None:
+        cwd.joinpath("file.txt").write_text(
+            "partial implementation\n",
+            encoding="utf-8",
+        )
+        create_pyvenv(cwd / ".venv-correction")
+
+    result = run_implementation_stage(
+        config,
+        run_dir,
+        codex_runner=MutatingRunner(
+            mutation=create_environment_and_partial_change,
+            returncode=2,
+            stderr="boom\n",
+        ),
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.run_record.last_completed_state == WorkflowState.SNAPSHOT
+    assert "Codex exited with code 2" in result.run_record.terminal_reason
+    assert "Workspace hygiene violation" in result.run_record.terminal_reason
+    assert ".venv-correction/pyvenv.cfg" in result.run_record.terminal_reason
+    assert result.workspace_guard is not None
+    assert result.workspace_guard.has_violation
+    assert repo.joinpath(".venv-correction", "pyvenv.cfg").is_file()
+    assert repo.joinpath("file.txt").read_text(encoding="utf-8") == (
+        "partial implementation\n"
+    )
+    assert result.patch_path == run_dir / DIFFS_DIR / "failed-implementation.patch"
+    guard = json.loads(
+        run_dir.joinpath("workspace-guard", "implementation.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert guard["new_environments"][0]["root"] == ".venv-correction"
+
+
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
 def test_failed_implementation_patch_capture_error_stays_human_required(tmp_path):
     _repo, run_dir, config = snapshot(tmp_path)
     run_dir.joinpath(DIFFS_DIR).write_text("not a directory\n", encoding="utf-8")
@@ -716,3 +879,8 @@ def sandbox_value(argv: tuple[str, ...]) -> str:
 def implementation_schema() -> dict[str, object]:
     schema_path = PROJECT_ROOT / "schemas" / "implementation-result.schema.json"
     return json.loads(schema_path.read_text(encoding="utf-8"))
+
+
+def create_pyvenv(path: Path) -> None:
+    path.mkdir(parents=True)
+    path.joinpath("pyvenv.cfg").write_text("home = python\n", encoding="utf-8")

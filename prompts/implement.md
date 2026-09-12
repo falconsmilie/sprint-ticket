@@ -30,6 +30,14 @@ Add or update appropriate tests.
 Run useful focused validation.
 Avoid unrelated refactoring.
 
+## Environment And Tooling
+
+Use the target repository's existing configured development environment and project tooling.
+Do not create a new virtual environment, Conda environment, dependency environment, package cache, or large generated dependency tree inside the target repository merely to implement or validate this ticket, unless the ticket explicitly requires that artifact.
+Do not install project dependencies globally or mutate unrelated machine-level Python, Node, Conda, or system environments as a workaround.
+Do not modify `.gitignore` merely to hide local validation environments or generated dependency trees.
+If required validation cannot be performed using the repository's existing environment/tooling, run only the safe validation that is available and report the limitation. Return `BLOCKED` when the missing environment prevents safe completion.
+
 ## Snapshotted Ticket
 
 The complete snapshotted ticket is included verbatim below. Do not summarize away requirements.

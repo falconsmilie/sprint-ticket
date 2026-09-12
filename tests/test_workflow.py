@@ -403,6 +403,59 @@ def test_lifecycle_git_safety_violation_stops_without_repair(
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_lifecycle_implementation_environment_pollution_stops_before_verification(
+    tmp_path,
+):
+    repo, ticket, config = workflow_inputs(tmp_path)
+
+    def create_environment_and_source_change(cwd: Path) -> None:
+        cwd.joinpath("file.txt").write_text("implemented\n", encoding="utf-8")
+        create_pyvenv(cwd / ".venv-correction")
+
+    codex = SequencedCodexRunner(
+        steps=[
+            CodexStep(
+                result=implementation_result(),
+                mutation=create_environment_and_source_change,
+            )
+        ],
+        calls=[],
+    )
+    verification = SequencedVerificationRunner(steps=[VerificationStep()], calls=[])
+
+    result = run_ticket_lifecycle(
+        config,
+        ticket,
+        runs_dir=tmp_path / "runs",
+        codex_runner=codex,
+        verification_runner=verification,
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.implementation_result is not None
+    assert result.implementation_result.workspace_guard is not None
+    assert result.implementation_result.workspace_guard.has_violation
+    assert verification.calls == []
+    assert result.review_results == ()
+    assert result.correction_results == ()
+    assert len(codex.calls) == 1
+    assert repo.joinpath(".venv-correction", "pyvenv.cfg").is_file()
+    assert repo.joinpath("file.txt").read_text(encoding="utf-8") == "implemented\n"
+    assert run_git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "feature/example"
+    assert run_git(repo, "rev-parse", "HEAD") == result.run_record.baseline_sha
+    assert run_git(repo, "diff", "--cached", "--name-only") == ""
+    guard_path = result.run_dir / "workspace-guard" / "implementation.json"
+    guard = json.loads(guard_path.read_text(encoding="utf-8"))
+    assert guard["new_environments"][0]["root"] == ".venv-correction"
+    report = result.run_dir.joinpath("final-report.md").read_text(encoding="utf-8")
+    assert "### Workspace Hygiene" in report
+    assert ".venv-correction" in report
+    assert "did not exist before this writable operation" in report
+    assert "TicketAutomation did not delete detected environments." in report
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
 def test_lifecycle_started_writable_codex_failure_is_human_required(tmp_path):
     repo, ticket, config = workflow_inputs(tmp_path)
     codex = SequencedCodexRunner(
@@ -440,6 +493,70 @@ def test_lifecycle_started_writable_codex_failure_is_human_required(tmp_path):
     assert "Codex failure" in report
     assert "failed-implementation.patch" in report
     assert "file.txt" in report
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_lifecycle_correction_environment_pollution_stops_before_reverification(
+    tmp_path,
+):
+    repo, ticket, config = workflow_inputs(tmp_path)
+
+    def create_environment_and_correction(cwd: Path) -> None:
+        cwd.joinpath("file.txt").write_text("corrected\n", encoding="utf-8")
+        create_pyvenv(cwd / ".venv-correction")
+
+    codex = SequencedCodexRunner(
+        steps=[
+            CodexStep(
+                result=implementation_result(),
+                mutation=write_file("implemented\n"),
+            ),
+            CodexStep(
+                result=review_result(verdict=ReviewVerdict.CORRECTIONS_REQUIRED.value)
+            ),
+            CodexStep(
+                result=implementation_result(),
+                mutation=create_environment_and_correction,
+            ),
+            CodexStep(result=review_result()),
+        ],
+        calls=[],
+    )
+    verification = SequencedVerificationRunner(
+        steps=[VerificationStep(), VerificationStep()],
+        calls=[],
+    )
+
+    result = run_ticket_lifecycle(
+        config,
+        ticket,
+        runs_dir=tmp_path / "runs",
+        codex_runner=codex,
+        verification_runner=verification,
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.run_record.current_correction_round == 1
+    assert len(result.correction_results) == 1
+    assert result.correction_results[0].workspace_guard is not None
+    assert result.correction_results[0].workspace_guard.has_violation
+    assert len(verification.calls) == 1
+    assert len(result.verification_results) == 1
+    assert len(result.review_results) == 1
+    assert len(codex.calls) == 3
+    assert repo.joinpath(".venv-correction", "pyvenv.cfg").is_file()
+    assert repo.joinpath("file.txt").read_text(encoding="utf-8") == "corrected\n"
+    assert run_git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "feature/example"
+    assert run_git(repo, "rev-parse", "HEAD") == result.run_record.baseline_sha
+    assert run_git(repo, "diff", "--cached", "--name-only") == ""
+    guard_path = result.run_dir / "workspace-guard" / "correction-round-1.json"
+    guard = json.loads(guard_path.read_text(encoding="utf-8"))
+    assert guard["phase"] == "CORRECT"
+    assert guard["new_environments"][0]["markers"] == [".venv-correction/pyvenv.cfg"]
+    report = result.run_dir.joinpath("final-report.md").read_text(encoding="utf-8")
+    assert "correction-round-1.json" in report
+    assert "TicketAutomation did not delete detected environments." in report
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
@@ -1791,3 +1908,8 @@ def event_stream(result: dict[str, object]) -> str:
 def sandbox_value(argv: tuple[str, ...]) -> str:
     sandbox_index = argv.index("--sandbox")
     return argv[sandbox_index + 1]
+
+
+def create_pyvenv(path: Path) -> None:
+    path.mkdir(parents=True)
+    path.joinpath("pyvenv.cfg").write_text("home = python\n", encoding="utf-8")

@@ -222,6 +222,32 @@ def test_correction_prompt_retains_original_ticket_and_preserve_instruction(tmp_
 @pytest.mark.skipif(
     GIT is None, reason="git executable is required for correction tests"
 )
+def test_correction_prompt_contains_environment_tooling_policy(tmp_path):
+    _repo, run_dir, config = review_correct_run(tmp_path)
+    runner = completed_runner()
+
+    run_correction_stage(config, run_dir, codex_runner=runner)
+
+    assert runner.stdin is not None
+    prompt = runner.stdin.lower()
+    assert (
+        "existing uncommitted source changes are the implementation being corrected"
+        in prompt
+    )
+    assert "existing configured development environment" in prompt
+    assert "project tooling" in prompt
+    assert "do not create a new virtual environment" in prompt
+    assert "conda environment" in prompt
+    assert "inside the target repository" in prompt
+    assert "do not install project dependencies globally" in prompt
+    assert "do not modify `.gitignore`" in prompt
+    assert "report the limitation" in prompt
+    assert "return `blocked`" in prompt
+
+
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for correction tests"
+)
 def test_correction_runs_as_fresh_workspace_write_invocation(tmp_path):
     _repo, run_dir, config = review_correct_run(tmp_path)
     runner = completed_runner()
@@ -384,6 +410,50 @@ def test_after_correction_patch_is_complete_baseline_relative_diff(tmp_path):
 @pytest.mark.skipif(
     GIT is None, reason="git executable is required for correction tests"
 )
+def test_new_environment_after_completed_correction_is_human_required(tmp_path):
+    repo, run_dir, config = review_correct_run(tmp_path)
+
+    def create_environment_and_correction(cwd: Path) -> None:
+        cwd.joinpath("file.txt").write_text("corrected\n", encoding="utf-8")
+        create_pyvenv(cwd / ".venv-correction")
+
+    result = run_correction_stage(
+        config,
+        run_dir,
+        codex_runner=CodexRunner(
+            result=correction_result(),
+            mutation=create_environment_and_correction,
+        ),
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.run_record.current_correction_round == 1
+    assert result.workspace_guard is not None
+    assert result.workspace_guard.has_violation
+    assert "Workspace hygiene violation" in result.controller_message
+    assert ".venv-correction/" in result.controller_message
+    assert ".venv-correction/pyvenv.cfg" in result.controller_message
+    assert "did not exist before" in result.controller_message
+    assert "No files were deleted automatically" in result.controller_message
+    assert (
+        "branch unchanged; HEAD unchanged; staging empty" in result.controller_message
+    )
+    assert repo.joinpath(".venv-correction", "pyvenv.cfg").is_file()
+    assert repo.joinpath("file.txt").read_text(encoding="utf-8") == "corrected\n"
+    assert run_git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "feature/example"
+    assert run_git(repo, "rev-parse", "HEAD") == result.run_record.baseline_sha
+    assert run_git(repo, "diff", "--cached", "--name-only") == ""
+    guard_path = run_dir / "workspace-guard" / "correction-round-1.json"
+    guard = json.loads(guard_path.read_text(encoding="utf-8"))
+    assert guard["phase"] == "CORRECT"
+    assert guard["new_environments"][0]["root"] == ".venv-correction"
+    assert guard["new_environments"][0]["markers"] == [".venv-correction/pyvenv.cfg"]
+
+
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for correction tests"
+)
 def test_oversized_logs_are_not_blindly_embedded(tmp_path):
     huge_stdout = "A" * 10_000
     _repo, run_dir, config = verification_correct_run(tmp_path, stdout=huge_stdout)
@@ -490,6 +560,45 @@ def test_failed_correction_with_observed_changes_overrides_nonstart_metadata(tmp
     assert run_git(repo, "rev-parse", "HEAD") == result.run_record.baseline_sha
     assert run_git(repo, "diff", "--cached", "--name-only") == ""
     assert "Process started: no" in result.run_record.terminal_reason
+
+
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for correction tests"
+)
+def test_failed_writable_correction_records_environment_guard_finding(tmp_path):
+    repo, run_dir, config = review_correct_run(tmp_path)
+
+    def create_environment_and_partial_correction(cwd: Path) -> None:
+        cwd.joinpath("file.txt").write_text("partial correction\n", encoding="utf-8")
+        create_pyvenv(cwd / ".venv-correction")
+
+    result = run_correction_stage(
+        config,
+        run_dir,
+        codex_runner=ProcessFailureRunner(
+            mutation=create_environment_and_partial_correction,
+        ),
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.run_record.current_correction_round == 0
+    assert "Codex exited with code 2" in result.run_record.terminal_reason
+    assert "Workspace hygiene violation" in result.run_record.terminal_reason
+    assert ".venv-correction/pyvenv.cfg" in result.run_record.terminal_reason
+    assert result.workspace_guard is not None
+    assert result.workspace_guard.has_violation
+    assert repo.joinpath(".venv-correction", "pyvenv.cfg").is_file()
+    assert repo.joinpath("file.txt").read_text(encoding="utf-8") == (
+        "partial correction\n"
+    )
+    assert result.patch_path == run_dir / "diffs" / "failed-correction-1.patch"
+    guard = json.loads(
+        run_dir.joinpath("workspace-guard", "correction-round-1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert guard["new_environments"][0]["root"] == ".venv-correction"
 
 
 @pytest.mark.skipif(
@@ -926,3 +1035,8 @@ def event_stream(result: dict[str, object]) -> str:
 def sandbox_value(argv: tuple[str, ...]) -> str:
     sandbox_index = argv.index("--sandbox")
     return argv[sandbox_index + 1]
+
+
+def create_pyvenv(path: Path) -> None:
+    path.mkdir(parents=True)
+    path.joinpath("pyvenv.cfg").write_text("home = python\n", encoding="utf-8")

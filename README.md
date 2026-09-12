@@ -8,6 +8,8 @@ TicketAutomation permits only one active run per target repository working tree.
 
 Human control remains explicit. TicketAutomation does not commit, push, change branches, stage files, reset work, stash work, or clean a target repository. The implementation agent may edit the working tree, and TicketAutomation verifies the branch, HEAD, and staging area after that writable boundary. The review agent runs in a separate read-only Codex invocation and must not edit the repository.
 
+Writable implementation and correction agents must use the target project's existing development environment and tooling. They must not create ad-hoc virtual environments, Conda environments, package caches, or generated dependency trees inside the target repository merely to perform implementation or validation, and they must not mutate global dependency environments as a workaround.
+
 ## Configuration
 
 Copy the example configuration and edit the local file for your machine:
@@ -119,6 +121,8 @@ The implementation stage renders `prompts/implement.md` with the complete snapsh
 
 After Codex exits, TicketAutomation independently inspects Git. The current branch must still match the starting branch, `HEAD` must still match the baseline SHA, and the staging area must be empty. If any of those invariants are violated, the run becomes `HUMAN_REQUIRED` and TicketAutomation does not undo the mutation. A `BLOCKED` implementation result also becomes `HUMAN_REQUIRED` with the agent result preserved in `implementation/result.json`. If Codex reports `COMPLETED` without any worktree changes for an implementation ticket, the run becomes `HUMAN_REQUIRED`. Codex execution failures become `FAILED`.
 
+TicketAutomation also snapshots recognizable Python and Conda environment roots inside the target repository before and after the writable implementation invocation. If a newly persisted local environment appears, the run becomes `HUMAN_REQUIRED`; TicketAutomation writes `workspace-guard/implementation.json` and leaves the workspace untouched for inspection.
+
 When implementation completes and the safety checks pass, TicketAutomation captures `runs/<run-id>/diffs/after-implementation.patch` and `runs/<run-id>/diffs/after-implementation.stat` from Git.
 
 ## Verification
@@ -150,6 +154,8 @@ The two correction sources remain distinct. A failed deterministic gate is not c
 Each correction round uses a fresh Codex invocation with the `workspace-write` sandbox and stores artifacts under `runs/<run-id>/correction-executions/round-<round>/`: `prompt.md`, `events.jsonl`, `stderr.log`, and `result.json`. The correction prompt includes the complete original ticket, the generated corrective ticket, and current repository context. It explicitly tells the correction agent that existing uncommitted changes are the original implementation and must be preserved unless the corrective ticket identifies a defect.
 
 After every writable correction invocation, TicketAutomation independently verifies that the branch still matches the starting branch, `HEAD` still equals the baseline SHA, and the staging area is empty. If any invariant is violated, the run becomes `HUMAN_REQUIRED` and TicketAutomation does not reset or repair the repository. A correction result of `BLOCKED` also becomes `HUMAN_REQUIRED` with the agent explanation preserved.
+
+Correction rounds use the same workspace-environment guard as implementation. If a correction agent leaves behind a newly created Python or Conda environment inside the target repository, TicketAutomation stops at `HUMAN_REQUIRED`, writes a `workspace-guard/correction-round-<n>.json` artifact, does not delete the environment, and does not modify target `.gitignore` rules.
 
 Completed corrections capture `runs/<run-id>/diffs/after-correction-<round>.patch`. That patch is always the full diff from the original baseline SHA to the complete current working tree, including valid existing implementation work, rather than only the incremental correction delta. The next step is always deterministic verification before any further review.
 

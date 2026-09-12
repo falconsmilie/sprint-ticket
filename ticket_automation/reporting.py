@@ -15,6 +15,7 @@ from .audit import (
 from .git import GitCommandError, GitRepository
 from .models import WorkflowState
 from .runs import RUN_RECORD_FILE, RunError, RunRecord, load_run_record, save_run_record
+from .workspace_guard import WORKSPACE_GUARD_DIR_NAME
 
 DIFFS_DIR_NAME = "diffs"
 FINAL_PATCH_FILE = "final.patch"
@@ -230,6 +231,7 @@ def collect_report_context(
         if (run_path / CORRECTIONS_DIR_NAME).is_dir()
         else ()
     )
+    workspace_guard_inspections = _read_workspace_guard_inspections(run_path)
     final_review = review_results[-1]["data"] if review_results else None
     advisory_findings = _findings_with_disposition(final_review, "ADVISORY")
     follow_up_findings = _findings_with_disposition(final_review, "FOLLOW_UP")
@@ -249,6 +251,7 @@ def collect_report_context(
             "deletions": deletions,
             "verification_rounds": verification_rounds,
             "review_results": review_results,
+            "workspace_guard_inspections": workspace_guard_inspections,
             "correction_ticket_paths": correction_ticket_paths,
             "final_review": final_review,
             "advisory_findings": advisory_findings,
@@ -357,6 +360,8 @@ def render_final_report(
     checkpoint_patch = controller["latest_writable_checkpoint_patch"]
     if checkpoint_patch is not None:
         lines.append(f"- Latest writable checkpoint patch: {checkpoint_patch}")
+
+    _append_workspace_guard(lines, controller["workspace_guard_inspections"])
 
     lines.extend(
         [
@@ -639,6 +644,18 @@ def _read_review_results(run_dir: Path) -> tuple[dict[str, Any], ...]:
     return tuple(items)
 
 
+def _read_workspace_guard_inspections(run_dir: Path) -> tuple[dict[str, Any], ...]:
+    guard_root = run_dir / WORKSPACE_GUARD_DIR_NAME
+    if not guard_root.is_dir():
+        return ()
+    items: list[dict[str, Any]] = []
+    for path in sorted(guard_root.glob("*.json")):
+        data = _read_json_if_exists(path)
+        if isinstance(data, dict):
+            items.append({"path": path.relative_to(run_dir).as_posix(), "data": data})
+    return tuple(items)
+
+
 def _read_json_if_exists(path: Path) -> Any | None:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -684,6 +701,55 @@ def _append_findings(
         finding_id = finding.get("id", "<unknown>")
         finding_title = finding.get("title", "Untitled finding")
         lines.append(f"- {finding_id}: {finding_title}")
+
+
+def _append_workspace_guard(
+    lines: list[str],
+    inspections: tuple[dict[str, Any], ...],
+) -> None:
+    lines.extend(["", "### Workspace Hygiene", ""])
+    if not inspections:
+        lines.append("- No workspace-environment guard artifacts were persisted.")
+        return
+
+    lines.append(f"- Workspace guard artifacts: {len(inspections)}")
+    found_new_environment = False
+    for item in inspections:
+        path = item.get("path", "<unknown>")
+        data = item.get("data", {})
+        if not isinstance(data, dict):
+            continue
+        phase = data.get("phase", "UNKNOWN")
+        new_environments = data.get("new_environments", [])
+        new_count = len(new_environments) if isinstance(new_environments, list) else 0
+        lines.append(
+            f"- {path}: phase {phase}; newly detected environments: {new_count}"
+        )
+        if not isinstance(new_environments, list):
+            continue
+        for environment in new_environments:
+            if not isinstance(environment, dict):
+                continue
+            found_new_environment = True
+            markers = environment.get("markers", [])
+            marker = (
+                markers[0] if isinstance(markers, list) and markers else "<unknown>"
+            )
+            lines.append(
+                "  - "
+                f"{environment.get('root', '<unknown>')}: "
+                f"{_workspace_environment_kind(environment.get('kind'))}; "
+                f"marker: {marker}; "
+                "did not exist before this writable operation"
+            )
+    if found_new_environment:
+        lines.append("- TicketAutomation did not delete detected environments.")
+
+
+def _workspace_environment_kind(value: object) -> str:
+    if value == "conda":
+        return "Conda environment"
+    return "Python virtual environment"
 
 
 def _format_agent_test(item: Any) -> str:

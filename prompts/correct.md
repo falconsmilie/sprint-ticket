@@ -40,6 +40,14 @@ Do not broaden the ticket.
 Do not perform unrelated refactoring.
 Run relevant targeted validation after making the correction.
 
+## Environment And Tooling
+
+Existing uncommitted source changes are the implementation being corrected. Use the target repository's existing configured development environment and project tooling to validate those changes.
+Do not create a new virtual environment, Conda environment, dependency environment, package cache, or large generated dependency tree inside the target repository merely to perform correction or validation, unless the original or corrective ticket explicitly requires that artifact.
+Do not install project dependencies globally or mutate unrelated machine-level Python, Node, Conda, or system environments as a workaround.
+Do not modify `.gitignore` merely to hide local validation environments or generated dependency trees.
+If required validation cannot be performed using the repository's existing environment/tooling, run only the safe validation that is available and report the limitation. Return `BLOCKED` when the missing environment prevents safe completion.
+
 ## Repository Context
 
 {{REPOSITORY_CONTEXT}}
