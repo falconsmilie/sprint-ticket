@@ -12,6 +12,11 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from . import executable_resolution
+from .process_output import (
+    ProcessOutputDecodeError,
+    decode_human_output,
+    decode_protocol_output,
+)
 
 DEFAULT_CODEX_EXECUTABLE = "codex"
 DEFAULT_TIMEOUT_SECONDS = 60 * 60
@@ -154,6 +159,12 @@ class CodexProcessTimedOut(TimeoutError):
         self.result = result
 
 
+class CodexProcessOutputDecodeError(RuntimeError):
+    def __init__(self, message: str, result: CodexProcessResult):
+        super().__init__(message)
+        self.result = result
+
+
 class CodexProcessRunner(Protocol):
     def run(
         self,
@@ -221,10 +232,9 @@ class SubprocessCodexRunner:
             completed = subprocess.run(
                 command.argv,
                 cwd=command.cwd,
-                input=stdin,
+                input=stdin.encode("utf-8"),
                 capture_output=True,
-                text=True,
-                encoding="utf-8",
+                text=False,
                 check=False,
                 timeout=timeout_seconds,
                 shell=False,
@@ -238,10 +248,26 @@ class SubprocessCodexRunner:
                 )
             ) from error
 
+        stderr = decode_human_output(completed.stderr)
+        try:
+            stdout = decode_protocol_output(
+                completed.stdout,
+                stream_name="Codex stdout",
+            )
+        except ProcessOutputDecodeError as error:
+            raise CodexProcessOutputDecodeError(
+                str(error),
+                CodexProcessResult(
+                    returncode=completed.returncode,
+                    stdout=decode_human_output(completed.stdout),
+                    stderr=stderr,
+                ),
+            ) from error
+
         return CodexProcessResult(
             returncode=completed.returncode,
-            stdout=completed.stdout,
-            stderr=completed.stderr,
+            stdout=stdout,
+            stderr=stderr,
         )
 
 
@@ -373,6 +399,28 @@ class CodexExecutor:
                 exit_code=None,
                 timed_out=True,
                 timeout_seconds=error.result.timeout_seconds,
+            )
+        except CodexProcessOutputDecodeError as error:
+            artifact_paths.events.write_text(
+                error.result.stdout,
+                encoding="utf-8",
+                newline="\n",
+            )
+            artifact_paths.stderr.write_text(
+                error.result.stderr,
+                encoding="utf-8",
+                newline="\n",
+            )
+            return _fail(
+                kind=CodexFailureKind.MALFORMED_EVENT_STREAM,
+                message=str(error),
+                command=command,
+                sandbox=sandbox,
+                output_schema=output_schema,
+                artifacts=artifact_paths,
+                started_at=start,
+                process_started=True,
+                exit_code=error.result.returncode,
             )
         except OSError as error:
             artifact_paths.events.write_text("", encoding="utf-8", newline="\n")
@@ -1436,11 +1484,7 @@ def _duration_seconds(start: datetime, end: datetime) -> float:
 
 
 def _process_text(value: str | bytes | None) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return value
+    return decode_human_output(value)
 
 
 __all__ = [
@@ -1457,6 +1501,7 @@ __all__ = [
     "CodexExecutionStatus",
     "CodexExecutor",
     "CodexFailureKind",
+    "CodexProcessOutputDecodeError",
     "CodexProcessResult",
     "CodexProcessRunner",
     "CodexProcessTimedOut",

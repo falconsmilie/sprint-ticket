@@ -18,6 +18,7 @@ from ticket_automation.corrections import (
 from ticket_automation.models import WorkflowState
 from ticket_automation.runs import create_run_snapshot, load_run_record, save_run_record
 from ticket_automation.verification import (
+    SubprocessVerificationRunner,
     VerificationError,
     VerificationErrorKind,
     VerificationProcessCommand,
@@ -31,6 +32,23 @@ from ticket_automation.verification import (
 
 def fixed_clock() -> datetime:
     return datetime(2026, 9, 11, 13, 5, 14, tzinfo=timezone.utc)
+
+
+def test_subprocess_output_decoding_does_not_depend_on_locale(tmp_path):
+    command = VerificationProcessCommand(
+        argv=(
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.buffer.write(b'utf8: \\xc4\\x8d\\n')",
+        ),
+        cwd=tmp_path,
+    )
+
+    result = SubprocessVerificationRunner().run(command, timeout_seconds=30)
+
+    assert result.returncode == 0
+    assert result.stdout == "utf8: č\n"
+    assert isinstance(result.stderr, str)
 
 
 @dataclass

@@ -22,6 +22,7 @@ from ticket_automation.codex import (
     CodexExecutionStatus,
     CodexExecutor,
     CodexFailureKind,
+    CodexProcessOutputDecodeError,
     CodexProcessResult,
     CodexProcessTimedOut,
     CodexProcessTimeout,
@@ -637,6 +638,45 @@ def test_subprocess_timeout_converts_partial_output(monkeypatch, tmp_path):
     assert raised.value.result.stderr == "partial stderr\n"
 
 
+def test_codex_output_decode_failure_is_typed_execution_failure(tmp_path):
+    schema = write_schema(tmp_path / "schema.json")
+    runner = FakeRunner(
+        error=CodexProcessOutputDecodeError(
+            "Codex stdout was not valid utf-8.",
+            CodexProcessResult(
+                returncode=0,
+                stdout="replacement � output\n",
+                stderr="progress\n",
+            ),
+        )
+    )
+
+    with pytest.raises(CodexExecutionFailure) as raised:
+        execute(
+            prompt="prompt",
+            repo_path=tmp_path,
+            sandbox=Sandbox.READ_ONLY,
+            output_schema=schema,
+            artifact_directory=tmp_path / "artifacts",
+            executable=EXISTING_EXECUTABLE,
+            runner=runner,
+        )
+
+    assert raised.value.kind == CodexFailureKind.MALFORMED_EVENT_STREAM
+    assert raised.value.execution.events_jsonl_path.read_text(encoding="utf-8") == (
+        "replacement � output\n"
+    )
+    assert raised.value.execution.stderr_log_path.read_text(encoding="utf-8") == (
+        "progress\n"
+    )
+    assert_failure_execution_record(
+        raised.value.execution,
+        failure_kind=CodexFailureKind.MALFORMED_EVENT_STREAM,
+        process_started=True,
+        exit_code=0,
+    )
+
+
 def test_malformed_jsonl_is_typed_failure(tmp_path):
     schema = write_schema(tmp_path / "schema.json")
     runner = FakeRunner(
@@ -984,7 +1024,7 @@ def test_subprocess_runner_does_not_use_shell(monkeypatch, tmp_path):
     assert result.returncode == 0
     assert captured["args"] == (("codex", "exec", "-"),)
     assert captured["kwargs"]["cwd"] == tmp_path
-    assert captured["kwargs"]["input"] == "prompt"
+    assert captured["kwargs"]["input"] == b"prompt"
     assert captured["kwargs"]["shell"] is False
 
 

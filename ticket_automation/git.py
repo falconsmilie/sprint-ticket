@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import re
-import subprocess
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
+from .process_output import run_human_text_command
 
 _MUTATING_SUBCOMMANDS = frozenset(
     {
@@ -154,6 +154,9 @@ class GitRepository:
         output = _git(self.path, ("ls-files", "--others", "--exclude-standard")).stdout
         return _split_lines(output)
 
+    def status_short(self) -> str:
+        return _git(self.path, ("status", "--short")).stdout
+
     def has_staged_files(self) -> bool:
         result = _git(self.path, ("diff", "--cached", "--quiet", "--"), check=False)
         if result.returncode == 0:
@@ -192,13 +195,7 @@ def _git(
         )
 
     command = ("git", *argv)
-    completed = subprocess.run(
-        command,
-        cwd=repo_path,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    completed = run_human_text_command(command, cwd=repo_path)
     result = GitCommandResult(
         argv=command,
         returncode=completed.returncode,

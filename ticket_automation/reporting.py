@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
-import subprocess
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from os import devnull
 from pathlib import Path
 from typing import Any
 
+from .audit import (
+    changed_files_including_untracked,
+    diff_including_untracked,
+    diff_stats_including_untracked,
+)
 from .git import GitCommandError, GitRepository
 from .models import WorkflowState
 from .runs import RUN_RECORD_FILE, RunError, RunRecord, load_run_record, save_run_record
@@ -149,10 +152,21 @@ def run_report_stage(
 
 def generate_terminal_report_best_effort(run_dir: Path | str) -> Path | None:
     run_path = Path(run_dir)
+    run_record: RunRecord | None = None
     try:
         run_record = load_run_record(run_path / RUN_RECORD_FILE)
-        _final_patch_path, patch_text = capture_final_patch(run_path, run_record)
-        context = collect_report_context(run_path, run_record, patch_text=patch_text)
+        patch_text = ""
+        patch_capture_error: str | None = None
+        try:
+            _final_patch_path, patch_text = capture_final_patch(run_path, run_record)
+        except Exception as error:  # noqa: BLE001 - best effort must not throw.
+            patch_capture_error = f"Final patch unavailable: {error}"
+        context = collect_report_context(
+            run_path,
+            run_record,
+            patch_text=patch_text,
+            patch_capture_error=patch_capture_error,
+        )
         report_text = render_final_report(
             context,
             terminal_reason=run_record.terminal_reason,
@@ -160,16 +174,12 @@ def generate_terminal_report_best_effort(run_dir: Path | str) -> Path | None:
         final_report_path = run_path / FINAL_REPORT_FILE
         _write_text(final_report_path, report_text)
         return final_report_path
-    except (
-        GitCommandError,
-        KeyError,
-        OSError,
-        ReportError,
-        RunError,
-        TypeError,
-        ValueError,
-    ):
-        return None
+    except Exception as error:  # noqa: BLE001 - best effort must not throw.
+        return _write_minimal_terminal_report(
+            run_path,
+            run_record,
+            reporting_error=error,
+        )
 
 
 def capture_final_patch(
@@ -193,6 +203,7 @@ def collect_report_context(
     run_record: RunRecord,
     *,
     patch_text: str | None = None,
+    patch_capture_error: str | None = None,
 ) -> dict[str, Any]:
     run_path = Path(run_dir)
     repository = GitRepository(Path(run_record.target_repository_path))
@@ -200,10 +211,11 @@ def collect_report_context(
     if patch is None:
         try:
             patch = diff_including_untracked(repository, run_record.baseline_sha)
-        except (GitCommandError, OSError, ValueError):
+        except (GitCommandError, OSError, ValueError) as error:
             patch = ""
+            patch_capture_error = f"Final patch unavailable: {error}"
 
-    changed_files, diff_stats = _git_diff_facts(repository, run_record)
+    changed_files, diff_stats, git_status = _git_diff_facts(repository, run_record)
     additions, deletions = count_patch_changes(patch)
     implementation_result = _read_json_if_exists(
         run_path / IMPLEMENTATION_DIR_NAME / RESULT_JSON
@@ -232,6 +244,7 @@ def collect_report_context(
             "artifact_paths": _existing_artifact_paths(run_path),
             "changed_files": changed_files,
             "diff_stats": diff_stats,
+            "git_status": git_status,
             "additions": additions,
             "deletions": deletions,
             "verification_rounds": verification_rounds,
@@ -250,6 +263,7 @@ def collect_report_context(
             "final_patch_path": str(
                 (run_path / DIFFS_DIR_NAME / FINAL_PATCH_FILE).relative_to(run_path)
             ),
+            "final_patch_error": patch_capture_error,
             "final_report_path": FINAL_REPORT_FILE,
         },
         "agent": {
@@ -327,9 +341,17 @@ def render_final_report(
             "```text",
             controller["diff_stats"] or "No diff statistics available.",
             "```",
-            f"- Final patch: {controller['final_patch_path']}",
+            "- Git status:",
+            "",
+            "```text",
+            controller["git_status"] or "No Git status available.",
+            "```",
         ]
     )
+    if controller["final_patch_error"]:
+        lines.append(f"- Final patch: {controller['final_patch_error']}")
+    else:
+        lines.append(f"- Final patch: {controller['final_patch_path']}")
     if safety.inspection_error:
         lines.append(f"- Git inspection error: {safety.inspection_error}")
     checkpoint_patch = controller["latest_writable_checkpoint_patch"]
@@ -493,33 +515,6 @@ def inspect_git_safety(run_record: RunRecord) -> GitSafetyStatus:
     )
 
 
-def diff_including_untracked(repository: GitRepository, baseline_sha: str) -> str:
-    parts = [repository.diff(baseline_sha).rstrip()]
-    for file_path in repository.untracked_files():
-        parts.append(
-            _git_no_index_diff(repository.path, file_path, stats=False).rstrip()
-        )
-    return _join_git_sections(parts)
-
-
-def diff_stats_including_untracked(repository: GitRepository, baseline_sha: str) -> str:
-    parts = [repository.diff_stats(baseline_sha).rstrip()]
-    for file_path in repository.untracked_files():
-        parts.append(
-            _git_no_index_diff(repository.path, file_path, stats=True).rstrip()
-        )
-    return _join_git_sections(parts)
-
-
-def changed_files_including_untracked(
-    repository: GitRepository,
-    baseline_sha: str,
-) -> tuple[str, ...]:
-    return _unique(
-        (*repository.changed_files(baseline_sha), *repository.untracked_files())
-    )
-
-
 def count_patch_changes(patch_text: str) -> tuple[int, int]:
     additions = 0
     deletions = 0
@@ -586,14 +581,29 @@ def _acceptance_problem(context: dict[str, Any]) -> str | None:
 def _git_diff_facts(
     repository: GitRepository,
     run_record: RunRecord,
-) -> tuple[tuple[str, ...], str]:
+) -> tuple[tuple[str, ...], str, str]:
+    changed_files: tuple[str, ...] = ()
+    diff_stats = ""
+    git_status = ""
     try:
-        return (
-            changed_files_including_untracked(repository, run_record.baseline_sha),
-            diff_stats_including_untracked(repository, run_record.baseline_sha),
+        changed_files = changed_files_including_untracked(
+            repository,
+            run_record.baseline_sha,
         )
     except (GitCommandError, OSError, ValueError):
-        return (), ""
+        pass
+    try:
+        diff_stats = diff_stats_including_untracked(
+            repository,
+            run_record.baseline_sha,
+        )
+    except (GitCommandError, OSError, ValueError):
+        pass
+    try:
+        git_status = repository.status_short()
+    except (GitCommandError, OSError, ValueError):
+        pass
+    return changed_files, diff_stats, git_status
 
 
 def _checkpoint_patch_matches(path: Path | None, current_patch: str) -> bool:
@@ -691,45 +701,6 @@ def _review_verdict(review_result: dict[str, Any] | None) -> str:
     return verdict if isinstance(verdict, str) else "NOT AVAILABLE"
 
 
-def _git_no_index_diff(repo_path: Path, file_path: str, *, stats: bool) -> str:
-    null_candidates = (
-        ("/dev/null",) if devnull == "/dev/null" else ("/dev/null", devnull)
-    )
-    last_result: subprocess.CompletedProcess[str] | None = None
-    for null_path in null_candidates:
-        command = ["git", "diff", "--no-ext-diff", "--no-index"]
-        if stats:
-            command.append("--stat")
-        command.extend(("--", null_path, file_path))
-        result = subprocess.run(
-            command,
-            cwd=repo_path,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode in (0, 1):
-            return result.stdout
-        last_result = result
-    assert last_result is not None
-    message = last_result.stderr.strip() or last_result.stdout.strip() or "no output"
-    command_text = " ".join(str(argument) for argument in last_result.args)
-    raise GitCommandError(
-        f"{command_text} failed with exit code {last_result.returncode}: {message}"
-    )
-
-
-def _join_git_sections(parts: Iterable[str]) -> str:
-    content = "\n".join(part for part in parts if part)
-    if not content:
-        return ""
-    return f"{content}\n"
-
-
-def _unique(values: Iterable[str]) -> tuple[str, ...]:
-    return tuple(dict.fromkeys(values))
-
-
 def _round_sort_key(path: Path) -> tuple[int, str]:
     stem = path.name
     if path.is_file():
@@ -748,6 +719,37 @@ def _yes_no(value: bool) -> str:
 def _write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8", newline="\n")
+
+
+def _write_minimal_terminal_report(
+    run_path: Path,
+    run_record: RunRecord | None,
+    *,
+    reporting_error: BaseException,
+) -> Path | None:
+    if run_record is None:
+        return None
+    lines = [
+        f"# {run_record.ticket_id} terminal report",
+        "",
+        "## Run identity",
+        "",
+        f"- Run ID: {run_record.run_id}",
+        f"- Run path: {run_path}",
+        f"- Target repository path: {run_record.target_repository_path}",
+        f"- State: {run_record.state.value}",
+        f"- Last completed state: {run_record.last_completed_state.value}",
+        f"- Primary failure: {run_record.terminal_reason or 'unknown'}",
+        f"- Reporting fallback: {type(reporting_error).__name__}: {reporting_error}",
+        "- Manual inspection required.",
+        "",
+    ]
+    report_path = run_path / FINAL_REPORT_FILE
+    try:
+        _write_text(report_path, "\n".join(lines))
+    except Exception:  # noqa: BLE001 - outer boundary is best effort.
+        return None
+    return report_path
 
 
 def _timestamp(clock: Callable[[], datetime] | None) -> str:

@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from tests.helpers import GIT, create_git_repo, make_config, run_git
+from ticket_automation import corrections as corrections_module
 from ticket_automation.codex import (
     CodexCommand,
     CodexFailureKind,
@@ -25,7 +26,9 @@ from ticket_automation.corrections import (
     render_correction_ticket,
     run_correction_stage,
 )
+from ticket_automation.git import GitCommandError
 from ticket_automation.models import WorkflowState
+from ticket_automation.reporting import generate_terminal_report_best_effort
 from ticket_automation.review import ReviewVerdict, run_review_stage
 from ticket_automation.runs import create_run_snapshot, load_run_record, save_run_record
 from ticket_automation.verification import run_verification_stage
@@ -512,6 +515,72 @@ def test_failed_correction_patch_capture_error_stays_human_required(tmp_path):
     assert result.patch_path is None
     assert "Failure patch capture error:" in result.run_record.terminal_reason
     assert "may have left partial source changes" in result.run_record.terminal_reason
+
+
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for correction tests"
+)
+def test_correction_diff_capture_failure_after_mutation_is_human_required(
+    monkeypatch,
+    tmp_path,
+):
+    repo, run_dir, config = review_correct_run(tmp_path)
+
+    def fail_diff(repository, baseline_sha):
+        del repository, baseline_sha
+        raise GitCommandError("synthetic diff decode failure")
+
+    monkeypatch.setattr(corrections_module, "_diff_including_untracked", fail_diff)
+    runner = completed_runner()
+
+    result = run_correction_stage(config, run_dir, codex_runner=runner)
+
+    assert runner.calls == 1
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.patch_path is None
+    assert "Could not capture correction diff" in result.controller_message
+    assert "synthetic diff decode failure" in result.controller_message
+    assert run_git(repo, "diff", "--name-only") == "file.txt"
+    assert repo.joinpath("file.txt").read_text(encoding="utf-8") == (
+        "corrected by fake correction\n"
+    )
+    assert not run_dir.joinpath("diffs", "after-correction-1.patch").exists()
+    assert result.codex_execution is not None
+    assert result.codex_execution.execution_json_path.is_file()
+
+
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for correction tests"
+)
+def test_untracked_unicode_file_is_handled_by_correction_and_reporting(tmp_path):
+    _repo, run_dir, config = review_correct_run(tmp_path)
+    unicode_text = "phospho α/β č - en dash – em dash — Søren 😀\n"
+
+    result = run_correction_stage(
+        config,
+        run_dir,
+        codex_runner=CodexRunner(
+            result=correction_result(),
+            mutation=lambda cwd: cwd.joinpath("unicode.txt").write_text(
+                unicode_text,
+                encoding="utf-8",
+            ),
+        ),
+    )
+
+    assert result.run_record.state == WorkflowState.VERIFY
+    assert result.patch_path is not None
+    correction_patch = result.patch_path.read_text(encoding="utf-8")
+    assert "diff --git a/unicode.txt b/unicode.txt" in correction_patch
+    assert f"+{unicode_text.rstrip()}" in correction_patch
+
+    report_path = generate_terminal_report_best_effort(run_dir)
+
+    assert report_path is not None
+    final_patch = run_dir.joinpath("diffs", "final.patch").read_text(encoding="utf-8")
+    assert f"+{unicode_text.rstrip()}" in final_patch
+    report = report_path.read_text(encoding="utf-8")
+    assert "unicode.txt" in report
 
 
 @pytest.mark.skipif(

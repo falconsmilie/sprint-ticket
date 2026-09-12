@@ -10,8 +10,10 @@ from pathlib import Path
 import pytest
 
 from tests.helpers import GIT, create_git_repo, make_config, run_git
+from ticket_automation import reporting as reporting_module
 from ticket_automation.codex import CodexCommand, CodexProcessResult, Sandbox
 from ticket_automation.config import VerificationCommand
+from ticket_automation.git import GitCommandError
 from ticket_automation.implementation import run_implementation_stage
 from ticket_automation.models import WorkflowState
 from ticket_automation.review import ReviewVerdict, run_review_stage
@@ -1579,6 +1581,55 @@ def test_resume_interrupted_correction_becomes_human_required(tmp_path):
     assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
     assert "Writable correction was interrupted" in result.run_record.terminal_reason
     assert result.run_dir.joinpath("final-report.md").is_file()
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_best_effort_report_preserves_primary_failure_when_final_patch_fails(
+    monkeypatch,
+    tmp_path,
+):
+    repo, ticket, config = workflow_inputs(tmp_path)
+    runs_dir = tmp_path / "runs"
+    snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
+    repo.joinpath("file.txt").write_text("partial correction\n", encoding="utf-8")
+    record_path = snapshot.run_dir / "run.json"
+    save_run_record(
+        load_run_record(record_path).with_state(
+            WorkflowState.CORRECT,
+            updated_timestamp="2026-09-11T13:05:18Z",
+            last_completed_state=WorkflowState.CORRECT,
+        ),
+        record_path,
+    )
+
+    def fail_diff(repository, baseline_sha):
+        del repository, baseline_sha
+        raise GitCommandError("synthetic final patch failure")
+
+    monkeypatch.setattr(reporting_module, "diff_including_untracked", fail_diff)
+
+    result = resume_ticket_lifecycle(
+        config,
+        snapshot.run_record.run_id,
+        runs_dir=runs_dir,
+        codex_runner=SequencedCodexRunner(
+            steps=[CodexStep(result=implementation_result())],
+            calls=[],
+        ),
+        verification_runner=SequencedVerificationRunner(steps=[], calls=[]),
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert "Writable correction was interrupted" in result.run_record.terminal_reason
+    report = result.run_dir.joinpath("final-report.md").read_text(encoding="utf-8")
+    assert "Terminal outcome: HUMAN_REQUIRED" in report
+    assert (
+        "What requires human inspection: Writable correction was interrupted" in report
+    )
+    assert "Final patch unavailable" in report
+    assert "synthetic final patch failure" in report
+    assert run_git(repo, "diff", "--name-only") == "file.txt"
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")

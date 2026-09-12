@@ -5,13 +5,14 @@ import hashlib
 import json
 import os
 import socket
-import subprocess
 import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Self
+
+from .process_output import run_human_text_command
 
 if os.name == "nt":
     import msvcrt
@@ -306,12 +307,8 @@ def _git_working_tree_root(path: Path) -> Path | None:
         return None
     cwd = path if path.is_dir() else path.parent
     try:
-        result = subprocess.run(
-            ("git", "rev-parse", "--show-toplevel"),
-            cwd=cwd,
-            check=False,
-            capture_output=True,
-            text=True,
+        result = run_human_text_command(
+            ("git", "rev-parse", "--show-toplevel"), cwd=cwd
         )
     except (FileNotFoundError, OSError):
         return None
@@ -393,10 +390,7 @@ def _format_lock_error(
         [
             f"Owning run ID: {metadata.run_id}",
             f"Owning state: {metadata.current_state or 'unknown'}",
-            (
-                "Owner process: "
-                f"{metadata.owner_hostname} pid {metadata.owner_pid}"
-            ),
+            (f"Owner process: {metadata.owner_hostname} pid {metadata.owner_pid}"),
             f"Acquired: {metadata.acquired_timestamp}",
         ]
     )

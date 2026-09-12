@@ -22,6 +22,7 @@ from .corrections import (
 )
 from .git import GitCommandError, GitRepository
 from .models import WorkflowState
+from .process_output import decode_human_output
 from .runs import (
     RUN_RECORD_FILE,
     RunError,
@@ -118,9 +119,7 @@ class SubprocessVerificationRunner:
                 cwd=command.cwd,
                 check=False,
                 capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+                text=False,
                 timeout=timeout_seconds,
                 shell=False,
             )
@@ -135,8 +134,8 @@ class SubprocessVerificationRunner:
 
         return VerificationProcessResult(
             returncode=completed.returncode,
-            stdout=completed.stdout,
-            stderr=completed.stderr,
+            stdout=decode_human_output(completed.stdout),
+            stderr=decode_human_output(completed.stderr),
         )
 
 
@@ -1379,11 +1378,7 @@ def _timestamp(clock: Callable[[], datetime] | None) -> str:
 
 
 def _process_text(value: str | bytes | None) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return value
+    return decode_human_output(value)
 
 
 __all__ = [
