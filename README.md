@@ -4,6 +4,8 @@ TicketAutomation is a standalone Python project for coordinating automation arou
 
 V1 is scoped to one implementation ticket at a time. TicketAutomation now runs the complete mechanical loop for one ticket: preflight, snapshot, implementation, deterministic verification, independent review, bounded correction, reverification, fresh rereview, final reporting, and audit handoff until the run reaches `READY_FOR_HUMAN`, `HUMAN_REQUIRED`, or `FAILED`.
 
+TicketAutomation permits only one active run per target repository working tree. `run` and `resume` take a local process-scoped repository lock under TicketAutomation-owned runtime state before entering the writable lifecycle, keyed by the canonical target repository identity where practical. This protects the uncommitted ticket boundary from two local automation processes editing the same working tree at once; Git history safety is still enforced separately by branch, HEAD, and staging checks.
+
 Human control remains explicit. TicketAutomation does not commit, push, change branches, stage files, reset work, stash work, or clean a target repository. The implementation agent may edit the working tree, and TicketAutomation verifies the branch, HEAD, and staging area after that writable boundary. The review agent runs in a separate read-only Codex invocation and must not edit the repository.
 
 ## Configuration
@@ -68,6 +70,8 @@ timeout_seconds = 1800
 ## Repository Preflight
 
 Preflight is the safety gate for target repositories. It checks that `project.repo` exists, is a Git working tree, is on a branch, has no unstaged, untracked, or staged changes, and is not on one of the configured protected branches such as `main` or `master`.
+
+`run` acquires the target repository ownership lock before preflight and releases it on controlled terminal outcomes or ordinary exceptions. If a later preflight check fails, the process ownership is released; the failed preflight does not strand the repository.
 
 The target repository must start clean. TicketAutomation deliberately does not stash changes, discard files, switch branches, reset history, or perform any automatic Git cleanup. If preflight fails, fix the repository yourself and run preflight again.
 

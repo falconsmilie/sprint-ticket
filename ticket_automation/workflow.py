@@ -20,6 +20,7 @@ from .implementation import (
     ImplementationStageResult,
     run_implementation_stage,
 )
+from .locking import RepositoryRunLock, acquire_repository_run_lock
 from .models import WorkflowState
 from .preflight import PreflightResult
 from .reporting import (
@@ -103,24 +104,54 @@ def run_ticket_lifecycle(
     verification_runner: VerificationProcessRunner | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> LifecycleResult:
+    with acquire_repository_run_lock(
+        config.project.repo,
+        run_id=None,
+        current_state=WorkflowState.PREFLIGHT.value,
+        clock=clock,
+    ) as repository_lock:
+        return _run_ticket_lifecycle_locked(
+            config,
+            ticket_path,
+            runs_dir=runs_dir,
+            repository_lock=repository_lock,
+            codex_runner=codex_runner,
+            verification_runner=verification_runner,
+            clock=clock,
+        )
+
+
+def _run_ticket_lifecycle_locked(
+    config: AppConfig,
+    ticket_path: Path | str,
+    *,
+    runs_dir: Path | str,
+    repository_lock: RepositoryRunLock,
+    codex_runner: CodexProcessRunner | None,
+    verification_runner: VerificationProcessRunner | None,
+    clock: Callable[[], datetime] | None,
+) -> LifecycleResult:
     snapshot = create_run_snapshot(
         config,
         ticket_path,
         runs_dir=runs_dir,
         clock=clock,
     )
+    _update_repository_lock(repository_lock, snapshot.run_record)
     implementation_result: ImplementationStageResult | None = None
     verification_results: list[VerificationStageResult] = []
     review_results: list[ReviewStageResult] = []
     correction_results: list[CorrectionStageResult] = []
 
     try:
+        repository_lock.update(current_state=WorkflowState.IMPLEMENT.value)
         implementation_result = run_implementation_stage(
             config,
             snapshot.run_dir,
             codex_runner=codex_runner,
             clock=clock,
         )
+        _update_repository_lock(repository_lock, implementation_result.run_record)
         return _drive_lifecycle(
             config,
             snapshot.run_dir,
@@ -132,6 +163,7 @@ def run_ticket_lifecycle(
             correction_results=correction_results,
             codex_runner=codex_runner,
             verification_runner=verification_runner,
+            repository_lock=repository_lock,
             clock=clock,
         )
     except RunError as error:
@@ -140,6 +172,7 @@ def run_ticket_lifecycle(
             terminal_reason=str(error),
             clock=clock,
         )
+        _update_repository_lock(repository_lock, run_record)
         generate_terminal_report_best_effort(snapshot.run_dir)
         return LifecycleResult(
             run_dir=snapshot.run_dir,
@@ -160,6 +193,7 @@ def run_ticket_lifecycle(
             terminal_reason=controller_error,
             clock=clock,
         )
+        _update_repository_lock(repository_lock, run_record)
         generate_terminal_report_best_effort(snapshot.run_dir)
         return LifecycleResult(
             run_dir=snapshot.run_dir,
@@ -188,6 +222,35 @@ def resume_ticket_lifecycle(
 
     preflight_result = PreflightResult(())
     run_record = load_run_record(run_dir / RUN_RECORD_FILE)
+    with acquire_repository_run_lock(
+        run_record.target_repository_path,
+        run_id=run_record.run_id,
+        current_state=run_record.state.value,
+        clock=clock,
+    ) as repository_lock:
+        return _resume_ticket_lifecycle_locked(
+            config,
+            run_dir,
+            preflight_result,
+            run_record,
+            repository_lock=repository_lock,
+            codex_runner=codex_runner,
+            verification_runner=verification_runner,
+            clock=clock,
+        )
+
+
+def _resume_ticket_lifecycle_locked(
+    config: AppConfig,
+    run_dir: Path,
+    preflight_result: PreflightResult,
+    run_record: RunRecord,
+    *,
+    repository_lock: RepositoryRunLock,
+    codex_runner: CodexProcessRunner | None,
+    verification_runner: VerificationProcessRunner | None,
+    clock: Callable[[], datetime] | None,
+) -> LifecycleResult:
     if run_record.state in TERMINAL_STATES:
         return LifecycleResult(
             run_dir=run_dir,
@@ -206,6 +269,7 @@ def resume_ticket_lifecycle(
             terminal_reason=resume_problem,
             clock=clock,
         )
+        _update_repository_lock(repository_lock, run_record)
         generate_terminal_report_best_effort(run_dir)
         return LifecycleResult(
             run_dir=run_dir,
@@ -224,6 +288,7 @@ def resume_ticket_lifecycle(
             terminal_reason=checkpoint_problem,
             clock=clock,
         )
+        _update_repository_lock(repository_lock, run_record)
         generate_terminal_report_best_effort(run_dir)
         return LifecycleResult(
             run_dir=run_dir,
@@ -242,12 +307,14 @@ def resume_ticket_lifecycle(
 
     try:
         if run_record.state == WorkflowState.SNAPSHOT:
+            repository_lock.update(current_state=WorkflowState.IMPLEMENT.value)
             implementation_result = run_implementation_stage(
                 config,
                 run_dir,
                 codex_runner=codex_runner,
                 clock=clock,
             )
+            _update_repository_lock(repository_lock, implementation_result.run_record)
             run_record = implementation_result.run_record
 
         return _drive_lifecycle(
@@ -261,6 +328,7 @@ def resume_ticket_lifecycle(
             correction_results=correction_results,
             codex_runner=codex_runner,
             verification_runner=verification_runner,
+            repository_lock=repository_lock,
             clock=clock,
         )
     except RunError as error:
@@ -269,6 +337,7 @@ def resume_ticket_lifecycle(
             terminal_reason=str(error),
             clock=clock,
         )
+        _update_repository_lock(repository_lock, run_record)
         generate_terminal_report_best_effort(run_dir)
         return LifecycleResult(
             run_dir=run_dir,
@@ -290,6 +359,7 @@ def resume_ticket_lifecycle(
             terminal_reason=controller_error,
             clock=clock,
         )
+        _update_repository_lock(repository_lock, run_record)
         generate_terminal_report_best_effort(run_dir)
         return LifecycleResult(
             run_dir=run_dir,
@@ -370,11 +440,13 @@ def _drive_lifecycle(
     correction_results: list[CorrectionStageResult],
     codex_runner: CodexProcessRunner | None,
     verification_runner: VerificationProcessRunner | None,
+    repository_lock: RepositoryRunLock,
     clock: Callable[[], datetime] | None,
 ) -> LifecycleResult:
     report_result: ReportStageResult | None = None
 
     while run_record.state not in TERMINAL_STATES:
+        _update_repository_lock(repository_lock, run_record)
         if run_record.state == WorkflowState.IMPLEMENT:
             if run_record.last_completed_state != WorkflowState.IMPLEMENT:
                 raise RunError(
@@ -389,6 +461,7 @@ def _drive_lifecycle(
             )
             verification_results.append(verification)
             run_record = verification.run_record
+            _update_repository_lock(repository_lock, run_record)
             continue
 
         if run_record.state == WorkflowState.VERIFY:
@@ -401,6 +474,7 @@ def _drive_lifecycle(
                 )
                 verification_results.append(verification)
                 run_record = verification.run_record
+                _update_repository_lock(repository_lock, run_record)
                 continue
 
             if run_record.last_completed_state == WorkflowState.VERIFY:
@@ -412,6 +486,7 @@ def _drive_lifecycle(
                 )
                 review_results.append(review)
                 run_record = review.run_record
+                _update_repository_lock(repository_lock, run_record)
                 continue
 
         if run_record.state == WorkflowState.CORRECT:
@@ -424,6 +499,7 @@ def _drive_lifecycle(
                     ),
                     clock=clock,
                 )
+                _update_repository_lock(repository_lock, run_record)
                 continue
 
             if run_record.current_correction_round >= run_record.max_correction_rounds:
@@ -435,6 +511,7 @@ def _drive_lifecycle(
                     ),
                     clock=clock,
                 )
+                _update_repository_lock(repository_lock, run_record)
                 continue
 
             correction = run_correction_stage(
@@ -445,11 +522,13 @@ def _drive_lifecycle(
             )
             correction_results.append(correction)
             run_record = correction.run_record
+            _update_repository_lock(repository_lock, run_record)
             continue
 
         if run_record.state == WorkflowState.REPORT:
             report_result = run_report_stage(run_dir, clock=clock)
             run_record = report_result.run_record
+            _update_repository_lock(repository_lock, run_record)
             continue
 
         raise RunError(
@@ -460,6 +539,7 @@ def _drive_lifecycle(
 
     if run_record.state != WorkflowState.READY_FOR_HUMAN:
         generate_terminal_report_best_effort(run_dir)
+    _update_repository_lock(repository_lock, run_record)
 
     return LifecycleResult(
         run_dir=run_dir,
@@ -503,6 +583,17 @@ def _resume_preflight_problem(run_dir: Path, run_record: RunRecord) -> str | Non
     if not safety.safe:
         return _resume_safety_reason(safety)
     return None
+
+
+def _update_repository_lock(
+    repository_lock: RepositoryRunLock,
+    run_record: RunRecord,
+) -> None:
+    repository_lock.update(
+        run_id=run_record.run_id,
+        current_state=run_record.state.value,
+        target_repository_path=run_record.target_repository_path,
+    )
 
 
 def _resume_checkpoint_problem(run_dir: Path, run_record: RunRecord) -> str | None:

@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 from .config import ConfigError, format_config_summary, load_config
+from .locking import RepositoryLockError, active_repository_locks
 from .preflight import format_preflight_result, run_preflight
 from .runs import (
     RUNS_DIR_NAME,
@@ -118,6 +119,9 @@ def _handle_run(args: argparse.Namespace) -> int:
     except RunPreflightError as error:
         print(format_preflight_result(error.result))
         return 1
+    except RepositoryLockError as error:
+        print(f"Run error: {error}", file=sys.stderr)
+        return 1
     except RunError as error:
         print(f"Run error: {error}", file=sys.stderr)
         return 1
@@ -128,7 +132,13 @@ def _handle_run(args: argparse.Namespace) -> int:
 
 def _handle_status(args: argparse.Namespace) -> int:
     runs_dir = args.config_dir / RUNS_DIR_NAME
-    print(format_status(list_run_records(runs_dir), runs_dir=runs_dir))
+    print(
+        format_status(
+            list_run_records(runs_dir),
+            runs_dir=runs_dir,
+            active_ownerships=active_repository_locks(),
+        )
+    )
     return 0
 
 
@@ -142,6 +152,9 @@ def _handle_resume(args: argparse.Namespace) -> int:
             runs_dir=runs_dir,
         )
     except RunError as error:
+        print(f"Run error: {error}", file=sys.stderr)
+        return 1
+    except RepositoryLockError as error:
         print(f"Run error: {error}", file=sys.stderr)
         return 1
 

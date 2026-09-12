@@ -5,7 +5,7 @@ import os
 import re
 import shutil
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -343,28 +343,52 @@ def list_run_records(runs_dir: Path | str) -> tuple[RunRecord, ...]:
     )
 
 
-def format_status(records: tuple[RunRecord, ...], *, runs_dir: Path | str) -> str:
+def format_status(
+    records: tuple[RunRecord, ...],
+    *,
+    runs_dir: Path | str,
+    active_ownerships: tuple[object, ...] = (),
+) -> str:
     if not records:
-        return f"No runs found in {Path(runs_dir)}."
-
-    header = (
-        f"{'Run ID':<36} {'Ticket ID':<16} {'State':<16} {'Branch':<24} "
-        f"{'Corr':<9} {'Review':<8} {'Updated':<20} Reason"
-    )
-    rows = [header]
-    for record in records:
-        reason = record.terminal_reason or ""
-        correction_round = (
-            f"{record.current_correction_round}/{record.max_correction_rounds}"
+        rows = [f"No runs found in {Path(runs_dir)}."]
+    else:
+        header = (
+            f"{'Run ID':<36} {'Ticket ID':<16} {'State':<16} {'Branch':<24} "
+            f"{'Corr':<9} {'Review':<8} {'Updated':<20} Reason"
         )
-        rows.append(
-            f"{record.run_id:<36} {record.ticket_id:<16} "
-            f"{record.state.value:<16} {record.starting_branch:<24} "
-            f"{correction_round:<9} "
-            f"{record.current_review_round:<8} {record.updated_timestamp:<20} "
-            f"{reason}"
-        )
+        rows = [header]
+        for record in records:
+            reason = record.terminal_reason or ""
+            correction_round = (
+                f"{record.current_correction_round}/{record.max_correction_rounds}"
+            )
+            rows.append(
+                f"{record.run_id:<36} {record.ticket_id:<16} "
+                f"{record.state.value:<16} {record.starting_branch:<24} "
+                f"{correction_round:<9} "
+                f"{record.current_review_round:<8} {record.updated_timestamp:<20} "
+                f"{reason}"
+            )
+    if active_ownerships:
+        rows.extend(["", "Active repository ownership"])
+        for ownership in active_ownerships:
+            run_id = _ownership_value(ownership, "run_id") or "<unknown>"
+            state = _ownership_value(ownership, "current_state") or "<unknown>"
+            target = _ownership_value(ownership, "target_repository_path") or "<unknown>"
+            owner_pid = _ownership_value(ownership, "owner_pid") or "<unknown>"
+            owner_host = _ownership_value(ownership, "owner_hostname") or "<unknown>"
+            acquired = _ownership_value(ownership, "acquired_timestamp") or "<unknown>"
+            rows.append(
+                f"  {run_id}: {state} owns {target} "
+                f"({owner_host} pid {owner_pid}, acquired {acquired})"
+            )
     return "\n".join(rows)
+
+
+def _ownership_value(ownership: object, key: str) -> object:
+    if isinstance(ownership, Mapping):
+        return ownership.get(key)
+    return getattr(ownership, key, None)
 
 
 def _timestamp(clock: Callable[[], datetime] | None) -> str:
