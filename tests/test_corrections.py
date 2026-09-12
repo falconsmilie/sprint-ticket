@@ -68,6 +68,8 @@ class CodexRunner:
 
 @dataclass
 class ProcessFailureRunner:
+    mutation: Callable[[Path], None] | None = None
+    error: BaseException | None = None
     command: CodexCommand | None = None
     stdin: str | None = None
     timeout_seconds: float | None = None
@@ -84,6 +86,10 @@ class ProcessFailureRunner:
         self.command = command
         self.stdin = stdin
         self.timeout_seconds = timeout_seconds
+        if self.mutation is not None:
+            self.mutation(command.cwd)
+        if self.error is not None:
+            raise self.error
         return CodexProcessResult(
             returncode=2,
             stdout="",
@@ -391,7 +397,9 @@ def test_oversized_logs_are_not_blindly_embedded(tmp_path):
 @pytest.mark.skipif(
     GIT is None, reason="git executable is required for correction tests"
 )
-def test_codex_boundary_failure_persists_canonical_execution_artifact(tmp_path):
+def test_codex_boundary_failure_requires_human_with_canonical_execution_artifact(
+    tmp_path,
+):
     _repo, run_dir, config = review_correct_run(tmp_path)
     runner = ProcessFailureRunner()
 
@@ -402,16 +410,108 @@ def test_codex_boundary_failure_persists_canonical_execution_artifact(tmp_path):
         artifact_dir.joinpath("execution.json").read_text(encoding="utf-8")
     )
     assert runner.calls == 1
-    assert result.run_record.state == WorkflowState.FAILED
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
     assert artifact_dir.joinpath("prompt.md").is_file()
     assert artifact_dir.joinpath("events.jsonl").is_file()
     assert artifact_dir.joinpath("stderr.log").is_file()
     assert not artifact_dir.joinpath("result.json").exists()
+    assert result.patch_path == run_dir / "diffs" / "failed-correction-1.patch"
+    assert result.patch_path.is_file()
+    assert "worktree" in {violation.name for violation in result.safety_violations}
+    assert "Process started: yes" in result.run_record.terminal_reason
+    assert "Execution metadata:" in result.run_record.terminal_reason
     assert execution_record["status"] == "FAILED"
     assert execution_record["failure_kind"] == CodexFailureKind.NON_ZERO_EXIT.value
     assert execution_record["process_exit_code"] == 2
     assert execution_record["structured_result_present"] is False
     assert execution_record["result_json_present"] is False
+
+
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for correction tests"
+)
+def test_failed_writable_correction_with_partial_changes_is_human_required(tmp_path):
+    repo, run_dir, config = review_correct_run(tmp_path)
+    runner = ProcessFailureRunner(
+        mutation=lambda cwd: cwd.joinpath("file.txt").write_text(
+            "partial correction\n",
+            encoding="utf-8",
+        ),
+    )
+
+    result = run_correction_stage(config, run_dir, codex_runner=runner)
+
+    assert runner.calls == 1
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.run_record.current_correction_round == 0
+    assert run_git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "feature/example"
+    assert run_git(repo, "rev-parse", "HEAD") == result.run_record.baseline_sha
+    assert run_git(repo, "diff", "--cached", "--name-only") == ""
+    assert run_git(repo, "diff", "--name-only") == "file.txt"
+    assert repo.joinpath("file.txt").read_text(encoding="utf-8") == (
+        "partial correction\n"
+    )
+    assert result.patch_path == run_dir / "diffs" / "failed-correction-1.patch"
+    assert "+partial correction" in result.patch_path.read_text(encoding="utf-8")
+    assert result.codex_execution.execution_json_path.is_file()
+    assert result.codex_execution.events_jsonl_path.is_file()
+    assert result.codex_execution.stderr_log_path.is_file()
+    assert "worktree" in {violation.name for violation in result.safety_violations}
+    assert "Baseline-relative failure patch:" in result.run_record.terminal_reason
+    assert not run_dir.joinpath("diffs", "after-correction-1.patch").exists()
+
+
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for correction tests"
+)
+def test_failed_correction_with_observed_changes_overrides_nonstart_metadata(tmp_path):
+    repo, run_dir, config = review_correct_run(tmp_path)
+    runner = ProcessFailureRunner(
+        mutation=lambda cwd: cwd.joinpath("file.txt").write_text(
+            "nonstart partial correction\n",
+            encoding="utf-8",
+        ),
+        error=FileNotFoundError("missing codex"),
+    )
+
+    result = run_correction_stage(config, run_dir, codex_runner=runner)
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.run_record.current_correction_round == 0
+    assert result.codex_execution.process_started is False
+    assert "worktree" in {violation.name for violation in result.safety_violations}
+    assert result.patch_path == run_dir / "diffs" / "failed-correction-1.patch"
+    assert "+nonstart partial correction" in result.patch_path.read_text(
+        encoding="utf-8"
+    )
+    assert run_git(repo, "rev-parse", "HEAD") == result.run_record.baseline_sha
+    assert run_git(repo, "diff", "--cached", "--name-only") == ""
+    assert "Process started: no" in result.run_record.terminal_reason
+
+
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for correction tests"
+)
+def test_failed_correction_patch_capture_error_stays_human_required(tmp_path):
+    _repo, run_dir, config = review_correct_run(tmp_path)
+    run_dir.joinpath("diffs").write_text("not a directory\n", encoding="utf-8")
+
+    result = run_correction_stage(
+        config,
+        run_dir,
+        codex_runner=ProcessFailureRunner(
+            mutation=lambda cwd: cwd.joinpath("file.txt").write_text(
+                "partial correction\n",
+                encoding="utf-8",
+            ),
+        ),
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.run_record.current_correction_round == 0
+    assert result.patch_path is None
+    assert "Failure patch capture error:" in result.run_record.terminal_reason
+    assert "may have left partial source changes" in result.run_record.terminal_reason
 
 
 @pytest.mark.skipif(

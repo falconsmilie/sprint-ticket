@@ -401,10 +401,102 @@ def test_lifecycle_git_safety_violation_stops_without_repair(
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
-def test_lifecycle_codex_infrastructure_failure_is_failed(tmp_path):
+def test_lifecycle_started_writable_codex_failure_is_human_required(tmp_path):
+    repo, ticket, config = workflow_inputs(tmp_path)
+    codex = SequencedCodexRunner(
+        steps=[
+            CodexStep(
+                mutation=write_file("partial implementation\n"),
+                returncode=2,
+                stderr="service unavailable\n",
+            ),
+            CodexStep(result=review_result()),
+        ],
+        calls=[],
+    )
+
+    result = run_ticket_lifecycle(
+        config,
+        ticket,
+        runs_dir=tmp_path / "runs",
+        codex_runner=codex,
+        verification_runner=SequencedVerificationRunner(steps=[], calls=[]),
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert "Codex exited with code 2" in result.run_record.terminal_reason
+    assert "may have left partial source changes" in result.run_record.terminal_reason
+    assert result.verification_results == ()
+    assert result.review_results == ()
+    assert result.correction_results == ()
+    assert len(codex.calls) == 1
+    assert run_git(repo, "diff", "--name-only") == "file.txt"
+    assert result.run_dir.joinpath("diffs", "failed-implementation.patch").is_file()
+    report = result.run_dir.joinpath("final-report.md").read_text(encoding="utf-8")
+    assert "Terminal outcome: HUMAN_REQUIRED" in report
+    assert "Codex failure" in report
+    assert "failed-implementation.patch" in report
+    assert "file.txt" in report
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_lifecycle_failed_correction_does_not_count_as_completed_round(tmp_path):
+    repo, ticket, config = workflow_inputs(tmp_path)
+    codex = SequencedCodexRunner(
+        steps=[
+            CodexStep(
+                result=implementation_result(),
+                mutation=write_file("implemented\n"),
+            ),
+            CodexStep(
+                mutation=write_file("partial correction\n"),
+                returncode=2,
+                stderr="correction failed\n",
+            ),
+            CodexStep(result=review_result()),
+        ],
+        calls=[],
+    )
+    verification = SequencedVerificationRunner(
+        steps=[
+            VerificationStep(
+                returncode=7,
+                stdout="runner failed\n",
+                stderr="failure detail\n",
+            ),
+        ],
+        calls=[],
+    )
+
+    result = run_ticket_lifecycle(
+        config,
+        ticket,
+        runs_dir=tmp_path / "runs",
+        codex_runner=codex,
+        verification_runner=verification,
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.run_record.current_correction_round == 0
+    assert result.run_record.current_review_round == 0
+    assert result.review_results == ()
+    assert len(result.correction_results) == 1
+    assert len(codex.calls) == 2
+    assert run_git(repo, "diff", "--name-only") == "file.txt"
+    assert result.run_dir.joinpath("diffs", "failed-correction-1.patch").is_file()
+    report = result.run_dir.joinpath("final-report.md").read_text(encoding="utf-8")
+    assert "Corrective rounds completed: 0" in report
+    assert "failed-correction-1.patch" in report
+    assert "Correction completed" not in result.run_record.terminal_reason
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_lifecycle_proven_codex_start_failure_without_changes_is_failed(tmp_path):
     _repo, ticket, config = workflow_inputs(tmp_path)
     codex = SequencedCodexRunner(
-        steps=[CodexStep(returncode=2, stderr="service unavailable\n")],
+        steps=[CodexStep(error=FileNotFoundError("missing codex"))],
         calls=[],
     )
 
@@ -418,7 +510,7 @@ def test_lifecycle_codex_infrastructure_failure_is_failed(tmp_path):
     )
 
     assert result.run_record.state == WorkflowState.FAILED
-    assert "Codex exited with code 2" in result.run_record.terminal_reason
+    assert "Codex executable is unavailable" in result.run_record.terminal_reason
     assert result.verification_results == ()
     assert result.review_results == ()
     assert result.correction_results == ()

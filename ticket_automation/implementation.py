@@ -41,6 +41,8 @@ _IMPLEMENTATION_DIR_NAME = "implementation"
 _DIFFS_DIR_NAME = "diffs"
 _AFTER_IMPLEMENTATION_PATCH_FILE = "after-implementation.patch"
 _AFTER_IMPLEMENTATION_STATS_FILE = "after-implementation.stat"
+_FAILED_IMPLEMENTATION_PATCH_FILE = "failed-implementation.patch"
+_FAILED_IMPLEMENTATION_STATS_FILE = "failed-implementation.stat"
 _TICKET_PLACEHOLDER = "{{SNAPSHOTTED_TICKET}}"
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _IMPLEMENTATION_PROMPT_TEMPLATE = _PROJECT_ROOT / "prompts" / "implement.md"
@@ -84,6 +86,16 @@ class ImplementationStageResult:
     @property
     def successful(self) -> bool:
         return self.run_record.state == WorkflowState.IMPLEMENT
+
+
+@dataclass(frozen=True)
+class _FailedWritableAudit:
+    safety_violations: tuple[_ImplementationSafetyViolation, ...]
+    changed_files: tuple[str, ...]
+    patch_path: Path | None
+    diff_stats_path: Path | None
+    patch_error: str | None
+    human_required: bool
 
 
 def run_implementation_stage(
@@ -148,17 +160,24 @@ def run_implementation_stage(
             runner=codex_runner,
         )
     except CodexExecutionFailure as error:
-        safety_violations = _inspect_safety(
+        failed_audit = _audit_failed_writable_invocation(
             repository,
+            run_path,
             active_record,
-            phase=_SafetyInspectionPhase.AFTER_IMPLEMENTATION,
+            execution=error.execution,
         )
         state = (
-            WorkflowState.HUMAN_REQUIRED if safety_violations else WorkflowState.FAILED
+            WorkflowState.HUMAN_REQUIRED
+            if failed_audit.human_required
+            else WorkflowState.FAILED
         )
         message = (
-            "Codex failed and repository safety invariants were violated."
-            if safety_violations
+            _failed_writable_message(
+                operation="implementation",
+                execution=error.execution,
+                audit=failed_audit,
+            )
+            if failed_audit.human_required
             else error.execution.failure_message or str(error)
         )
         return _finish(
@@ -168,13 +187,14 @@ def run_implementation_stage(
             artifact_directory=implementation_dir,
             execution=error.execution,
             agent_result=None,
-            safety_violations=safety_violations,
-            changed_files=(),
-            patch_path=None,
-            diff_stats_path=None,
+            safety_violations=failed_audit.safety_violations,
+            changed_files=failed_audit.changed_files,
+            patch_path=failed_audit.patch_path,
+            diff_stats_path=failed_audit.diff_stats_path,
             state=state,
             controller_message=message,
             clock=clock,
+            last_completed_state=active_record.last_completed_state,
         )
 
     agent_result = _require_agent_result(execution.structured_result)
@@ -311,6 +331,10 @@ def format_implementation_result(result: ImplementationStageResult) -> str:
         rows.append(f"Patch: {result.patch_path}")
     if result.diff_stats_path is not None:
         rows.append(f"Diff stats: {result.diff_stats_path}")
+    if result.codex_execution is not None and not result.codex_execution.successful:
+        rows.append(f"Codex execution: {result.codex_execution.execution_json_path}")
+        rows.append(f"Codex events: {result.codex_execution.events_jsonl_path}")
+        rows.append(f"Codex stderr: {result.codex_execution.stderr_log_path}")
     if result.safety_violations:
         rows.append("Safety violations:")
         rows.extend(
@@ -335,11 +359,12 @@ def _finish(
     state: WorkflowState,
     controller_message: str,
     clock: Callable[[], datetime] | None,
+    last_completed_state: WorkflowState = WorkflowState.IMPLEMENT,
 ) -> ImplementationStageResult:
     updated_record = run_record.with_state(
         state,
         updated_timestamp=_timestamp(clock),
-        last_completed_state=WorkflowState.IMPLEMENT,
+        last_completed_state=last_completed_state,
         terminal_reason=controller_message if state in _TERMINAL_STATES else None,
     )
     save_run_record(updated_record, run_record_path)
@@ -493,6 +518,143 @@ def _capture_diff(
     return patch_path, stats_path
 
 
+def _audit_failed_writable_invocation(
+    repository: GitRepository,
+    run_path: Path,
+    run_record: RunRecord,
+    *,
+    execution: CodexExecution,
+) -> _FailedWritableAudit:
+    violations = list(
+        _inspect_safety(
+            repository,
+            run_record,
+            phase=_SafetyInspectionPhase.AFTER_IMPLEMENTATION,
+        )
+    )
+    changed_files: tuple[str, ...] = ()
+    try:
+        changed_files = _worktree_changed_files(repository, run_record.baseline_sha)
+    except (GitCommandError, OSError, ValueError) as error:
+        violations.append(
+            _ImplementationSafetyViolation(
+                name="worktree-inspection",
+                expected="baseline-relative source diff inspection succeeds",
+                actual=str(error),
+                message=(
+                    "Could not inspect source changes after failed writable Codex "
+                    "invocation."
+                ),
+            )
+        )
+
+    if changed_files:
+        violations.append(
+            _ImplementationSafetyViolation(
+                name="worktree",
+                expected="no baseline-relative source changes after failed writable invocation",
+                actual=_format_files(changed_files),
+                message=(
+                    "Baseline-relative source changes exist after failed writable "
+                    "Codex invocation."
+                ),
+            )
+        )
+
+    human_required = execution.process_started or bool(violations)
+    patch_path: Path | None = None
+    diff_stats_path: Path | None = None
+    patch_error: str | None = None
+    if human_required:
+        try:
+            patch_path, diff_stats_path = _capture_failed_diff(
+                repository,
+                run_path,
+                run_record.baseline_sha,
+            )
+        except ImplementationError as error:
+            patch_error = str(error)
+
+    return _FailedWritableAudit(
+        safety_violations=tuple(violations),
+        changed_files=changed_files,
+        patch_path=patch_path,
+        diff_stats_path=diff_stats_path,
+        patch_error=patch_error,
+        human_required=human_required,
+    )
+
+
+def _capture_failed_diff(
+    repository: GitRepository,
+    run_dir: Path,
+    baseline_sha: str,
+) -> tuple[Path, Path]:
+    diffs_dir = run_dir / _DIFFS_DIR_NAME
+    patch_path = diffs_dir / _FAILED_IMPLEMENTATION_PATCH_FILE
+    stats_path = diffs_dir / _FAILED_IMPLEMENTATION_STATS_FILE
+    try:
+        diffs_dir.mkdir(parents=True, exist_ok=True)
+        patch = _diff_including_untracked(repository, baseline_sha)
+        stats = _diff_stats_including_untracked(repository, baseline_sha)
+        patch_path.write_text(patch, encoding="utf-8", newline="\n")
+        stats_path.write_text(stats, encoding="utf-8", newline="\n")
+    except (GitCommandError, OSError, ValueError) as error:
+        raise ImplementationError(
+            f"Could not capture failed implementation diff: {error}"
+        ) from error
+    return patch_path, stats_path
+
+
+def _failed_writable_message(
+    *,
+    operation: str,
+    execution: CodexExecution,
+    audit: _FailedWritableAudit,
+) -> str:
+    rows = [
+        (
+            "The writable Codex invocation did not complete successfully and may "
+            "have left partial source changes. Automation has stopped for human "
+            "inspection."
+        ),
+        (
+            "Codex failure: "
+            f"{_format_optional_failure_kind(execution)}: "
+            f"{execution.failure_message or 'unknown failure'}"
+        ),
+        f"Last operation: {operation}",
+        f"Process started: {_yes_no(execution.process_started)}",
+        f"Execution metadata: {execution.execution_json_path}",
+        f"Events: {execution.events_jsonl_path}",
+        f"Stderr: {execution.stderr_log_path}",
+        f"Git safety: {_format_failure_safety(audit.safety_violations)}",
+        f"Changed files relative to baseline: {_format_files(audit.changed_files)}",
+    ]
+    if audit.patch_path is not None:
+        rows.append(f"Baseline-relative failure patch: {audit.patch_path}")
+    if audit.diff_stats_path is not None:
+        rows.append(f"Failure diff stats: {audit.diff_stats_path}")
+    if audit.patch_error is not None:
+        rows.append(f"Failure patch capture error: {audit.patch_error}")
+    return " ".join(rows)
+
+
+def _format_failure_safety(
+    violations: tuple[_ImplementationSafetyViolation, ...],
+) -> str:
+    if not violations:
+        return "branch unchanged; HEAD unchanged; staging empty"
+    return "; ".join(
+        f"{violation.name} expected {violation.expected}, got {violation.actual}"
+        for violation in violations
+    )
+
+
+def _format_optional_failure_kind(execution: CodexExecution) -> str:
+    return "UNKNOWN" if execution.failure_kind is None else execution.failure_kind.value
+
+
 def _worktree_changed_files(
     repository: GitRepository,
     baseline_sha: str,
@@ -566,11 +728,17 @@ def _join_git_sections(parts: Iterable[str]) -> str:
 
 
 def _format_files(files: tuple[str, ...]) -> str:
+    if not files:
+        return "none"
     shown = ", ".join(files[:5])
     hidden_count = len(files) - 5
     if hidden_count > 0:
         shown = f"{shown}, and {hidden_count} more"
     return shown
+
+
+def _yes_no(value: bool) -> str:
+    return "yes" if value else "no"
 
 
 def _timestamp(clock: Callable[[], datetime] | None) -> str:

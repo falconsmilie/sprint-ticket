@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
 
 import pytest
 
 from tests.helpers import GIT, create_git_repo, make_config, run_git
 from ticket_automation.codex import (
     CodexCommand,
+    CodexFailureKind,
     CodexProcessResult,
     CodexResultValidationError,
     Sandbox,
@@ -31,7 +32,7 @@ AFTER_IMPLEMENTATION_STATS = "after-implementation.stat"
 
 
 def fixed_clock() -> datetime:
-    return datetime(2026, 9, 11, 13, 5, 13, tzinfo=timezone.utc)
+    return datetime(2026, 9, 11, 13, 5, 13, tzinfo=UTC)
 
 
 @dataclass
@@ -39,7 +40,9 @@ class MutatingRunner:
     result: dict[str, object] | None = None
     mutation: Callable[[Path], None] | None = None
     returncode: int = 0
+    stdout: str | None = None
     stderr: str = ""
+    error: BaseException | None = None
     command: CodexCommand | None = None
     stdin: str | None = None
     timeout_seconds: float | None = None
@@ -58,6 +61,14 @@ class MutatingRunner:
         self.timeout_seconds = timeout_seconds
         if self.mutation is not None:
             self.mutation(command.cwd)
+        if self.error is not None:
+            raise self.error
+        if self.stdout is not None:
+            return CodexProcessResult(
+                returncode=self.returncode,
+                stdout=self.stdout,
+                stderr=self.stderr,
+            )
         if self.returncode != 0:
             return CodexProcessResult(
                 returncode=self.returncode,
@@ -452,17 +463,22 @@ def test_untracked_files_are_accepted_and_included_in_patch(tmp_path):
 @pytest.mark.skipif(
     GIT is None, reason="git executable is required for implementation tests"
 )
-def test_process_failure_becomes_failed_state(tmp_path):
+def test_started_process_failure_becomes_human_required(tmp_path):
     _repo, run_dir, config = snapshot(tmp_path)
     runner = MutatingRunner(returncode=2, stderr="boom\n")
 
     result = run_implementation_stage(config, run_dir, codex_runner=runner)
 
-    assert result.run_record.state == WorkflowState.FAILED
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
     assert result.codex_execution.failure_message == "Codex exited with code 2."
+    assert result.codex_execution.process_started is True
     assert (
         result.codex_execution.stderr_log_path.read_text(encoding="utf-8") == "boom\n"
     )
+    assert "Process started: yes" in result.run_record.terminal_reason
+    assert "may have left partial source changes" in result.run_record.terminal_reason
+    assert result.patch_path == run_dir / DIFFS_DIR / "failed-implementation.patch"
+    assert result.patch_path.is_file()
     execution_record = json.loads(
         result.codex_execution.execution_json_path.read_text(encoding="utf-8")
     )
@@ -471,6 +487,143 @@ def test_process_failure_becomes_failed_state(tmp_path):
     assert execution_record["process_exit_code"] == 2
     assert execution_record["result_json_present"] is False
     assert not result.codex_execution.result_json_path.exists()
+
+
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
+def test_failed_writable_implementation_with_partial_changes_is_human_required(
+    tmp_path,
+):
+    repo, run_dir, config = snapshot(tmp_path)
+    runner = MutatingRunner(
+        mutation=lambda cwd: cwd.joinpath("file.txt").write_text(
+            "partial implementation\n",
+            encoding="utf-8",
+        ),
+        returncode=2,
+        stderr="boom\n",
+    )
+
+    result = run_implementation_stage(config, run_dir, codex_runner=runner)
+
+    assert runner.calls == 1
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.changed_files == ("file.txt",)
+    assert "worktree" in {violation.name for violation in result.safety_violations}
+    assert run_git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "feature/example"
+    assert run_git(repo, "rev-parse", "HEAD") == result.run_record.baseline_sha
+    assert run_git(repo, "diff", "--cached", "--name-only") == ""
+    assert run_git(repo, "diff", "--name-only") == "file.txt"
+    assert repo.joinpath("file.txt").read_text(encoding="utf-8") == (
+        "partial implementation\n"
+    )
+    assert result.patch_path == run_dir / DIFFS_DIR / "failed-implementation.patch"
+    assert "+partial implementation" in result.patch_path.read_text(encoding="utf-8")
+    assert result.diff_stats_path == run_dir / DIFFS_DIR / "failed-implementation.stat"
+    assert result.codex_execution.execution_json_path.is_file()
+    assert result.codex_execution.events_jsonl_path.is_file()
+    assert result.codex_execution.stderr_log_path.is_file()
+    assert "Execution metadata:" in result.run_record.terminal_reason
+    assert "Baseline-relative failure patch:" in result.run_record.terminal_reason
+    assert not run_dir.joinpath(DIFFS_DIR, AFTER_IMPLEMENTATION_PATCH).exists()
+
+
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
+def test_started_untrusted_completion_without_changes_is_human_required(tmp_path):
+    _repo, run_dir, config = snapshot(tmp_path)
+    runner = MutatingRunner(stdout='{"type":"turn.started"}\n', stderr="lost\n")
+
+    result = run_implementation_stage(config, run_dir, codex_runner=runner)
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.changed_files == ()
+    assert result.safety_violations == ()
+    assert result.patch_path == run_dir / DIFFS_DIR / "failed-implementation.patch"
+    assert result.patch_path.read_text(encoding="utf-8") == ""
+    assert result.codex_execution.process_started is True
+    assert (
+        result.codex_execution.failure_kind
+        == CodexFailureKind.MISSING_STRUCTURED_RESULT
+    )
+    assert "Process started: yes" in result.run_record.terminal_reason
+
+
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
+def test_proven_process_start_failure_without_changes_remains_failed(tmp_path):
+    _repo, run_dir, config = snapshot(tmp_path)
+    runner = MutatingRunner(error=FileNotFoundError("missing codex"))
+
+    result = run_implementation_stage(config, run_dir, codex_runner=runner)
+
+    assert result.run_record.state == WorkflowState.FAILED
+    assert result.changed_files == ()
+    assert result.patch_path is None
+    assert result.diff_stats_path is None
+    assert result.codex_execution.process_started is False
+    assert (
+        result.codex_execution.failure_kind == CodexFailureKind.EXECUTABLE_UNAVAILABLE
+    )
+    assert not run_dir.joinpath(DIFFS_DIR, "failed-implementation.patch").exists()
+
+
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
+def test_failed_implementation_with_observed_changes_overrides_nonstart_metadata(
+    tmp_path,
+):
+    repo, run_dir, config = snapshot(tmp_path)
+    runner = MutatingRunner(
+        mutation=lambda cwd: cwd.joinpath("file.txt").write_text(
+            "nonstart partial implementation\n",
+            encoding="utf-8",
+        ),
+        error=FileNotFoundError("missing codex"),
+    )
+
+    result = run_implementation_stage(config, run_dir, codex_runner=runner)
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.changed_files == ("file.txt",)
+    assert result.codex_execution.process_started is False
+    assert "worktree" in {violation.name for violation in result.safety_violations}
+    assert result.patch_path == run_dir / DIFFS_DIR / "failed-implementation.patch"
+    assert "+nonstart partial implementation" in result.patch_path.read_text(
+        encoding="utf-8"
+    )
+    assert run_git(repo, "rev-parse", "HEAD") == result.run_record.baseline_sha
+    assert run_git(repo, "diff", "--cached", "--name-only") == ""
+    assert "Process started: no" in result.run_record.terminal_reason
+
+
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
+def test_failed_implementation_patch_capture_error_stays_human_required(tmp_path):
+    _repo, run_dir, config = snapshot(tmp_path)
+    run_dir.joinpath(DIFFS_DIR).write_text("not a directory\n", encoding="utf-8")
+
+    result = run_implementation_stage(
+        config,
+        run_dir,
+        codex_runner=MutatingRunner(
+            mutation=lambda cwd: cwd.joinpath("file.txt").write_text(
+                "partial implementation\n",
+                encoding="utf-8",
+            ),
+            returncode=2,
+        ),
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.patch_path is None
+    assert "Failure patch capture error:" in result.run_record.terminal_reason
+    assert "may have left partial source changes" in result.run_record.terminal_reason
 
 
 def test_implementation_result_schema_accepts_trusted_statuses():
