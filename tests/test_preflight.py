@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import pytest
 
-from tests.helpers import GIT, create_git_repo, make_config, run_git
+from tests.helpers import (
+    GIT,
+    create_git_repo,
+    make_config,
+    prepend_executable_path,
+    run_git,
+    write_path_executable,
+)
 from ticket_automation.preflight import PreflightStatus, run_preflight
 
 
@@ -107,3 +114,17 @@ def test_missing_codex_executable_fails_with_useful_reason(tmp_path):
     assert not result.passed
     assert check(result, "Codex CLI").status == PreflightStatus.FAIL
     assert "ticket-automation-missing-codex" in check(result, "Codex CLI").message
+
+
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for preflight tests"
+)
+def test_codex_cli_check_accepts_path_resolved_bare_command(monkeypatch, tmp_path):
+    repo = create_git_repo(tmp_path / "repo")
+    executable = write_path_executable(tmp_path / "tool dir")
+    prepend_executable_path(monkeypatch, executable.parent)
+
+    result = run_preflight(make_config(repo, codex_executable="codex"))
+
+    assert result.passed
+    assert check(result, "Codex CLI").status == PreflightStatus.PASS

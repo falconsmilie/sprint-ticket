@@ -11,6 +11,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
+from . import executable_resolution
+
 DEFAULT_CODEX_EXECUTABLE = "codex"
 DEFAULT_TIMEOUT_SECONDS = 60 * 60
 PROMPT_ARTIFACT = "prompt.md"
@@ -274,7 +276,7 @@ class CodexExecutor:
         artifact_paths.directory.mkdir(parents=True, exist_ok=True)
         artifact_paths.prompt.write_text(prompt, encoding="utf-8", newline="\n")
 
-        command = build_codex_command(
+        configured_command = build_codex_command(
             executable=self.executable,
             repo_path=repo_path,
             sandbox=sandbox,
@@ -287,7 +289,7 @@ class CodexExecutor:
             return _fail(
                 kind=CodexFailureKind.INVALID_SCHEMA,
                 message=f"Invalid Codex output schema: {error}",
-                command=command,
+                command=configured_command,
                 sandbox=sandbox,
                 output_schema=output_schema,
                 artifacts=artifact_paths,
@@ -295,6 +297,36 @@ class CodexExecutor:
                 process_started=False,
                 exit_code=None,
             )
+
+        resolved_executable = executable_resolution.resolve_executable(
+            self.executable,
+            cwd=repo_path,
+        )
+        if resolved_executable is None:
+            artifact_paths.events.write_text("", encoding="utf-8", newline="\n")
+            artifact_paths.stderr.write_text(
+                f"Executable not found: {self.executable}\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            return _fail(
+                kind=CodexFailureKind.EXECUTABLE_UNAVAILABLE,
+                message=f"Codex executable is unavailable: {self.executable}",
+                command=configured_command,
+                sandbox=sandbox,
+                output_schema=output_schema,
+                artifacts=artifact_paths,
+                started_at=start,
+                process_started=False,
+                exit_code=None,
+            )
+
+        command = build_codex_command(
+            executable=str(resolved_executable),
+            repo_path=repo_path,
+            sandbox=sandbox,
+            output_schema=output_schema,
+        )
 
         try:
             process = self.runner.run(
@@ -309,7 +341,7 @@ class CodexExecutor:
             )
             return _fail(
                 kind=CodexFailureKind.EXECUTABLE_UNAVAILABLE,
-                message=f"Codex executable is unavailable: {self.executable}",
+                message=f"Codex executable is unavailable: {command.argv[0]}",
                 command=command,
                 sandbox=sandbox,
                 output_schema=output_schema,
@@ -664,9 +696,7 @@ def _execution_record(execution: CodexExecution) -> dict[str, Any]:
         "timed_out": execution.timed_out,
         "timeout_seconds": execution.timeout_seconds,
         "failure_kind": (
-            None
-            if execution.failure_kind is None
-            else execution.failure_kind.value
+            None if execution.failure_kind is None else execution.failure_kind.value
         ),
         "failure_message": execution.failure_message,
         "started_at": execution.started_at,

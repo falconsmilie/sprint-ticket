@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import os
-import shutil
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from . import executable_resolution
 from .config import AppConfig, VerificationCommand
 from .git import GitCommandError, GitRepository
 
@@ -174,23 +173,10 @@ def _check_executable(
     *,
     cwd: Path,
 ) -> None:
-    if _executable_exists(executable, cwd=cwd):
+    if executable_resolution.resolve_executable(executable, cwd=cwd) is not None:
         checks.append(_pass(name))
         return
     checks.append(_fail(name, f"Executable not found: {executable}"))
-
-
-def _executable_exists(executable: str, *, cwd: Path) -> bool:
-    executable_path = Path(executable)
-    has_path_part = executable_path.is_absolute() or any(
-        separator in executable for separator in (os.sep, os.altsep) if separator
-    )
-    if has_path_part:
-        candidate = (
-            executable_path if executable_path.is_absolute() else cwd / executable_path
-        )
-        return candidate.is_file()
-    return shutil.which(executable) is not None
 
 
 def _pass(name: str, message: str = "") -> PreflightCheck:

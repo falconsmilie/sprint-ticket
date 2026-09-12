@@ -16,7 +16,6 @@ from ticket_automation.config import (
     VerificationSettings,
 )
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 GIT = shutil.which("git")
 FAKE_CODEX_SCRIPT = r"""
@@ -153,6 +152,29 @@ def write_fake_codex_executable(directory: Path) -> Path:
     launcher.write_text(f"#!{sys.executable}\n{FAKE_CODEX_SCRIPT}", encoding="utf-8")
     launcher.chmod(0o755)
     return launcher
+
+
+def write_path_executable(directory: Path, *, name: str = "codex") -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        executable = directory / f"{name}.CMD"
+        executable.write_text("@echo off\nexit /b 0\n", encoding="utf-8")
+        return executable
+
+    executable = directory / name
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    return executable
+
+
+def prepend_executable_path(monkeypatch, directory: Path) -> None:
+    existing_path = os.environ.get("PATH")
+    if existing_path:
+        monkeypatch.setenv("PATH", f"{directory}{os.pathsep}{existing_path}")
+    else:
+        monkeypatch.setenv("PATH", str(directory))
+    if os.name == "nt":
+        monkeypatch.setenv("PATHEXT", ".CMD;.EXE;.BAT")
 
 
 def create_git_repo(repo: Path, *, branch: str = "feature/example") -> Path:
