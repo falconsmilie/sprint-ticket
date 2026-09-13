@@ -7,6 +7,7 @@ from pathlib import Path
 from . import executable_resolution
 from .config import AppConfig, VerificationCommand
 from .git import GitCommandError, GitRepository
+from .git_safety import WorkspaceSnapshot
 
 
 class PreflightStatus(StrEnum):
@@ -72,14 +73,15 @@ def run_preflight(config: AppConfig) -> PreflightResult:
         )
     checks.append(_pass("Git repository"))
 
-    try:
-        _check_working_tree(repository, checks)
-        _check_staging_area(repository, checks)
-        branch = _check_branch(repository, checks)
+    snapshot = WorkspaceSnapshot.capture(repository)
+    if not snapshot.inspection_complete:
+        checks.append(_fail("Git inspection", "; ".join(snapshot.inspection_errors)))
+    else:
+        _check_working_tree(repository, snapshot, checks)
+        _check_staging_area(snapshot, checks)
+        branch = _check_branch(snapshot, checks)
         if branch is not None:
             _check_protected_branch(branch, config.project.protected_branches, checks)
-    except GitCommandError as error:
-        checks.append(_fail("Git inspection", str(error)))
 
     _check_executable("Codex CLI", config.codex.executable, checks, cwd=repo_path)
     for command in config.verification.commands:
@@ -96,33 +98,48 @@ def format_preflight_result(result: PreflightResult) -> str:
 
 
 def _check_working_tree(
-    repository: GitRepository, checks: list[PreflightCheck]
+    repository: GitRepository,
+    snapshot: WorkspaceSnapshot,
+    checks: list[PreflightCheck],
 ) -> None:
-    changed_files = repository.unstaged_files()
-    untracked_files = repository.untracked_files()
-    if changed_files or untracked_files:
+    if snapshot.unstaged_worktree_clean and not snapshot.untracked_paths:
+        checks.append(_pass("Working tree"))
+        return
+
+    try:
+        tracked_paths = repository.unstaged_files()
+    except GitCommandError as error:
         checks.append(
             _fail(
                 "Working tree",
-                _format_file_reason(
-                    "Unstaged or untracked changes are present",
-                    (*changed_files, *untracked_files),
-                ),
+                "Canonical workspace state is dirty; changed paths could not be "
+                f"listed: {error}",
             )
         )
         return
-    checks.append(_pass("Working tree"))
+    changed_paths = tuple(sorted((*tracked_paths, *snapshot.untracked_paths)))
+    reason = (
+        _format_file_reason(
+            "Unstaged or untracked changes are present",
+            changed_paths,
+        )
+        if changed_paths
+        else "Canonical workspace state contains unstaged changes."
+    )
+    checks.append(_fail("Working tree", reason))
 
 
 def _check_staging_area(
-    repository: GitRepository, checks: list[PreflightCheck]
+    snapshot: WorkspaceSnapshot, checks: list[PreflightCheck]
 ) -> None:
-    staged_files = repository.staged_files()
-    if staged_files:
+    if snapshot.staged_paths:
         checks.append(
             _fail(
                 "Staging area",
-                _format_file_reason("Staged files are present", staged_files),
+                _format_file_reason(
+                    "Staged files are present",
+                    snapshot.staged_paths,
+                ),
             )
         )
         return
@@ -130,9 +147,9 @@ def _check_staging_area(
 
 
 def _check_branch(
-    repository: GitRepository, checks: list[PreflightCheck]
+    snapshot: WorkspaceSnapshot, checks: list[PreflightCheck]
 ) -> str | None:
-    branch = repository.current_branch()
+    branch = snapshot.branch
     if branch is None:
         checks.append(_fail("Branch", "Repository is in detached HEAD state."))
         return None

@@ -10,6 +10,7 @@ from tests.helpers import (
     run_git,
     write_path_executable,
 )
+from ticket_automation.git import GitRepository
 from ticket_automation.preflight import PreflightStatus, run_preflight
 
 
@@ -48,6 +49,20 @@ def test_dirty_working_tree_fails_without_modifying_repository(tmp_path):
 @pytest.mark.skipif(
     GIT is None, reason="git executable is required for preflight tests"
 )
+def test_dirty_decision_comes_from_canonical_snapshot(monkeypatch, tmp_path):
+    repo = create_git_repo(tmp_path / "repo")
+    (repo / "file.txt").write_text("dirty\n", encoding="utf-8")
+    monkeypatch.setattr(GitRepository, "unstaged_files", lambda self: ())
+
+    result = run_preflight(make_config(repo))
+
+    assert not result.passed
+    assert check(result, "Working tree").status == PreflightStatus.FAIL
+
+
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for preflight tests"
+)
 def test_staged_files_fail(tmp_path):
     repo = create_git_repo(tmp_path / "repo")
     (repo / "file.txt").write_text("staged\n", encoding="utf-8")
@@ -56,6 +71,7 @@ def test_staged_files_fail(tmp_path):
     result = run_preflight(make_config(repo))
 
     assert not result.passed
+    assert check(result, "Working tree").status == PreflightStatus.PASS
     assert check(result, "Staging area").status == PreflightStatus.FAIL
     assert "file.txt" in check(result, "Staging area").message
 

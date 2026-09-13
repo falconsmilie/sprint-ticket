@@ -30,79 +30,12 @@ class GitCommandError(RuntimeError):
     """Raised when a read-only Git inspection command fails."""
 
 
-class GitStateChangedError(RuntimeError):
-    """Raised when a repository safety snapshot no longer matches."""
-
-
 @dataclass(frozen=True)
 class GitCommandResult:
     argv: tuple[str, ...]
     returncode: int
     stdout: str
     stderr: str
-
-
-@dataclass(frozen=True)
-class GitSafetyViolation:
-    name: str
-    expected: str
-    actual: str
-    message: str
-
-
-@dataclass(frozen=True)
-class GitSafetySnapshot:
-    branch: str | None
-    head_sha: str
-    has_staged_files: bool
-
-    @classmethod
-    def capture(cls, repository: GitRepository) -> GitSafetySnapshot:
-        return cls(
-            branch=repository.current_branch(),
-            head_sha=repository.head_sha(),
-            has_staged_files=repository.has_staged_files(),
-        )
-
-    def compare(self, repository: GitRepository) -> tuple[GitSafetyViolation, ...]:
-        current = GitSafetySnapshot.capture(repository)
-        violations: list[GitSafetyViolation] = []
-
-        if self.branch != current.branch:
-            violations.append(
-                GitSafetyViolation(
-                    name="branch",
-                    expected=_format_optional(self.branch),
-                    actual=_format_optional(current.branch),
-                    message="Repository branch changed after the safety snapshot.",
-                )
-            )
-        if self.head_sha != current.head_sha:
-            violations.append(
-                GitSafetyViolation(
-                    name="HEAD",
-                    expected=self.head_sha,
-                    actual=current.head_sha,
-                    message="Repository HEAD changed after the safety snapshot.",
-                )
-            )
-        if self.has_staged_files != current.has_staged_files:
-            violations.append(
-                GitSafetyViolation(
-                    name="staging",
-                    expected=str(self.has_staged_files),
-                    actual=str(current.has_staged_files),
-                    message="Repository staging state changed after the safety snapshot.",
-                )
-            )
-
-        return tuple(violations)
-
-    def assert_matches(self, repository: GitRepository) -> None:
-        violations = self.compare(repository)
-        if violations:
-            details = "; ".join(violation.message for violation in violations)
-            raise GitStateChangedError(details)
 
 
 class GitRepository:
@@ -169,6 +102,37 @@ class GitRepository:
         output = _git(self.path, ("diff", "--cached", "--name-only", "--")).stdout
         return _split_lines(output)
 
+    def staged_diff(self) -> str:
+        return _git(
+            self.path,
+            (
+                "diff",
+                "--cached",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--binary",
+                "--full-index",
+                "HEAD",
+                "--",
+            ),
+        ).stdout
+
+    def tracked_diff(self) -> str:
+        return _git(
+            self.path,
+            (
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--binary",
+                "--full-index",
+                "HEAD",
+                "--",
+            ),
+        ).stdout
+
     def changed_files(self, baseline_sha: str) -> tuple[str, ...]:
         baseline = _validate_baseline_sha(baseline_sha)
         output = _git(self.path, ("diff", "--name-only", baseline, "--")).stdout
@@ -225,14 +189,7 @@ def _validate_baseline_sha(baseline_sha: str) -> str:
     return baseline_sha
 
 
-def _format_optional(value: str | None) -> str:
-    return "<none>" if value is None else value
-
-
 __all__ = [
     "GitCommandError",
     "GitRepository",
-    "GitSafetySnapshot",
-    "GitSafetyViolation",
-    "GitStateChangedError",
 ]

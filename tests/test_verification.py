@@ -15,6 +15,8 @@ from ticket_automation.corrections import (
     ReviewFinding,
     VerificationFailure,
 )
+from ticket_automation.git import GitRepository
+from ticket_automation.git_safety import WorkspaceSnapshot
 from ticket_automation.models import StageOutcome, WorkflowState
 from ticket_automation.runs import create_run_snapshot, load_run_record, save_run_record
 from ticket_automation.verification import (
@@ -96,6 +98,11 @@ def test_one_passing_command_moves_run_to_verify_and_writes_round_zero(tmp_path)
     data = json.loads(result.round_result.json_path.read_text(encoding="utf-8"))
     assert data["status"] == "PASS"
     assert data["commands"][0]["stdout"] == "verification passed\n"
+    assert data["checkpoint"]["schema_version"] == 2
+    assert (
+        data["checkpoint"]["source_fingerprint"]
+        == WorkspaceSnapshot.capture(GitRepository(repo)).fingerprint
+    )
 
 
 @pytest.mark.skipif(

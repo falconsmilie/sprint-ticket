@@ -31,7 +31,11 @@ from ticket_automation.models import StageOutcome, WorkflowState
 from ticket_automation.reporting import generate_terminal_report_best_effort
 from ticket_automation.review import ReviewVerdict, run_review_stage
 from ticket_automation.runs import create_run_snapshot, load_run_record, save_run_record
-from ticket_automation.verification import run_verification_stage
+from ticket_automation.verification import (
+    VerificationProcessCommand,
+    VerificationProcessResult,
+    run_verification_stage,
+)
 
 ROUND_1 = "round-1"
 
@@ -97,6 +101,21 @@ class ProcessFailureRunner:
             returncode=2,
             stdout="",
             stderr="synthetic codex failure\n",
+        )
+
+
+class PassingVerificationRunner:
+    def run(
+        self,
+        command: VerificationProcessCommand,
+        *,
+        timeout_seconds: float | None,
+    ) -> VerificationProcessResult:
+        del command, timeout_seconds
+        return VerificationProcessResult(
+            returncode=0,
+            stdout="deterministic passed\n",
+            stderr="",
         )
 
 
@@ -392,7 +411,30 @@ def test_starting_staged_files_do_not_invoke_or_consume_round(tmp_path):
     assert result.ticket_path is None
     assert not (run_dir / CORRECTIONS_DIR_NAME).exists()
     assert not (run_dir / CORRECTION_EXECUTIONS_DIR_NAME / ROUND_1).exists()
-    assert [violation.name for violation in result.safety_violations] == ["staging"]
+    assert {violation.name for violation in result.safety_violations} == {
+        "staging",
+        "workspace-fingerprint",
+    }
+
+
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for correction tests"
+)
+def test_correction_rejects_untrusted_verification_checkpoint_metadata(tmp_path):
+    _repo, run_dir, config = verification_correct_run(tmp_path)
+    verification_path = run_dir / "verification" / "round-0.json"
+    verification = json.loads(verification_path.read_text(encoding="utf-8"))
+    verification["checkpoint"]["baseline_sha"] = "0" * 40
+    verification_path.write_text(json.dumps(verification), encoding="utf-8")
+    runner = completed_runner()
+
+    result = run_correction_stage(config, run_dir, codex_runner=runner)
+
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
+    assert runner.calls == 0
+    assert [violation.name for violation in result.safety_violations] == [
+        "workspace-checkpoint"
+    ]
 
 
 @pytest.mark.skipif(
@@ -884,7 +926,7 @@ def review_correct_run(
             encoding="utf-8",
         )
     write_implementation_result(snapshot.run_dir)
-    write_passing_verification(snapshot.run_dir, repo)
+    write_passing_verification(snapshot.run_dir, config)
     mark_run_state(snapshot.run_dir, WorkflowState.REVIEWING)
     review_stage_result = run_review_stage(
         config,
@@ -922,37 +964,27 @@ def write_implementation_result(run_dir: Path) -> None:
     )
 
 
-def write_passing_verification(run_dir: Path, repo: Path) -> None:
-    verification_dir = run_dir / "verification"
-    verification_dir.mkdir()
-    verification_dir.joinpath("round-0.json").write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "format": "ticket_automation.verification_round",
-                "round_index": 0,
-                "status": "PASS",
-                "commands": [
-                    {
-                        "name": "tests",
-                        "argv": ["fake", "test"],
-                        "cwd": str(repo),
-                        "status": "PASS",
-                        "stdout": "deterministic passed\n",
-                        "stderr": "",
-                        "exit_code": 0,
-                    }
-                ],
-                "safety_violations": [],
-                "correction_reasons": [],
-            }
+def write_passing_verification(run_dir: Path, config: AppConfig) -> None:
+    record_path = run_dir / "run.json"
+    save_run_record(
+        load_run_record(record_path)
+        .transition_to(
+            WorkflowState.IMPLEMENTING,
+            updated_timestamp="2026-09-11T13:05:15Z",
+        )
+        .transition_to(
+            WorkflowState.VERIFYING,
+            updated_timestamp="2026-09-11T13:05:16Z",
         ),
-        encoding="utf-8",
+        record_path,
     )
-    verification_dir.joinpath("round-0.log").write_text(
-        "deterministic passed\n",
-        encoding="utf-8",
+    result = run_verification_stage(
+        config,
+        run_dir,
+        process_runner=PassingVerificationRunner(),
+        clock=fixed_clock,
     )
+    assert result.outcome == StageOutcome.COMPLETED
 
 
 def mark_run_state(
@@ -964,7 +996,9 @@ def mark_run_state(
 ) -> None:
     run_record_path = run_dir / "run.json"
     run_record = load_run_record(run_record_path)
-    if state == WorkflowState.CORRECTING and run_record.state in {
+    if state == WorkflowState.REVIEWING and run_record.state == WorkflowState.VERIFYING:
+        transition_path = (WorkflowState.REVIEWING,)
+    elif state == WorkflowState.CORRECTING and run_record.state in {
         WorkflowState.VERIFYING,
         WorkflowState.REVIEWING,
     }:

@@ -19,6 +19,7 @@ from .config import (
     CodexExecutionSettings,
 )
 from .git import GitCommandError, GitRepository
+from .git_safety import WorkspaceSnapshot, workspace_safety_changes
 from .models import WorkflowState, _validate_workflow_transition
 from .preflight import PreflightResult, run_preflight
 
@@ -65,15 +66,26 @@ class BaselineRecord:
         *,
         snapshot_timestamp: str,
     ) -> BaselineRecord:
-        branch = repository.current_branch()
-        if branch is None:
+        snapshot = WorkspaceSnapshot.capture(repository)
+        violations = workspace_safety_changes(
+            snapshot,
+            expected_repository_path=repository.path,
+            expected_branch=snapshot.branch,
+            expected_head_sha=snapshot.head_sha or "<unknown>",
+            require_empty_staging=False,
+        )
+        if violations:
+            details = "; ".join(violation.message for violation in violations)
+            raise RunError(f"Cannot capture repository baseline: {details}")
+        if snapshot.branch is None:
             raise RunError("Cannot snapshot a repository in detached HEAD state.")
-        has_staged_files = repository.has_staged_files()
+        assert snapshot.head_sha is not None
+        has_staged_files = bool(snapshot.staged_paths)
         return cls(
-            repository_path=str(repository.path.resolve()),
-            branch=branch,
-            head_sha=repository.head_sha(),
-            clean_worktree=repository.is_working_tree_clean(),
+            repository_path=str(snapshot.repository_path),
+            branch=snapshot.branch,
+            head_sha=snapshot.head_sha,
+            clean_worktree=snapshot.worktree_clean and not has_staged_files,
             has_staged_files=has_staged_files,
             staging_status="dirty" if has_staged_files else "clean",
             snapshot_timestamp=snapshot_timestamp,

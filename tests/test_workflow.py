@@ -10,7 +10,6 @@ from pathlib import Path
 import pytest
 
 from tests.helpers import GIT, create_git_repo, make_config, run_git
-from ticket_automation import reporting as reporting_module
 from ticket_automation.codex import CodexCommand, CodexProcessResult, Sandbox
 from ticket_automation.config import AppConfig, VerificationCommand
 from ticket_automation.git import GitCommandError
@@ -998,6 +997,99 @@ def test_resume_from_completed_implementation_runs_verification_review_and_repor
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+@pytest.mark.parametrize("patch_evidence", ["changed", "missing"])
+def test_resume_uses_workspace_fingerprint_instead_of_patch_evidence(
+    tmp_path,
+    patch_evidence,
+):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+    runs_dir = tmp_path / "runs"
+    snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
+    run_implementation_stage(
+        config,
+        snapshot.run_dir,
+        codex_runner=SequencedCodexRunner(
+            steps=[
+                CodexStep(
+                    result=implementation_result(),
+                    mutation=write_file("implemented\n"),
+                )
+            ],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    patch_path = snapshot.run_dir / "diffs" / "after-implementation.patch"
+    if patch_evidence == "changed":
+        patch_path.write_text(
+            "human evidence changed independently\n",
+            encoding="utf-8",
+        )
+    else:
+        patch_path.unlink()
+
+    result = resume_ticket_lifecycle(
+        config,
+        snapshot.run_record.run_id,
+        runs_dir=runs_dir,
+        codex_runner=SequencedCodexRunner(
+            steps=[CodexStep(result=review_result())],
+            calls=[],
+        ),
+        verification_runner=SequencedVerificationRunner(
+            steps=[VerificationStep()],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+
+    assert result.successful
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_resume_fails_closed_without_canonical_workspace_checkpoint(tmp_path):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+    runs_dir = tmp_path / "runs"
+    snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
+    run_implementation_stage(
+        config,
+        snapshot.run_dir,
+        codex_runner=SequencedCodexRunner(
+            steps=[
+                CodexStep(
+                    result=implementation_result(),
+                    mutation=write_file("implemented\n"),
+                )
+            ],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    snapshot.run_dir.joinpath(
+        "diffs",
+        "after-implementation.workspace.sha256",
+    ).unlink()
+    codex = SequencedCodexRunner(steps=[], calls=[])
+    verification = SequencedVerificationRunner(steps=[], calls=[])
+
+    result = resume_ticket_lifecycle(
+        config,
+        snapshot.run_record.run_id,
+        runs_dir=runs_dir,
+        codex_runner=codex,
+        verification_runner=verification,
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert "workspace fingerprint checkpoint is missing" in (
+        result.run_record.terminal_reason or ""
+    )
+    assert codex.calls == []
+    assert verification.calls == []
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
 def test_resume_from_reporting_regenerates_report_without_rerunning_stages(tmp_path):
     _repo, ticket, config = workflow_inputs(tmp_path)
     runs_dir = tmp_path / "runs"
@@ -1416,7 +1508,7 @@ def test_resume_does_not_reuse_review_result_after_repository_changed(tmp_path):
     )
 
     assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
-    assert "Current source diff no longer matches" in result.run_record.terminal_reason
+    assert "Current workspace no longer matches" in result.run_record.terminal_reason
     assert codex.calls == []
 
 
@@ -1519,7 +1611,7 @@ def test_resume_does_not_reuse_verification_artifact_after_repository_changed(
     )
 
     assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
-    assert "Current source diff no longer matches" in result.run_record.terminal_reason
+    assert "Current workspace no longer matches" in result.run_record.terminal_reason
     assert verification.calls == []
     assert codex.calls == []
 
@@ -1956,7 +2048,10 @@ def test_best_effort_report_preserves_primary_failure_when_final_patch_fails(
         del repository, baseline_sha
         raise GitCommandError("synthetic final patch failure")
 
-    monkeypatch.setattr(reporting_module, "diff_including_untracked", fail_diff)
+    monkeypatch.setattr(
+        "ticket_automation.reporting.diff_including_untracked",
+        fail_diff,
+    )
 
     result = resume_ticket_lifecycle(
         config,

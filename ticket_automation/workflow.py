@@ -16,6 +16,10 @@ from .corrections import (
     run_correction_stage,
 )
 from .git import GitCommandError, GitRepository
+from .git_safety import (
+    WorkspaceSnapshot,
+    _read_workspace_fingerprint,
+)
 from .implementation import (
     ImplementationStageResult,
     run_implementation_stage,
@@ -25,13 +29,12 @@ from .models import StageOutcome, WorkflowState
 from .preflight import PreflightResult
 from .reporting import (
     ReportStageResult,
+    _latest_writable_workspace_fingerprint_path,
     collect_report_context,
-    diff_including_untracked,
     generate_terminal_report_best_effort,
     inspect_git_safety,
     latest_review_result,
     latest_verification_round,
-    latest_writable_checkpoint_patch,
     run_report_stage,
 )
 from .review import (
@@ -778,10 +781,10 @@ def _resume_checkpoint_problem(run_dir: Path, run_record: RunRecord) -> str | No
         verification = latest_verification_round(run_dir)
         if not isinstance(verification, dict) or verification.get("status") != "PASS":
             return "Review cannot resume because the latest verification did not pass."
-        return _require_current_diff_matches_checkpoint(run_dir, run_record)
+        return _require_current_workspace_matches_checkpoint(run_dir, run_record)
 
     if run_record.state == WorkflowState.CORRECTION_PENDING:
-        checkpoint_problem = _require_current_diff_matches_checkpoint(
+        checkpoint_problem = _require_current_workspace_matches_checkpoint(
             run_dir,
             run_record,
         )
@@ -804,7 +807,7 @@ def _resume_checkpoint_problem(run_dir: Path, run_record: RunRecord) -> str | No
             return (
                 "Report cannot resume because deterministic verification did not pass."
             )
-        return _require_current_diff_matches_checkpoint(run_dir, run_record)
+        return _require_current_workspace_matches_checkpoint(run_dir, run_record)
 
     return f"Run state is not resumable in V1: {run_record.state.value}"
 
@@ -826,7 +829,7 @@ def _require_completed_implementation_checkpoint(
     result = _read_json_dict(result_path)
     if result is None or result.get("status") != "COMPLETED":
         return "Implementation checkpoint is missing a completed agent result."
-    return _require_current_diff_matches_checkpoint(run_dir, run_record)
+    return _require_current_workspace_matches_checkpoint(run_dir, run_record)
 
 
 def _require_completed_correction_checkpoint(
@@ -842,7 +845,7 @@ def _require_completed_correction_checkpoint(
     result = _read_json_dict(result_path)
     if result is None or result.get("status") != "COMPLETED":
         return "Correction checkpoint is missing a completed agent result."
-    return _require_current_diff_matches_checkpoint(run_dir, run_record)
+    return _require_current_workspace_matches_checkpoint(run_dir, run_record)
 
 
 def _require_correction_source_checkpoint(
@@ -916,23 +919,31 @@ def _require_correction_source_checkpoint(
     )
 
 
-def _require_current_diff_matches_checkpoint(
+def _require_current_workspace_matches_checkpoint(
     run_dir: Path,
     run_record: RunRecord,
 ) -> str | None:
-    checkpoint = latest_writable_checkpoint_patch(run_dir, run_record)
-    if checkpoint is None:
-        return "Required writable checkpoint patch is missing."
+    fingerprint_path = _latest_writable_workspace_fingerprint_path(
+        run_dir,
+        run_record,
+    )
+    if fingerprint_path is None:
+        return "Required canonical workspace fingerprint checkpoint is missing."
     repository = GitRepository(Path(run_record.target_repository_path))
     try:
-        current_patch = diff_including_untracked(repository, run_record.baseline_sha)
-        checkpoint_patch = checkpoint.read_text(encoding="utf-8")
-    except (GitCommandError, OSError, ValueError) as error:
-        return f"Could not compare current diff to checkpoint: {error}"
-    if current_patch != checkpoint_patch:
+        expected_fingerprint = _read_workspace_fingerprint(fingerprint_path)
+        current_snapshot = WorkspaceSnapshot.capture(repository)
+    except (OSError, RuntimeError, ValueError) as error:
+        return f"Could not compare current workspace to checkpoint: {error}"
+    if not current_snapshot.inspection_complete:
         return (
-            "Current source diff no longer matches the last verified writable "
-            "checkpoint."
+            "Could not compare current workspace to checkpoint: workspace "
+            "inspection was incomplete: "
+            + "; ".join(current_snapshot.inspection_errors)
+        )
+    if not current_snapshot.matches_fingerprint(expected_fingerprint):
+        return (
+            "Current workspace no longer matches the last verified writable checkpoint."
         )
     return None
 

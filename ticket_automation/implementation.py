@@ -26,6 +26,13 @@ from .codex import (
 )
 from .config import AppConfig
 from .git import GitCommandError, GitRepository
+from .git_safety import (
+    WorkspaceChange,
+    WorkspaceSnapshot,
+    _workspace_fingerprint_path,
+    _write_workspace_fingerprint,
+    workspace_safety_changes,
+)
 from .models import StageOutcome, WorkflowState
 from .runs import (
     BASELINE_RECORD_FILE,
@@ -438,86 +445,45 @@ def _inspect_safety(
     run_record: RunRecord,
     *,
     phase: str,
+    require_clean_worktree: bool = False,
 ) -> tuple[_ImplementationSafetyViolation, ...]:
-    violations: list[_ImplementationSafetyViolation] = []
-    try:
-        current_branch = repository.current_branch()
-        current_head = repository.head_sha()
-        staged_files = repository.staged_files()
-    except GitCommandError as error:
-        return (
-            _ImplementationSafetyViolation(
-                name="git-inspection",
-                expected=f"{phase} Git inspection succeeds",
-                actual=str(error),
-                message=f"Could not inspect repository {phase}.",
-            ),
-        )
-
-    if current_branch != run_record.starting_branch:
-        violations.append(
-            _ImplementationSafetyViolation(
-                name="branch",
-                expected=run_record.starting_branch,
-                actual="<detached>" if current_branch is None else current_branch,
-                message=f"Current branch changed {phase}.",
-            )
-        )
-    if current_head != run_record.baseline_sha:
-        violations.append(
-            _ImplementationSafetyViolation(
-                name="HEAD",
-                expected=run_record.baseline_sha,
-                actual=current_head,
-                message=f"HEAD changed {phase}.",
-            )
-        )
-    if staged_files:
-        violations.append(
-            _ImplementationSafetyViolation(
-                name="staging",
-                expected="empty",
-                actual=", ".join(staged_files[:5]),
-                message=f"Staging area is not empty {phase}.",
-            )
-        )
-    return tuple(violations)
+    snapshot = WorkspaceSnapshot.capture(repository)
+    changes = workspace_safety_changes(
+        snapshot,
+        expected_repository_path=run_record.target_repository_path,
+        expected_branch=run_record.starting_branch,
+        expected_head_sha=run_record.baseline_sha,
+        require_clean_worktree=require_clean_worktree,
+    )
+    return _implementation_changes(changes, phase=phase)
 
 
 def _inspect_starting_state(
     repository: GitRepository,
     run_record: RunRecord,
 ) -> tuple[_ImplementationSafetyViolation, ...]:
-    violations = list(
-        _inspect_safety(
-            repository,
-            run_record,
-            phase=_SafetyInspectionPhase.BEFORE_IMPLEMENTATION,
-        )
+    return _inspect_safety(
+        repository,
+        run_record,
+        phase=_SafetyInspectionPhase.BEFORE_IMPLEMENTATION,
+        require_clean_worktree=True,
     )
-    try:
-        changed_files = _worktree_changed_files(repository, run_record.baseline_sha)
-    except GitCommandError as error:
-        violations.append(
-            _ImplementationSafetyViolation(
-                name="worktree-inspection",
-                expected="clean baseline worktree inspection succeeds",
-                actual=str(error),
-                message="Could not inspect repository worktree before implementation.",
-            )
-        )
-        return tuple(violations)
 
-    if changed_files:
-        violations.append(
-            _ImplementationSafetyViolation(
-                name="worktree",
-                expected="clean",
-                actual=_format_files(changed_files),
-                message="Worktree changed before implementation started.",
-            )
+
+def _implementation_changes(
+    changes: tuple[WorkspaceChange, ...],
+    *,
+    phase: str,
+) -> tuple[_ImplementationSafetyViolation, ...]:
+    return tuple(
+        _ImplementationSafetyViolation(
+            name=change.name,
+            expected=change.expected,
+            actual=change.actual,
+            message=f"{change.message.rstrip('.')} {phase}.",
         )
-    return tuple(violations)
+        for change in changes
+    )
 
 
 def _changed_files(repository: GitRepository, baseline_sha: str) -> tuple[str, ...]:
@@ -541,12 +507,17 @@ def _capture_diff(
     try:
         patch = _diff_including_untracked(repository, baseline_sha)
         stats = _diff_stats_including_untracked(repository, baseline_sha)
-    except GitCommandError as error:
+        patch_path.write_text(patch, encoding="utf-8", newline="\n")
+        stats_path.write_text(stats, encoding="utf-8", newline="\n")
+        snapshot = WorkspaceSnapshot.capture(repository)
+        _write_workspace_fingerprint(
+            _workspace_fingerprint_path(patch_path),
+            snapshot,
+        )
+    except (GitCommandError, OSError, RuntimeError, ValueError) as error:
         raise ImplementationError(
             f"Could not capture implementation diff: {error}"
         ) from error
-    patch_path.write_text(patch, encoding="utf-8", newline="\n")
-    stats_path.write_text(stats, encoding="utf-8", newline="\n")
     return patch_path, stats_path
 
 

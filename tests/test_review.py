@@ -27,6 +27,11 @@ from ticket_automation.review import (
     validate_review_result_semantics,
 )
 from ticket_automation.runs import create_run_snapshot, load_run_record, save_run_record
+from ticket_automation.verification import (
+    VerificationProcessCommand,
+    VerificationProcessResult,
+    run_verification_stage,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ROUND_1 = "round-1"
@@ -62,6 +67,30 @@ class ReviewRunner:
             returncode=0,
             stdout=event_stream(self.result),
             stderr="review progress\n",
+        )
+
+
+@dataclass
+class TrustedVerificationRunner:
+    status: str
+
+    def run(
+        self,
+        command: VerificationProcessCommand,
+        *,
+        timeout_seconds: float | None,
+    ) -> VerificationProcessResult:
+        del command, timeout_seconds
+        if self.status == "ERROR":
+            raise OSError("synthetic verification start failure")
+        return VerificationProcessResult(
+            returncode=0 if self.status == "PASS" else 1,
+            stdout=(
+                "deterministic passed\n"
+                if self.status == "PASS"
+                else "deterministic failed\n"
+            ),
+            stderr="",
         )
 
 
@@ -110,6 +139,15 @@ def test_review_uses_read_only_sandbox_and_writes_round_one_artifacts(tmp_path):
     assert review_dir.joinpath("events.jsonl").is_file()
     assert review_dir.joinpath("stderr.log").is_file()
     assert review_dir.joinpath("execution.json").is_file()
+    checkpoint = json.loads(review_dir.joinpath("checkpoint.json").read_text())
+    verification = json.loads(
+        run_dir.joinpath("verification", "round-0.json").read_text()
+    )
+    assert checkpoint["schema_version"] == 2
+    assert (
+        checkpoint["source_fingerprint"]
+        == verification["checkpoint"]["source_fingerprint"]
+    )
     execution_record = json.loads(review_dir.joinpath("execution.json").read_text())
     assert execution_record["status"] == "SUCCESS"
     assert execution_record["sandbox"] == Sandbox.READ_ONLY.value
@@ -267,6 +305,42 @@ def test_corrections_required_without_required_findings_is_rejected(tmp_path):
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for review tests")
+def test_review_rejects_workspace_changed_after_verification(tmp_path):
+    repo, run_dir, config = verified_run(tmp_path)
+    repo.joinpath("file.txt").write_text(
+        "changed after verification\n",
+        encoding="utf-8",
+    )
+    runner = ReviewRunner(result=review_result())
+
+    result = run_review_stage(config, run_dir, codex_runner=runner)
+
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
+    assert runner.calls == 0
+    assert [violation.name for violation in result.safety_violations] == [
+        "workspace-fingerprint"
+    ]
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for review tests")
+def test_review_rejects_untrusted_verification_checkpoint_metadata(tmp_path):
+    _repo, run_dir, config = verified_run(tmp_path)
+    verification_path = run_dir / "verification" / "round-0.json"
+    verification = json.loads(verification_path.read_text(encoding="utf-8"))
+    verification["checkpoint"]["run_id"] = "another-run"
+    verification_path.write_text(json.dumps(verification), encoding="utf-8")
+    runner = ReviewRunner(result=review_result())
+
+    result = run_review_stage(config, run_dir, codex_runner=runner)
+
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
+    assert runner.calls == 0
+    assert [violation.name for violation in result.safety_violations] == [
+        "workspace-checkpoint"
+    ]
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for review tests")
 def test_branch_invariant_is_rechecked_after_review(tmp_path):
     repo, run_dir, config = verified_run(tmp_path)
 
@@ -300,7 +374,10 @@ def test_head_invariant_is_rechecked_after_review(tmp_path):
     )
 
     assert result.outcome == StageOutcome.HUMAN_REQUIRED
-    assert [violation.name for violation in result.safety_violations] == ["HEAD"]
+    assert {violation.name for violation in result.safety_violations} == {
+        "HEAD",
+        "tracked-diff",
+    }
     assert run_git(repo, "rev-parse", "HEAD") != result.run_record.baseline_sha
 
 
@@ -319,7 +396,10 @@ def test_staging_invariant_is_rechecked_after_review(tmp_path):
     )
 
     assert result.outcome == StageOutcome.HUMAN_REQUIRED
-    assert [violation.name for violation in result.safety_violations] == ["staging"]
+    assert {violation.name for violation in result.safety_violations} == {
+        "staging",
+        "tracked-diff",
+    }
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for review tests")
@@ -415,40 +495,6 @@ def verified_run(
         ),
         encoding="utf-8",
     )
-    verification_dir = snapshot.run_dir / "verification"
-    verification_dir.mkdir()
-    verification_dir.joinpath("round-0.json").write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "format": "ticket_automation.verification_round",
-                "round_index": 0,
-                "status": verification_status,
-                "commands": [
-                    {
-                        "name": "tests",
-                        "argv": ["fake", "test"],
-                        "cwd": str(repo),
-                        "status": verification_status,
-                        "stdout": (
-                            "deterministic passed\n"
-                            if verification_status == "PASS"
-                            else f"deterministic {verification_status.lower()}\n"
-                        ),
-                        "stderr": "",
-                        "exit_code": 0 if verification_status == "PASS" else 1,
-                    }
-                ],
-                "safety_violations": [],
-                "correction_reasons": [],
-            }
-        ),
-        encoding="utf-8",
-    )
-    verification_dir.joinpath("round-0.log").write_text(
-        "deterministic passed\n",
-        encoding="utf-8",
-    )
     run_record_path = snapshot.run_dir / "run.json"
     save_run_record(
         load_run_record(run_record_path)
@@ -459,8 +505,17 @@ def verified_run(
         .transition_to(
             WorkflowState.VERIFYING,
             updated_timestamp="2026-09-11T13:05:15Z",
-        )
-        .transition_to(
+        ),
+        run_record_path,
+    )
+    run_verification_stage(
+        config,
+        snapshot.run_dir,
+        process_runner=TrustedVerificationRunner(verification_status),
+        clock=fixed_clock,
+    )
+    save_run_record(
+        load_run_record(run_record_path).transition_to(
             WorkflowState.REVIEWING,
             updated_timestamp="2026-09-11T13:05:15Z",
         ),

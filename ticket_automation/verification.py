@@ -13,6 +13,14 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
+from ._verification_artifacts import (
+    VERIFICATION_CHECKPOINT_FORMAT,
+    VERIFICATION_CHECKPOINT_SCHEMA_VERSION,
+    VERIFICATION_DIR_NAME,
+    VERIFICATION_ROUND_FORMAT,
+    VERIFICATION_SCHEMA_VERSION,
+    _verification_commands_fingerprint,
+)
 from .config import AppConfig, VerificationCommand
 from .corrections import (
     CorrectionError,
@@ -20,7 +28,12 @@ from .corrections import (
     VerificationFailure,
     correction_reason_from_dict,
 )
-from .git import GitCommandError, GitRepository
+from .git import GitRepository
+from .git_safety import (
+    WorkspaceChange,
+    WorkspaceSnapshot,
+    workspace_safety_changes,
+)
 from .models import StageOutcome, WorkflowState
 from .process_output import decode_human_output
 from .runs import (
@@ -30,11 +43,6 @@ from .runs import (
     load_run_record,
 )
 
-VERIFICATION_SCHEMA_VERSION = 1
-VERIFICATION_ROUND_FORMAT = "ticket_automation.verification_round"
-VERIFICATION_CHECKPOINT_SCHEMA_VERSION = 1
-VERIFICATION_CHECKPOINT_FORMAT = "ticket_automation.verification_checkpoint"
-VERIFICATION_DIR_NAME = "verification"
 _INCOMPLETE_ARTIFACT_DIR_NAME = "_incomplete"
 CORRECTION_EXCERPT_CHARS = 4000
 
@@ -482,7 +490,7 @@ def run_verification_round(
     log_path: Path,
     process_runner: VerificationProcessRunner | None = None,
     repository: GitRepository | None = None,
-    repository_snapshot: _RepositoryVerificationSnapshot | None = None,
+    repository_snapshot: WorkspaceSnapshot | None = None,
     baseline_sha: str | None = None,
     run_record: RunRecord | None = None,
     clock: Callable[[], datetime] | None = None,
@@ -679,174 +687,47 @@ def _correction_reasons(
     )
 
 
-@dataclass(frozen=True)
-class _RepositoryVerificationSnapshot:
-    branch: str | None
-    head_sha: str
-    staged_files: tuple[str, ...]
-    tracked_diff: str
-    untracked_files: tuple[str, ...]
-    untracked_hashes: tuple[tuple[str, str], ...]
-
-    @classmethod
-    def capture(
-        cls,
-        repository: GitRepository,
-        *,
-        baseline_sha: str,
-    ) -> _RepositoryVerificationSnapshot:
-        untracked_files = repository.untracked_files()
-        return cls(
-            branch=repository.current_branch(),
-            head_sha=repository.head_sha(),
-            staged_files=repository.staged_files(),
-            tracked_diff=repository.diff(baseline_sha),
-            untracked_files=untracked_files,
-            untracked_hashes=_hash_untracked_files(repository.path, untracked_files),
-        )
-
-    def compare(
-        self,
-        repository: GitRepository,
-        *,
-        baseline_sha: str,
-    ) -> tuple[VerificationSafetyViolation, ...]:
-        current = _RepositoryVerificationSnapshot.capture(
-            repository,
-            baseline_sha=baseline_sha,
-        )
-        violations: list[VerificationSafetyViolation] = []
-
-        if self.branch != current.branch:
-            violations.append(
-                VerificationSafetyViolation(
-                    name="branch",
-                    expected=_format_optional(self.branch),
-                    actual=_format_optional(current.branch),
-                    message="Repository branch changed during verification.",
-                )
-            )
-        if self.head_sha != current.head_sha:
-            violations.append(
-                VerificationSafetyViolation(
-                    name="HEAD",
-                    expected=self.head_sha,
-                    actual=current.head_sha,
-                    message="Repository HEAD changed during verification.",
-                )
-            )
-        if self.staged_files != current.staged_files:
-            violations.append(
-                VerificationSafetyViolation(
-                    name="staging",
-                    expected=_format_files(self.staged_files),
-                    actual=_format_files(current.staged_files),
-                    message="Repository staging area changed during verification.",
-                )
-            )
-        if self.tracked_diff != current.tracked_diff:
-            violations.append(
-                VerificationSafetyViolation(
-                    name="tracked-diff",
-                    expected="unchanged",
-                    actual="changed",
-                    message="Tracked worktree diff changed during verification.",
-                )
-            )
-        if self.untracked_files != current.untracked_files:
-            violations.append(
-                VerificationSafetyViolation(
-                    name="untracked-files",
-                    expected=_format_files(self.untracked_files),
-                    actual=_format_files(current.untracked_files),
-                    message="Untracked files changed during verification.",
-                )
-            )
-        elif self.untracked_hashes != current.untracked_hashes:
-            violations.append(
-                VerificationSafetyViolation(
-                    name="untracked-content",
-                    expected="unchanged",
-                    actual="changed",
-                    message="Untracked file content changed during verification.",
-                )
-            )
-
-        return tuple(violations)
-
-
 def _capture_starting_repository_snapshot(
     repository: GitRepository,
     run_record: RunRecord,
 ) -> tuple[
-    _RepositoryVerificationSnapshot | None,
+    WorkspaceSnapshot | None,
     tuple[VerificationSafetyViolation, ...],
 ]:
-    try:
-        snapshot = _RepositoryVerificationSnapshot.capture(
-            repository,
-            baseline_sha=run_record.baseline_sha,
-        )
-    except (GitCommandError, OSError, ValueError) as error:
-        return None, (
-            VerificationSafetyViolation(
-                name="git-inspection",
-                expected="repository inspection succeeds",
-                actual=str(error),
-                message="Could not inspect repository before verification.",
-            ),
-        )
-
-    violations: list[VerificationSafetyViolation] = []
-    if snapshot.branch != run_record.starting_branch:
-        violations.append(
-            VerificationSafetyViolation(
-                name="branch",
-                expected=run_record.starting_branch,
-                actual=_format_optional(snapshot.branch),
-                message="Repository branch no longer matches the implementation run.",
-            )
-        )
-    if snapshot.head_sha != run_record.baseline_sha:
-        violations.append(
-            VerificationSafetyViolation(
-                name="HEAD",
-                expected=run_record.baseline_sha,
-                actual=snapshot.head_sha,
-                message="Repository HEAD no longer matches the implementation run.",
-            )
-        )
-    if snapshot.staged_files:
-        violations.append(
-            VerificationSafetyViolation(
-                name="staging",
-                expected="empty",
-                actual=_format_files(snapshot.staged_files),
-                message="Repository staging area is not empty before verification.",
-            )
-        )
-    return snapshot, tuple(violations)
+    snapshot = WorkspaceSnapshot.capture(repository)
+    changes = workspace_safety_changes(
+        snapshot,
+        expected_repository_path=run_record.target_repository_path,
+        expected_branch=run_record.starting_branch,
+        expected_head_sha=run_record.baseline_sha,
+    )
+    return snapshot, _verification_changes(changes)
 
 
 def _verification_safety_violations(
     *,
     repository: GitRepository | None,
-    repository_snapshot: _RepositoryVerificationSnapshot | None,
+    repository_snapshot: WorkspaceSnapshot | None,
     baseline_sha: str | None,
 ) -> tuple[VerificationSafetyViolation, ...]:
     if repository is None or repository_snapshot is None or baseline_sha is None:
         return ()
-    try:
-        return repository_snapshot.compare(repository, baseline_sha=baseline_sha)
-    except (GitCommandError, OSError, ValueError) as error:
-        return (
-            VerificationSafetyViolation(
-                name="git-inspection",
-                expected="repository inspection succeeds",
-                actual=str(error),
-                message="Could not inspect repository after verification.",
-            ),
+    current = WorkspaceSnapshot.capture(repository)
+    return _verification_changes(repository_snapshot.compare(current))
+
+
+def _verification_changes(
+    changes: tuple[WorkspaceChange, ...],
+) -> tuple[VerificationSafetyViolation, ...]:
+    return tuple(
+        VerificationSafetyViolation(
+            name=change.name,
+            expected=change.expected,
+            actual=change.actual,
+            message=change.message,
         )
+        for change in changes
+    )
 
 
 def _write_controller_error_round(
@@ -855,7 +736,7 @@ def _write_controller_error_round(
     round_index: int,
     json_path: Path,
     log_path: Path,
-    repository_snapshot: _RepositoryVerificationSnapshot | None,
+    repository_snapshot: WorkspaceSnapshot | None,
     commands: tuple[VerificationCommand, ...],
     safety_violations: tuple[VerificationSafetyViolation, ...],
     clock: Callable[[], datetime] | None,
@@ -904,7 +785,7 @@ def _load_existing_verification_round(
     log_path: Path,
     run_record: RunRecord,
     round_index: int,
-    repository_snapshot: _RepositoryVerificationSnapshot,
+    repository_snapshot: WorkspaceSnapshot,
     commands: tuple[VerificationCommand, ...],
 ) -> tuple[VerificationRound | None, str | None]:
     try:
@@ -943,7 +824,7 @@ def _verification_checkpoint_problem(
     *,
     run_record: RunRecord,
     round_index: int,
-    repository_snapshot: _RepositoryVerificationSnapshot,
+    repository_snapshot: WorkspaceSnapshot,
     commands: tuple[VerificationCommand, ...],
 ) -> str | None:
     if data.get("schema_version") != VERIFICATION_SCHEMA_VERSION:
@@ -1043,7 +924,7 @@ def _verification_checkpoint(
     run_record: RunRecord,
     *,
     round_index: int,
-    repository_snapshot: _RepositoryVerificationSnapshot | None,
+    repository_snapshot: WorkspaceSnapshot | None,
     commands: tuple[VerificationCommand, ...],
 ) -> dict[str, Any]:
     checkpoint: dict[str, Any] = {
@@ -1063,38 +944,8 @@ def _verification_checkpoint(
         ),
     }
     if repository_snapshot is not None:
-        checkpoint["source_fingerprint"] = _repository_snapshot_fingerprint(
-            repository_snapshot
-        )
+        checkpoint["source_fingerprint"] = repository_snapshot.fingerprint
     return checkpoint
-
-
-def _repository_snapshot_fingerprint(
-    snapshot: _RepositoryVerificationSnapshot,
-) -> str:
-    payload = {
-        "branch": snapshot.branch,
-        "head_sha": snapshot.head_sha,
-        "staged_files": list(snapshot.staged_files),
-        "tracked_diff_sha256": _text_sha256(snapshot.tracked_diff),
-        "untracked_files": list(snapshot.untracked_files),
-        "untracked_hashes": [list(item) for item in snapshot.untracked_hashes],
-    }
-    return _text_sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")))
-
-
-def _verification_commands_fingerprint(
-    commands: tuple[VerificationCommand, ...],
-) -> str:
-    payload = [
-        {
-            "name": command.name,
-            "argv": list(command.argv),
-            "timeout_seconds": command.timeout_seconds,
-        }
-        for command in commands
-    ]
-    return _text_sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")))
 
 
 def _archive_incomplete_verification_artifacts(
@@ -1186,23 +1037,6 @@ def _required_number(data: dict[str, Any], key: str) -> float:
     if not isinstance(value, int | float) or isinstance(value, bool):
         raise TypeError(f"{key} must be a number.")
     return float(value)
-
-
-def _hash_untracked_files(
-    repo_path: Path,
-    files: tuple[str, ...],
-) -> tuple[tuple[str, str], ...]:
-    return tuple(
-        (file_path, _file_sha256(repo_path / file_path)) for file_path in files
-    )
-
-
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _text_sha256(value: str) -> str:

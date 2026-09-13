@@ -8,6 +8,11 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from ._verification_artifacts import (
+    VERIFICATION_DIR_NAME,
+    _read_verification_source_fingerprint,
+    _VerificationArtifactError,
+)
 from .audit import (
     changed_files_including_untracked as _changed_files_including_untracked,
 )
@@ -26,8 +31,15 @@ from .codex import (
 from .codex import (
     execute as execute_codex,
 )
-from .config import AppConfig
+from .config import AppConfig, VerificationCommand
 from .git import GitCommandError, GitRepository
+from .git_safety import (
+    WorkspaceChange,
+    WorkspaceSnapshot,
+    _workspace_fingerprint_path,
+    _write_workspace_fingerprint,
+    workspace_safety_changes,
+)
 from .models import StageOutcome, WorkflowState
 from .runs import (
     BASELINE_RECORD_FILE,
@@ -54,7 +66,6 @@ class CorrectionReasonKind(StrEnum):
 
 CORRECTIONS_DIR_NAME = "corrections"
 CORRECTION_EXECUTIONS_DIR_NAME = "correction-executions"
-VERIFICATION_DIR_NAME = "verification"
 REVIEW_DIR_NAME = "reviews"
 DIFFS_DIR_NAME = "diffs"
 CORRECTION_TICKET_SUFFIX = "CORR"
@@ -219,10 +230,18 @@ def run_correction_stage(
             advance_correction_round=False,
         )
 
+    starting_snapshot = WorkspaceSnapshot.capture(repository)
     starting_violations = _inspect_correction_invariants(
         repository,
         run_record,
         phase="before correction",
+        current_snapshot=starting_snapshot,
+    )
+    starting_violations += _inspect_correction_source_fingerprint(
+        run_path,
+        run_record,
+        starting_snapshot,
+        verification_commands=config.verification.commands,
     )
     if starting_violations:
         return _finish(
@@ -991,50 +1010,76 @@ def _inspect_correction_invariants(
     run_record: RunRecord,
     *,
     phase: str,
+    current_snapshot: WorkspaceSnapshot | None = None,
 ) -> tuple[CorrectionSafetyViolation, ...]:
-    violations: list[CorrectionSafetyViolation] = []
+    snapshot = current_snapshot or WorkspaceSnapshot.capture(repository)
+    changes = workspace_safety_changes(
+        snapshot,
+        expected_repository_path=run_record.target_repository_path,
+        expected_branch=run_record.starting_branch,
+        expected_head_sha=run_record.baseline_sha,
+    )
+    return _correction_changes(changes, phase=phase)
+
+
+def _correction_changes(
+    changes: tuple[WorkspaceChange, ...],
+    *,
+    phase: str,
+) -> tuple[CorrectionSafetyViolation, ...]:
+    return tuple(
+        CorrectionSafetyViolation(
+            name=change.name,
+            expected=change.expected,
+            actual=change.actual,
+            message=f"{change.message.rstrip('.')} {phase}.",
+        )
+        for change in changes
+    )
+
+
+def _inspect_correction_source_fingerprint(
+    run_path: Path,
+    run_record: RunRecord,
+    current: WorkspaceSnapshot,
+    *,
+    verification_commands: tuple[VerificationCommand, ...],
+) -> tuple[CorrectionSafetyViolation, ...]:
     try:
-        current_branch = repository.current_branch()
-        current_head = repository.head_sha()
-        staged_files = repository.staged_files()
-    except GitCommandError as error:
+        expected = _read_verification_source_fingerprint(
+            run_path,
+            run_record,
+            expected_statuses=frozenset({"FAIL", "PASS"}),
+            verification_commands=verification_commands,
+        )
+    except _VerificationArtifactError as error:
         return (
             CorrectionSafetyViolation(
-                name="git-inspection",
-                expected=f"{phase} Git inspection succeeds",
+                name="workspace-checkpoint",
+                expected="readable canonical workspace fingerprint",
                 actual=str(error),
-                message=f"Could not inspect repository {phase}.",
+                message="Could not validate the correction source checkpoint.",
             ),
         )
-
-    if current_branch != run_record.starting_branch:
-        violations.append(
+    if not current.inspection_complete:
+        return (
             CorrectionSafetyViolation(
-                name="branch",
-                expected=run_record.starting_branch,
-                actual=_format_optional(current_branch),
-                message=f"Current branch changed {phase}.",
-            )
+                name="inspection-incomplete",
+                expected="complete workspace inspection",
+                actual="; ".join(current.inspection_errors) or "incomplete",
+                message="Could not validate the correction source workspace.",
+            ),
         )
-    if current_head != run_record.baseline_sha:
-        violations.append(
-            CorrectionSafetyViolation(
-                name="HEAD",
-                expected=run_record.baseline_sha,
-                actual=current_head,
-                message=f"HEAD changed {phase}.",
-            )
-        )
-    if staged_files:
-        violations.append(
-            CorrectionSafetyViolation(
-                name="staging",
-                expected="empty",
-                actual=_format_files(staged_files),
-                message=f"Staging area is not empty {phase}.",
-            )
-        )
-    return tuple(violations)
+    if current.matches_fingerprint(expected):
+        return ()
+    return (
+        CorrectionSafetyViolation(
+            name="workspace-fingerprint",
+            expected=expected,
+            actual=current.fingerprint,
+            message="Correction source workspace changed after its checkpoint.",
+        ),
+    )
 
 
 def _capture_correction_diff(
@@ -1053,7 +1098,13 @@ def _capture_correction_diff(
         diffs_dir.mkdir(parents=True, exist_ok=True)
         patch = _diff_including_untracked(repository, baseline_sha)
         patch_path.write_text(patch, encoding="utf-8", newline="\n")
-    except (GitCommandError, OSError, ValueError) as error:
+        if patch_template == AFTER_CORRECTION_PATCH_TEMPLATE:
+            snapshot = WorkspaceSnapshot.capture(repository)
+            _write_workspace_fingerprint(
+                _workspace_fingerprint_path(patch_path),
+                snapshot,
+            )
+    except (GitCommandError, OSError, RuntimeError, ValueError) as error:
         raise CorrectionError(f"Could not capture correction diff: {error}") from error
     return patch_path
 

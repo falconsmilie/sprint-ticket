@@ -248,7 +248,7 @@ def test_dirty_worktree_before_implementation_blocks_without_invoking_codex(tmp_
     assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert runner.calls == 0
     assert result.codex_execution is None
-    assert "worktree" in {violation.name for violation in result.safety_violations}
+    assert "tracked-diff" in {violation.name for violation in result.safety_violations}
     assert not run_dir.joinpath(IMPLEMENTATION_DIR, "prompt.md").exists()
     assert run_git(repo, "diff", "--name-only") == "file.txt"
 

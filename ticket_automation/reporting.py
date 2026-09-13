@@ -12,6 +12,11 @@ from .audit import (
     diff_stats_including_untracked,
 )
 from .git import GitCommandError, GitRepository
+from .git_safety import (
+    WorkspaceSnapshot,
+    _read_workspace_fingerprint,
+    _workspace_fingerprint_path,
+)
 from .models import StageOutcome, WorkflowState
 from .runs import RUN_RECORD_FILE, RunError, RunRecord, load_run_record
 from .workspace_guard import WORKSPACE_GUARD_DIR_NAME
@@ -39,6 +44,7 @@ class GitSafetyStatus:
     head_actual: str
     staged_files: tuple[str, ...]
     inspection_error: str | None = None
+    _workspace_snapshot: WorkspaceSnapshot | None = None
 
     @property
     def branch_ok(self) -> bool:
@@ -234,7 +240,14 @@ def collect_report_context(
     follow_up_findings = _findings_with_disposition(final_review, "FOLLOW_UP")
     safety = inspect_git_safety(run_record)
     checkpoint_patch_path = latest_writable_checkpoint_patch(run_path, run_record)
-    checkpoint_patch_matches = _checkpoint_patch_matches(checkpoint_patch_path, patch)
+    checkpoint_fingerprint_path = _latest_writable_workspace_fingerprint_path(
+        run_path,
+        run_record,
+    )
+    checkpoint_workspace_matches = _checkpoint_workspace_matches(
+        checkpoint_fingerprint_path,
+        safety._workspace_snapshot,
+    )
 
     return {
         "run_dir": run_path,
@@ -259,7 +272,7 @@ def collect_report_context(
                 if checkpoint_patch_path is None
                 else str(checkpoint_patch_path.relative_to(run_path))
             ),
-            "current_diff_matches_checkpoint": checkpoint_patch_matches,
+            "current_workspace_matches_checkpoint": checkpoint_workspace_matches,
             "final_patch_path": str(
                 (run_path / DIFFS_DIR_NAME / FINAL_PATCH_FILE).relative_to(run_path)
             ),
@@ -322,8 +335,8 @@ def render_final_report(
             f"- HEAD unchanged: {_yes_no(safety.head_ok)}",
             f"- Staging empty: {_yes_no(safety.staging_ok)}",
             (
-                "- Current source diff matches last verified writable checkpoint: "
-                f"{_yes_no(controller['current_diff_matches_checkpoint'])}"
+                "- Current workspace matches last verified writable checkpoint: "
+                f"{_yes_no(controller['current_workspace_matches_checkpoint'])}"
             ),
             f"- Changed files: {len(controller['changed_files'])}",
         ]
@@ -495,25 +508,20 @@ def render_final_report(
 
 def inspect_git_safety(run_record: RunRecord) -> GitSafetyStatus:
     repository = GitRepository(Path(run_record.target_repository_path))
-    try:
-        branch = repository.current_branch()
-        head = repository.head_sha()
-        staged_files = repository.staged_files()
-    except (GitCommandError, OSError) as error:
-        return GitSafetyStatus(
-            branch_expected=run_record.starting_branch,
-            branch_actual="<unknown>",
-            head_expected=run_record.baseline_sha,
-            head_actual="<unknown>",
-            staged_files=(),
-            inspection_error=str(error),
-        )
+    snapshot = WorkspaceSnapshot.capture(repository)
     return GitSafetyStatus(
         branch_expected=run_record.starting_branch,
-        branch_actual="<detached>" if branch is None else branch,
+        branch_actual=("<detached>" if snapshot.branch is None else snapshot.branch),
         head_expected=run_record.baseline_sha,
-        head_actual=head,
-        staged_files=staged_files,
+        head_actual=snapshot.head_sha or "<unknown>",
+        staged_files=snapshot.staged_paths,
+        inspection_error=(
+            None
+            if snapshot.inspection_complete
+            else "; ".join(snapshot.inspection_errors)
+            or "workspace inspection incomplete"
+        ),
+        _workspace_snapshot=snapshot,
     )
 
 
@@ -556,6 +564,23 @@ def latest_writable_checkpoint_patch(
     return path if path.is_file() else None
 
 
+def _latest_writable_workspace_fingerprint_path(
+    run_dir: Path | str,
+    run_record: RunRecord,
+) -> Path | None:
+    run_path = Path(run_dir)
+    if run_record.current_correction_round > 0:
+        patch_path = (
+            run_path
+            / DIFFS_DIR_NAME
+            / f"after-correction-{run_record.current_correction_round}.patch"
+        )
+    else:
+        patch_path = run_path / DIFFS_DIR_NAME / "after-implementation.patch"
+    fingerprint_path = _workspace_fingerprint_path(patch_path)
+    return fingerprint_path if fingerprint_path.is_file() else None
+
+
 def _acceptance_problem(context: dict[str, Any]) -> str | None:
     controller = context["controller"]
     safety: GitSafetyStatus = controller["git_safety"]
@@ -568,10 +593,9 @@ def _acceptance_problem(context: dict[str, Any]) -> str | None:
 
     if not safety.safe:
         return "Repository safety invariants were violated before human handoff."
-    if not controller["current_diff_matches_checkpoint"]:
+    if not controller["current_workspace_matches_checkpoint"]:
         return (
-            "Current source diff no longer matches the last verified writable "
-            "checkpoint."
+            "Current workspace no longer matches the last verified writable checkpoint."
         )
     if not isinstance(verification, dict) or verification.get("status") != "PASS":
         return "Deterministic verification is not currently passing."
@@ -608,13 +632,17 @@ def _git_diff_facts(
     return changed_files, diff_stats, git_status
 
 
-def _checkpoint_patch_matches(path: Path | None, current_patch: str) -> bool:
-    if path is None:
+def _checkpoint_workspace_matches(
+    fingerprint_path: Path | None,
+    current_snapshot: WorkspaceSnapshot | None,
+) -> bool:
+    if fingerprint_path is None or current_snapshot is None:
         return False
     try:
-        return path.read_text(encoding="utf-8") == current_patch
-    except OSError:
+        expected = _read_workspace_fingerprint(fingerprint_path)
+    except (OSError, ValueError):
         return False
+    return current_snapshot.matches_fingerprint(expected)
 
 
 def _read_numbered_json_files(directory: Path) -> tuple[dict[str, Any], ...]:

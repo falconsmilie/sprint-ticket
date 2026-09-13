@@ -12,6 +12,11 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from ._verification_artifacts import (
+    VERIFICATION_DIR_NAME,
+    _read_verification_source_fingerprint,
+    _VerificationArtifactError,
+)
 from .codex import (
     CodexExecution,
     CodexExecutionFailure,
@@ -24,8 +29,13 @@ from .codex import (
 from .codex import (
     execute as execute_codex,
 )
-from .config import AppConfig
-from .git import GitCommandError, GitRepository
+from .config import AppConfig, VerificationCommand
+from .git import GitRepository
+from .git_safety import (
+    WorkspaceChange,
+    WorkspaceSnapshot,
+    workspace_safety_changes,
+)
 from .models import StageOutcome, WorkflowState
 from .runs import (
     BASELINE_RECORD_FILE,
@@ -36,11 +46,10 @@ from .runs import (
     load_baseline_record,
     load_run_record,
 )
-from .verification import VERIFICATION_DIR_NAME
 
 REVIEW_DIR_NAME = "reviews"
 REVIEW_ROUND_OFFSET = 1
-_REVIEW_CHECKPOINT_SCHEMA_VERSION = 1
+_REVIEW_CHECKPOINT_SCHEMA_VERSION = 2
 _REVIEW_CHECKPOINT_FORMAT = "ticket_automation.review_checkpoint"
 _REVIEW_CHECKPOINT_FILE = "checkpoint.json"
 _INCOMPLETE_ARTIFACT_DIR_NAME = "_incomplete"
@@ -139,7 +148,12 @@ def run_review_stage(
     artifact_directory = run_path / REVIEW_DIR_NAME / f"round-{review_round}"
     result_path = artifact_directory / "result.json"
 
-    starting_violations = _inspect_review_invariants(repository, run_record)
+    repository_snapshot = WorkspaceSnapshot.capture(repository)
+    starting_violations = _inspect_review_invariants(
+        repository,
+        run_record,
+        current_snapshot=repository_snapshot,
+    )
     if starting_violations:
         return _finish(
             run_record=run_record,
@@ -156,10 +170,34 @@ def run_review_stage(
     prompt = _render_review_prompt(
         ticket_text=_read_snapshotted_ticket(run_path / RUN_TICKET_FILE),
         run_record=run_record,
-        current_branch=_current_branch_label(repository),
+        current_branch=(
+            "<detached>"
+            if repository_snapshot.branch is None
+            else repository_snapshot.branch
+        ),
         verification_results=_read_verification_results(run_path, run_record),
         implementation_summary=_read_implementation_summary(run_path),
     )
+    source_violations = _inspect_review_source_fingerprint(
+        run_path,
+        run_record,
+        repository_snapshot,
+        verification_commands=config.verification.commands,
+    )
+    if source_violations:
+        return _finish(
+            run_record=run_record,
+            run_dir=run_path,
+            artifact_directory=artifact_directory,
+            execution=None,
+            review_result=None,
+            safety_violations=source_violations,
+            processing_error=None,
+            outcome=StageOutcome.HUMAN_REQUIRED,
+            controller_message=(
+                "Repository no longer matches the verified review source."
+            ),
+        )
     artifact_state = _review_artifact_state(artifact_directory, result_path)
     if artifact_state == _ReviewArtifactState.COMPLETE:
         review_result, adoption_problem = _load_existing_review_result(
@@ -168,9 +206,14 @@ def run_review_stage(
             expected_prompt=prompt,
             run_record=run_record,
             review_round=review_round,
+            repository_snapshot=repository_snapshot,
         )
         if adoption_problem is None and review_result is not None:
-            safety_violations = _inspect_review_invariants(repository, run_record)
+            safety_violations = _inspect_review_invariants(
+                repository,
+                run_record,
+                expected_snapshot=repository_snapshot,
+            )
             if safety_violations:
                 return _finish(
                     run_record=run_record,
@@ -203,6 +246,7 @@ def run_review_stage(
             run_record,
             review_round=review_round,
             prompt=prompt,
+            repository_snapshot=repository_snapshot,
         ),
     )
 
@@ -218,7 +262,11 @@ def run_review_stage(
             runner=codex_runner,
         )
     except CodexExecutionFailure as error:
-        safety_violations = _inspect_review_invariants(repository, run_record)
+        safety_violations = _inspect_review_invariants(
+            repository,
+            run_record,
+            expected_snapshot=repository_snapshot,
+        )
         outcome = (
             StageOutcome.HUMAN_REQUIRED if safety_violations else StageOutcome.FAILED
         )
@@ -240,7 +288,11 @@ def run_review_stage(
         )
 
     review_result = _require_review_result(execution.structured_result)
-    safety_violations = _inspect_review_invariants(repository, run_record)
+    safety_violations = _inspect_review_invariants(
+        repository,
+        run_record,
+        expected_snapshot=repository_snapshot,
+    )
     if safety_violations:
         return _finish(
             run_record=run_record,
@@ -387,11 +439,13 @@ def _load_existing_review_result(
     expected_prompt: str,
     run_record: RunRecord,
     review_round: int,
+    repository_snapshot: WorkspaceSnapshot,
 ) -> tuple[dict[str, Any] | None, str | None]:
     expected_checkpoint = _review_checkpoint(
         run_record,
         review_round=review_round,
         prompt=expected_prompt,
+        repository_snapshot=repository_snapshot,
     )
     checkpoint_problem = _existing_review_checkpoint_problem(
         artifact_directory / _REVIEW_CHECKPOINT_FILE,
@@ -542,6 +596,7 @@ def _review_checkpoint(
     *,
     review_round: int,
     prompt: str,
+    repository_snapshot: WorkspaceSnapshot,
 ) -> dict[str, Any]:
     return {
         "schema_version": _REVIEW_CHECKPOINT_SCHEMA_VERSION,
@@ -556,6 +611,7 @@ def _review_checkpoint(
         ),
         "starting_branch": run_record.starting_branch,
         "baseline_sha": run_record.baseline_sha,
+        "source_fingerprint": repository_snapshot.fingerprint,
         "prompt_sha256": _text_sha256(_normalize_prompt_text(prompt)),
     }
 
@@ -709,55 +765,74 @@ def _required_findings(result: dict[str, Any]) -> tuple[dict[str, Any], ...]:
 def _inspect_review_invariants(
     repository: GitRepository,
     run_record: RunRecord,
+    *,
+    expected_snapshot: WorkspaceSnapshot | None = None,
+    current_snapshot: WorkspaceSnapshot | None = None,
 ) -> tuple[ReviewSafetyViolation, ...]:
-    violations: list[ReviewSafetyViolation] = []
+    current = current_snapshot or WorkspaceSnapshot.capture(repository)
+    if expected_snapshot is None:
+        changes = workspace_safety_changes(
+            current,
+            expected_repository_path=run_record.target_repository_path,
+            expected_branch=run_record.starting_branch,
+            expected_head_sha=run_record.baseline_sha,
+        )
+    else:
+        changes = expected_snapshot.compare(current)
+    return _review_changes(changes)
+
+
+def _review_changes(
+    changes: tuple[WorkspaceChange, ...],
+) -> tuple[ReviewSafetyViolation, ...]:
+    return tuple(
+        ReviewSafetyViolation(
+            name=change.name,
+            expected=change.expected,
+            actual=change.actual,
+            message=change.message,
+        )
+        for change in changes
+    )
+
+
+def _inspect_review_source_fingerprint(
+    run_path: Path,
+    run_record: RunRecord,
+    current: WorkspaceSnapshot,
+    *,
+    verification_commands: tuple[VerificationCommand, ...],
+) -> tuple[ReviewSafetyViolation, ...]:
     try:
-        current_branch = repository.current_branch()
-        current_head = repository.head_sha()
-        staged_files = repository.staged_files()
-    except GitCommandError as error:
+        expected = _read_verification_source_fingerprint(
+            run_path,
+            run_record,
+            expected_statuses=frozenset({"PASS"}),
+            verification_commands=verification_commands,
+        )
+    except _VerificationArtifactError as error:
         return (
             ReviewSafetyViolation(
-                name="git-inspection",
-                expected="Git inspection succeeds",
+                name="workspace-checkpoint",
+                expected="readable canonical workspace fingerprint",
                 actual=str(error),
-                message="Could not inspect repository review safety invariants.",
+                message="Could not validate the verified review source.",
             ),
         )
-
-    if current_branch != run_record.starting_branch:
-        violations.append(
-            ReviewSafetyViolation(
-                name="branch",
-                expected=run_record.starting_branch,
-                actual="<detached>" if current_branch is None else current_branch,
-                message="Current branch changed during review.",
-            )
-        )
-    if current_head != run_record.baseline_sha:
-        violations.append(
-            ReviewSafetyViolation(
-                name="HEAD",
-                expected=run_record.baseline_sha,
-                actual=current_head,
-                message="HEAD changed during review.",
-            )
-        )
-    if staged_files:
-        violations.append(
-            ReviewSafetyViolation(
-                name="staging",
-                expected="empty",
-                actual=_format_files(staged_files),
-                message="Staging area is not empty during review.",
-            )
-        )
-    return tuple(violations)
-
-
-def _current_branch_label(repository: GitRepository) -> str:
-    branch = repository.current_branch()
-    return "<detached>" if branch is None else branch
+    if current.matches_fingerprint(expected):
+        return ()
+    return (
+        ReviewSafetyViolation(
+            name="workspace-fingerprint",
+            expected=expected,
+            actual=(
+                current.fingerprint
+                if current.inspection_complete
+                else "incomplete workspace inspection"
+            ),
+            message="Review source workspace changed after deterministic verification.",
+        ),
+    )
 
 
 def _format_files(files: tuple[str, ...]) -> str:
