@@ -4,7 +4,13 @@ import argparse
 import sys
 from pathlib import Path
 
-from .config import ConfigError, format_config_summary, load_config
+from .config import (
+    CodexExecutionOverrides,
+    ConfigError,
+    apply_codex_execution_overrides,
+    format_config_summary,
+    load_config,
+)
 from .locking import RepositoryLockError, active_repository_locks
 from .preflight import format_preflight_result, run_preflight
 from .runs import (
@@ -61,6 +67,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Local Markdown ticket file to copy into the run directory.",
     )
+    run_parser.add_argument(
+        "--model",
+        help="Codex model to use for this run.",
+    )
+    run_parser.add_argument(
+        "--reasoning-effort",
+        help="Codex reasoning effort to use for this run.",
+    )
     run_parser.set_defaults(handler=_handle_run)
 
     status_parser = subparsers.add_parser(
@@ -105,7 +119,13 @@ def _handle_preflight(args: argparse.Namespace) -> int:
 
 
 def _handle_run(args: argparse.Namespace) -> int:
-    config = load_config(args.config_dir)
+    config = apply_codex_execution_overrides(
+        load_config(args.config_dir),
+        CodexExecutionOverrides(
+            model=args.model,
+            reasoning_effort=args.reasoning_effort,
+        ),
+    )
     runs_dir = args.config_dir / RUNS_DIR_NAME
     try:
         result = run_ticket_lifecycle(

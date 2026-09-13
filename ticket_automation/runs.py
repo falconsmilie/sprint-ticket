@@ -11,7 +11,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .config import AppConfig
+from .config import (
+    DEFAULT_CODEX_MODEL,
+    DEFAULT_CODEX_REASONING_EFFORT,
+    SUPPORTED_CODEX_REASONING_EFFORTS,
+    AppConfig,
+    CodexExecutionSettings,
+)
 from .git import GitCommandError, GitRepository
 from .models import WorkflowState
 from .preflight import PreflightResult, run_preflight
@@ -125,6 +131,7 @@ class RunRecord:
     current_correction_round: int
     max_correction_rounds: int
     current_review_round: int
+    codex: CodexExecutionSettings
     terminal_reason: str | None
     created_timestamp: str
     updated_timestamp: str
@@ -177,6 +184,10 @@ class RunRecord:
             "current_correction_round": self.current_correction_round,
             "max_correction_rounds": self.max_correction_rounds,
             "current_review_round": self.current_review_round,
+            "codex": {
+                "model": self.codex.model,
+                "reasoning_effort": self.codex.reasoning_effort,
+            },
             "terminal_reason": self.terminal_reason,
             "created_timestamp": self.created_timestamp,
             "updated_timestamp": self.updated_timestamp,
@@ -222,6 +233,7 @@ class RunRecord:
                 "current_review_round",
                 default=0,
             ),
+            codex=_optional_codex_execution_settings(data),
             terminal_reason=_optional_nullable_string(data, "terminal_reason"),
             created_timestamp=_require_string(data, "created_timestamp"),
             updated_timestamp=_require_string(data, "updated_timestamp"),
@@ -271,6 +283,7 @@ def create_run_snapshot(
             current_correction_round=0,
             max_correction_rounds=config.runner.max_correction_rounds,
             current_review_round=0,
+            codex=config.codex.execution,
             terminal_reason=None,
             created_timestamp=timestamp,
             updated_timestamp=timestamp,
@@ -563,6 +576,37 @@ def _optional_nullable_string(data: dict[str, Any], key: str) -> str | None:
     if not isinstance(value, str) or not value:
         raise RunError(f"Run record field must be a non-empty string or null: {key}")
     return value
+
+
+def _optional_codex_execution_settings(
+    data: dict[str, Any],
+) -> CodexExecutionSettings:
+    value = data.get("codex")
+    if value is None:
+        return CodexExecutionSettings(
+            model=DEFAULT_CODEX_MODEL,
+            reasoning_effort=DEFAULT_CODEX_REASONING_EFFORT,
+        )
+    if not isinstance(value, dict):
+        raise RunError("Run record field must be an object: codex")
+    model = _require_nested_string(value, "codex", "model")
+    reasoning_effort = _require_nested_string(value, "codex", "reasoning_effort")
+    if reasoning_effort not in SUPPORTED_CODEX_REASONING_EFFORTS:
+        supported = ", ".join(sorted(SUPPORTED_CODEX_REASONING_EFFORTS))
+        raise RunError(
+            f"Run record field codex.reasoning_effort must be one of: {supported}."
+        )
+    return CodexExecutionSettings(
+        model=model,
+        reasoning_effort=reasoning_effort,
+    )
+
+
+def _require_nested_string(data: dict[str, Any], parent: str, key: str) -> str:
+    value = data.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise RunError(f"Run record field must be a non-empty string: {parent}.{key}")
+    return value.strip()
 
 
 def _require_workflow_state(data: dict[str, Any], key: str) -> WorkflowState:

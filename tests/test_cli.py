@@ -89,7 +89,15 @@ def test_cli_run_invokes_fake_codex_and_runs_verification(tmp_path, monkeypatch)
     monkeypatch.setenv("TA_FAKE_CODEX_RECORD", str(record_path))
 
     result = run_cli(
-        "--config-dir", str(config_dir), "run", str(ticket), cwd=config_dir
+        "--config-dir",
+        str(config_dir),
+        "run",
+        str(ticket),
+        "--model",
+        "cli-model",
+        "--reasoning-effort",
+        "high",
+        cwd=config_dir,
     )
 
     assert result.returncode == 0
@@ -104,6 +112,18 @@ def test_cli_run_invokes_fake_codex_and_runs_verification(tmp_path, monkeypatch)
         "workspace-write",
         "read-only",
     ]
+    assert [
+        option_value(tuple(call["argv"]), "--model") for call in fake_record["calls"]
+    ] == ["cli-model", "cli-model"]
+    assert [
+        option_value(tuple(call["argv"]), "-c") for call in fake_record["calls"]
+    ] == ['model_reasoning_effort="high"', 'model_reasoning_effort="high"']
+    run_record_path = next(config_dir.joinpath("runs").glob("*/run.json"))
+    run_record = json.loads(run_record_path.read_text(encoding="utf-8"))
+    assert run_record["codex"] == {
+        "model": "cli-model",
+        "reasoning_effort": "high",
+    }
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for run CLI tests")
@@ -188,3 +208,8 @@ def test_cli_status_reads_multiple_run_records(tmp_path, monkeypatch):
 def sandbox_value(argv: tuple[str, ...]) -> str:
     sandbox_index = argv.index("--sandbox")
     return argv[sandbox_index + 1]
+
+
+def option_value(argv: tuple[str, ...], option: str) -> str:
+    option_index = argv.index(option)
+    return argv[option_index + 1]

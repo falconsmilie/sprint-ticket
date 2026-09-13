@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 
 from ticket_automation.config import (
+    DEFAULT_CODEX_MODEL,
+    DEFAULT_CODEX_REASONING_EFFORT,
     AppConfig,
     CodexSettings,
     ProjectSettings,
@@ -202,6 +204,8 @@ def make_config(
     *,
     protected_branches: tuple[str, ...] = ("main", "master"),
     codex_executable: str = sys.executable,
+    codex_model: str = DEFAULT_CODEX_MODEL,
+    codex_reasoning_effort: str = DEFAULT_CODEX_REASONING_EFFORT,
     max_correction_rounds: int = 1,
     verification_commands: tuple[VerificationCommand, ...] | None = None,
 ) -> AppConfig:
@@ -221,6 +225,8 @@ def make_config(
             executable=executable,
             implementation_sandbox="workspace-write",
             review_sandbox="read-only",
+            model=codex_model,
+            reasoning_effort=codex_reasoning_effort,
         ),
         verification=VerificationSettings(
             commands=verification_commands
@@ -263,6 +269,8 @@ def write_preflight_config(
         "",
         "[codex]",
         f"executable = {json.dumps(executable)}",
+        f"model = {json.dumps(DEFAULT_CODEX_MODEL)}",
+        f"reasoning_effort = {json.dumps(DEFAULT_CODEX_REASONING_EFFORT)}",
         'implementation_sandbox = "workspace-write"',
         'review_sandbox = "read-only"',
     ]

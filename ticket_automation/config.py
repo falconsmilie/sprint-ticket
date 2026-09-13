@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import copy
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-
 SUPPORTED_SANDBOXES = frozenset({"read-only", "workspace-write"})
+DEFAULT_CODEX_MODEL = "gpt-5.5"
+DEFAULT_CODEX_REASONING_EFFORT = "xhigh"
+SUPPORTED_CODEX_REASONING_EFFORTS = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh"}
+)
 SECRET_FIELD_MARKERS = ("secret", "password", "token", "api_key", "apikey")
 
 
@@ -28,10 +32,31 @@ class RunnerSettings:
 
 
 @dataclass(frozen=True)
+class CodexExecutionSettings:
+    model: str
+    reasoning_effort: str
+
+
+@dataclass(frozen=True)
+class CodexExecutionOverrides:
+    model: str | None = None
+    reasoning_effort: str | None = None
+
+
+@dataclass(frozen=True)
 class CodexSettings:
     executable: str
     implementation_sandbox: str
     review_sandbox: str
+    model: str
+    reasoning_effort: str
+
+    @property
+    def execution(self) -> CodexExecutionSettings:
+        return CodexExecutionSettings(
+            model=self.model,
+            reasoning_effort=self.reasoning_effort,
+        )
 
 
 @dataclass(frozen=True)
@@ -106,11 +131,71 @@ def parse_config(
                 "codex.implementation_sandbox",
             ),
             review_sandbox=_require_sandbox(codex, "codex.review_sandbox"),
+            model=_optional_codex_model(codex, "codex.model"),
+            reasoning_effort=_optional_reasoning_effort(
+                codex,
+                "codex.reasoning_effort",
+            ),
         ),
         verification=VerificationSettings(
             commands=_parse_verification_commands(verification),
         ),
         source_files=source_files,
+    )
+
+
+def apply_codex_execution_overrides(
+    config: AppConfig,
+    overrides: CodexExecutionOverrides,
+) -> AppConfig:
+    execution = resolve_codex_execution_config(config.codex, overrides)
+    return with_codex_execution_settings(config, execution)
+
+
+def with_codex_execution_settings(
+    config: AppConfig,
+    execution: CodexExecutionSettings,
+) -> AppConfig:
+    validated = validate_codex_execution_settings(execution)
+    return replace(
+        config,
+        codex=replace(
+            config.codex,
+            model=validated.model,
+            reasoning_effort=validated.reasoning_effort,
+        ),
+    )
+
+
+def resolve_codex_execution_config(
+    codex: CodexSettings,
+    overrides: CodexExecutionOverrides | None = None,
+) -> CodexExecutionSettings:
+    overrides = overrides or CodexExecutionOverrides()
+    model_name = "--model" if overrides.model is not None else "codex.model"
+    reasoning_name = (
+        "--reasoning-effort"
+        if overrides.reasoning_effort is not None
+        else "codex.reasoning_effort"
+    )
+    return _codex_execution_settings(
+        overrides.model if overrides.model is not None else codex.model,
+        overrides.reasoning_effort
+        if overrides.reasoning_effort is not None
+        else codex.reasoning_effort,
+        model_name=model_name,
+        reasoning_name=reasoning_name,
+    )
+
+
+def validate_codex_execution_settings(
+    execution: CodexExecutionSettings,
+) -> CodexExecutionSettings:
+    return _codex_execution_settings(
+        execution.model,
+        execution.reasoning_effort,
+        model_name="codex.model",
+        reasoning_name="codex.reasoning_effort",
     )
 
 
@@ -138,6 +223,8 @@ def format_config_summary(config: AppConfig) -> str:
             "",
             "Codex",
             f"  executable: {_redact_if_secret('codex.executable', config.codex.executable)}",
+            f"  model: {_redact_if_secret('codex.model', config.codex.model)}",
+            f"  reasoning effort: {config.codex.reasoning_effort}",
             f"  implementation sandbox: {config.codex.implementation_sandbox}",
             f"  review sandbox: {config.codex.review_sandbox}",
             "",
@@ -179,6 +266,48 @@ def _require_non_empty_string(table: dict[str, Any], dotted_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(f"Missing required non-empty string: {dotted_name}.")
     return value
+
+
+def _optional_codex_model(table: dict[str, Any], dotted_name: str) -> str:
+    key = dotted_name.rsplit(".", maxsplit=1)[-1]
+    value = table.get(key, DEFAULT_CODEX_MODEL)
+    return _require_non_empty_value(value, dotted_name)
+
+
+def _optional_reasoning_effort(table: dict[str, Any], dotted_name: str) -> str:
+    key = dotted_name.rsplit(".", maxsplit=1)[-1]
+    value = table.get(key, DEFAULT_CODEX_REASONING_EFFORT)
+    return _require_supported_reasoning_effort(value, dotted_name)
+
+
+def _codex_execution_settings(
+    model: Any,
+    reasoning_effort: Any,
+    *,
+    model_name: str,
+    reasoning_name: str,
+) -> CodexExecutionSettings:
+    return CodexExecutionSettings(
+        model=_require_non_empty_value(model, model_name),
+        reasoning_effort=_require_supported_reasoning_effort(
+            reasoning_effort,
+            reasoning_name,
+        ),
+    )
+
+
+def _require_non_empty_value(value: Any, dotted_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"Missing required non-empty string: {dotted_name}.")
+    return value.strip()
+
+
+def _require_supported_reasoning_effort(value: Any, dotted_name: str) -> str:
+    effort = _require_non_empty_value(value, dotted_name)
+    if effort not in SUPPORTED_CODEX_REASONING_EFFORTS:
+        supported = ", ".join(sorted(SUPPORTED_CODEX_REASONING_EFFORTS))
+        raise ConfigError(f"{dotted_name} must be one of: {supported}.")
+    return effort
 
 
 def _require_positive_int(table: dict[str, Any], key: str, dotted_name: str) -> int:

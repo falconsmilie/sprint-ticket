@@ -298,6 +298,7 @@ def run_correction_stage(
             output_schema=_CORRECTION_RESULT_SCHEMA,
             artifact_directory=artifact_directory,
             executable=config.codex.executable,
+            execution_config=config.codex.execution,
             runner=codex_runner,
         )
     except CodexExecutionFailure as error:

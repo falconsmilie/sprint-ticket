@@ -6,12 +6,18 @@ import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
 from . import executable_resolution
+from .config import (
+    DEFAULT_CODEX_MODEL,
+    DEFAULT_CODEX_REASONING_EFFORT,
+    CodexExecutionSettings,
+    validate_codex_execution_settings,
+)
 from .process_output import (
     ProcessOutputDecodeError,
     decode_human_output,
@@ -180,6 +186,7 @@ class CodexExecution:
     argv: tuple[str, ...]
     repo_path: Path
     sandbox: Sandbox
+    execution_config: CodexExecutionSettings
     output_schema_path: Path
     artifact_directory: Path
     prompt_path: Path
@@ -276,12 +283,14 @@ class CodexExecutor:
         self,
         *,
         executable: str = DEFAULT_CODEX_EXECUTABLE,
+        execution_config: CodexExecutionSettings | None = None,
         timeout_seconds: float | None = DEFAULT_TIMEOUT_SECONDS,
         runner: CodexProcessRunner | None = None,
     ):
         if not executable:
             raise ValueError("Codex executable must be a non-empty string.")
         self.executable = executable
+        self.execution_config = _effective_execution_config(execution_config)
         self.timeout_seconds = timeout_seconds
         self.runner = runner or SubprocessCodexRunner()
 
@@ -306,6 +315,7 @@ class CodexExecutor:
             executable=self.executable,
             repo_path=repo_path,
             sandbox=sandbox,
+            execution_config=self.execution_config,
             output_schema=output_schema,
         )
 
@@ -317,6 +327,7 @@ class CodexExecutor:
                 message=f"Invalid Codex output schema: {error}",
                 command=configured_command,
                 sandbox=sandbox,
+                execution_config=self.execution_config,
                 output_schema=output_schema,
                 artifacts=artifact_paths,
                 started_at=start,
@@ -340,6 +351,7 @@ class CodexExecutor:
                 message=f"Codex executable is unavailable: {self.executable}",
                 command=configured_command,
                 sandbox=sandbox,
+                execution_config=self.execution_config,
                 output_schema=output_schema,
                 artifacts=artifact_paths,
                 started_at=start,
@@ -351,6 +363,7 @@ class CodexExecutor:
             executable=str(resolved_executable),
             repo_path=repo_path,
             sandbox=sandbox,
+            execution_config=self.execution_config,
             output_schema=output_schema,
         )
 
@@ -370,6 +383,7 @@ class CodexExecutor:
                 message=f"Codex executable is unavailable: {command.argv[0]}",
                 command=command,
                 sandbox=sandbox,
+                execution_config=self.execution_config,
                 output_schema=output_schema,
                 artifacts=artifact_paths,
                 started_at=start,
@@ -392,6 +406,7 @@ class CodexExecutor:
                 message=str(error),
                 command=command,
                 sandbox=sandbox,
+                execution_config=self.execution_config,
                 output_schema=output_schema,
                 artifacts=artifact_paths,
                 started_at=start,
@@ -416,6 +431,7 @@ class CodexExecutor:
                 message=str(error),
                 command=command,
                 sandbox=sandbox,
+                execution_config=self.execution_config,
                 output_schema=output_schema,
                 artifacts=artifact_paths,
                 started_at=start,
@@ -432,6 +448,7 @@ class CodexExecutor:
                 message=f"Could not start Codex process: {error}",
                 command=command,
                 sandbox=sandbox,
+                execution_config=self.execution_config,
                 output_schema=output_schema,
                 artifacts=artifact_paths,
                 started_at=start,
@@ -453,6 +470,7 @@ class CodexExecutor:
                 message=f"Codex exited with code {process.returncode}.",
                 command=command,
                 sandbox=sandbox,
+                execution_config=self.execution_config,
                 output_schema=output_schema,
                 artifacts=artifact_paths,
                 started_at=start,
@@ -468,6 +486,7 @@ class CodexExecutor:
                 message=str(error),
                 command=command,
                 sandbox=sandbox,
+                execution_config=self.execution_config,
                 output_schema=output_schema,
                 artifacts=artifact_paths,
                 started_at=start,
@@ -482,6 +501,7 @@ class CodexExecutor:
                 message=service_error,
                 command=command,
                 sandbox=sandbox,
+                execution_config=self.execution_config,
                 output_schema=output_schema,
                 artifacts=artifact_paths,
                 started_at=start,
@@ -497,6 +517,7 @@ class CodexExecutor:
                 message=str(error),
                 command=command,
                 sandbox=sandbox,
+                execution_config=self.execution_config,
                 output_schema=output_schema,
                 artifacts=artifact_paths,
                 started_at=start,
@@ -510,6 +531,7 @@ class CodexExecutor:
                 message=str(error),
                 command=command,
                 sandbox=sandbox,
+                execution_config=self.execution_config,
                 output_schema=output_schema,
                 artifacts=artifact_paths,
                 started_at=start,
@@ -525,6 +547,7 @@ class CodexExecutor:
                 message=str(error),
                 command=command,
                 sandbox=sandbox,
+                execution_config=self.execution_config,
                 output_schema=output_schema,
                 artifacts=artifact_paths,
                 started_at=start,
@@ -539,6 +562,7 @@ class CodexExecutor:
             argv=command.argv,
             repo_path=command.cwd,
             sandbox=sandbox,
+            execution_config=self.execution_config,
             output_schema_path=Path(output_schema).resolve(),
             artifact_directory=artifact_paths.directory,
             prompt_path=artifact_paths.prompt,
@@ -567,11 +591,13 @@ def execute(
     output_schema: Path,
     artifact_directory: Path,
     executable: str = DEFAULT_CODEX_EXECUTABLE,
+    execution_config: CodexExecutionSettings | None = None,
     timeout_seconds: float | None = DEFAULT_TIMEOUT_SECONDS,
     runner: CodexProcessRunner | None = None,
 ) -> CodexExecution:
     return CodexExecutor(
         executable=executable,
+        execution_config=execution_config,
         timeout_seconds=timeout_seconds,
         runner=runner,
     ).execute(
@@ -588,22 +614,40 @@ def build_codex_command(
     executable: str,
     repo_path: Path,
     sandbox: Sandbox,
+    execution_config: CodexExecutionSettings | None = None,
     output_schema: Path,
 ) -> CodexCommand:
     if not isinstance(sandbox, Sandbox):
         raise TypeError("sandbox must be a Sandbox value.")
+    effective_execution_config = _effective_execution_config(execution_config)
     return CodexCommand(
         argv=(
             executable,
             "exec",
-            "-",
+            "--model",
+            effective_execution_config.model,
+            "-c",
+            (f'model_reasoning_effort="{effective_execution_config.reasoning_effort}"'),
             "--sandbox",
             sandbox.value,
             "--json",
             "--output-schema",
             str(Path(output_schema).resolve()),
+            "-",
         ),
         cwd=Path(repo_path),
+    )
+
+
+def _effective_execution_config(
+    execution_config: CodexExecutionSettings | None,
+) -> CodexExecutionSettings:
+    return validate_codex_execution_settings(
+        execution_config
+        or CodexExecutionSettings(
+            model=DEFAULT_CODEX_MODEL,
+            reasoning_effort=DEFAULT_CODEX_REASONING_EFFORT,
+        )
     )
 
 
@@ -676,6 +720,7 @@ def _fail(
     message: str,
     command: CodexCommand,
     sandbox: Sandbox,
+    execution_config: CodexExecutionSettings,
     output_schema: Path,
     artifacts: _ArtifactPaths,
     started_at: datetime,
@@ -694,6 +739,7 @@ def _fail(
         argv=command.argv,
         repo_path=command.cwd,
         sandbox=sandbox,
+        execution_config=execution_config,
         output_schema_path=Path(output_schema).resolve(),
         artifact_directory=artifacts.directory,
         prompt_path=artifacts.prompt,
@@ -751,6 +797,10 @@ def _execution_record(execution: CodexExecution) -> dict[str, Any]:
         "ended_at": execution.ended_at,
         "duration_seconds": execution.duration_seconds,
         "sandbox": execution.sandbox.value,
+        "codex": {
+            "model": execution.execution_config.model,
+            "reasoning_effort": execution.execution_config.reasoning_effort,
+        },
         "argv": list(execution.argv),
         "repo_path": str(execution.repo_path),
         "output_schema_path": str(execution.output_schema_path),
@@ -1472,11 +1522,11 @@ def _resolve_schema_ref(
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _format_timestamp(value: datetime) -> str:
-    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _duration_seconds(start: datetime, end: datetime) -> float:

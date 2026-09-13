@@ -224,6 +224,36 @@ def test_correction_round_and_maximum_are_persisted(tmp_path):
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
+def test_codex_execution_config_is_persisted_in_run_record(tmp_path):
+    repo = create_git_repo(tmp_path / "repo")
+    ticket = tmp_path / "QDEB-003.md"
+    ticket.write_text("# Ticket\n", encoding="utf-8")
+
+    result = create_run_snapshot(
+        make_config(
+            repo,
+            codex_model="configured-model",
+            codex_reasoning_effort="high",
+        ),
+        ticket,
+        runs_dir=tmp_path / "runs",
+        clock=fixed_clock,
+    )
+    data = json.loads(result.run_dir.joinpath("run.json").read_text(encoding="utf-8"))
+
+    assert data["codex"] == {
+        "model": "configured-model",
+        "reasoning_effort": "high",
+    }
+    assert load_run_record(result.run_dir / "run.json").codex.model == (
+        "configured-model"
+    )
+    assert load_run_record(result.run_dir / "run.json").codex.reasoning_effort == (
+        "high"
+    )
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
 def test_run_record_loads_pre_review_round_records(tmp_path):
     repo = create_git_repo(tmp_path / "repo")
     ticket = tmp_path / "QDEB-003.md"

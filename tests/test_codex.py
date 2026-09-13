@@ -32,6 +32,7 @@ from ticket_automation.codex import (
     execute,
     parse_sandbox,
 )
+from ticket_automation.config import CodexExecutionSettings, ConfigError
 from ticket_automation.preflight import run_preflight
 
 EXISTING_EXECUTABLE = str(Path(sys.executable).resolve())
@@ -76,27 +77,39 @@ def test_builds_workspace_write_command_arguments(tmp_path):
     assert command.argv == (
         "codex",
         "exec",
-        "-",
+        "--model",
+        "gpt-5.5",
+        "-c",
+        'model_reasoning_effort="xhigh"',
         "--sandbox",
         "workspace-write",
         "--json",
         "--output-schema",
         str(schema.resolve()),
+        "-",
     )
     assert command.cwd == tmp_path / "repo"
 
 
-def test_builds_read_only_command_arguments(tmp_path):
+def test_builds_command_with_explicit_execution_config(tmp_path):
     schema = write_schema(tmp_path / "schema.json")
 
     command = build_codex_command(
         executable="codex",
         repo_path=tmp_path / "repo",
         sandbox=Sandbox.READ_ONLY,
+        execution_config=CodexExecutionSettings(
+            model="gpt-5.5",
+            reasoning_effort="xhigh",
+        ),
         output_schema=schema,
     )
 
-    assert command.argv[4] == "read-only"
+    assert command.argv[command.argv.index("--model") + 1] == "gpt-5.5"
+    assert command.argv[command.argv.index("-c") + 1] == (
+        'model_reasoning_effort="xhigh"'
+    )
+    assert command.argv[command.argv.index("--sandbox") + 1] == "read-only"
 
 
 def test_rejects_unvalidated_sandbox_strings(tmp_path):
@@ -139,12 +152,16 @@ def test_execute_resolves_bare_executable_from_path(monkeypatch, tmp_path):
     assert runner.command.argv == (
         str(executable.resolve()),
         "exec",
-        "-",
+        "--model",
+        "gpt-5.5",
+        "-c",
+        'model_reasoning_effort="xhigh"',
         "--sandbox",
         "workspace-write",
         "--json",
         "--output-schema",
         str(schema.resolve()),
+        "-",
     )
 
 
@@ -177,7 +194,8 @@ def test_execute_uses_windows_cmd_launcher_returned_by_which(monkeypatch, tmp_pa
     assert runner.command is not None
     assert runner.command.argv[0] == str(executable.resolve())
     assert runner.command.argv[0] != "codex"
-    assert runner.command.argv[1:3] == ("exec", "-")
+    assert runner.command.argv[1] == "exec"
+    assert runner.command.argv[-1] == "-"
 
 
 def test_execute_uses_explicit_absolute_executable_without_path_lookup(
@@ -307,6 +325,10 @@ def test_persists_jsonl_stderr_prompt_and_structured_result(tmp_path):
     }
     execution_record = read_execution_record(result)
     assert execution_record["status"] == "SUCCESS"
+    assert execution_record["codex"] == {
+        "model": "gpt-5.5",
+        "reasoning_effort": "xhigh",
+    }
     assert execution_record["process_started"] is True
     assert execution_record["process_exit_code"] == 0
     assert execution_record["timed_out"] is False
@@ -891,10 +913,35 @@ def test_paths_containing_spaces_retain_argument_boundaries(tmp_path):
 
     assert runner.command is not None
     assert runner.command.argv[0] == str(executable.resolve())
-    assert runner.command.argv[-1] == str(schema.resolve())
+    assert runner.command.argv[runner.command.argv.index("--output-schema") + 1] == (
+        str(schema.resolve())
+    )
+    assert runner.command.argv[-1] == "-"
     assert runner.command.cwd == repo
     assert result.artifact_directory == artifact_dir
     assert result.result_json_path.is_file()
+
+
+def test_invalid_execution_config_fails_before_runner_starts(tmp_path):
+    schema = write_schema(tmp_path / "schema.json")
+    runner = FakeRunner(result=successful_process({"status": "ok"}))
+
+    with pytest.raises(ConfigError, match="codex.reasoning_effort"):
+        execute(
+            prompt="prompt",
+            repo_path=tmp_path,
+            sandbox=Sandbox.READ_ONLY,
+            output_schema=schema,
+            artifact_directory=tmp_path / "artifacts",
+            executable=EXISTING_EXECUTABLE,
+            execution_config=CodexExecutionSettings(
+                model="gpt-5.5",
+                reasoning_effort="unsupported",
+            ),
+            runner=runner,
+        )
+
+    assert runner.calls == 0
 
 
 def test_process_start_failure_is_typed(tmp_path):
@@ -1049,6 +1096,10 @@ def assert_failure_execution_record(
     assert not execution.result_json_path.exists()
     record = read_execution_record(execution)
     assert record["status"] == "FAILED"
+    assert record["codex"] == {
+        "model": "gpt-5.5",
+        "reasoning_effort": "xhigh",
+    }
     assert record["process_started"] is process_started
     assert record["process_exit_code"] == exit_code
     assert record["timed_out"] is timed_out

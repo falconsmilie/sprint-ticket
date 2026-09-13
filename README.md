@@ -20,6 +20,28 @@ Copy-Item config.example.toml config.local.toml
 
 Set `project.repo` in `config.local.toml` to the target repository path on your computer. `config.local.toml` is ignored by Git and overrides values from `config.example.toml`.
 
+Codex execution policy is configured by TicketAutomation, so runs do not depend on your global Codex model defaults:
+
+```toml
+[codex]
+model = "gpt-5.5"
+reasoning_effort = "xhigh"
+```
+
+The effective Codex model and reasoning effort are resolved in this order:
+
+```text
+CLI override
+> config.local.toml
+> application default
+```
+
+To temporarily run a ticket with a different model or reasoning effort, pass either override to `run`:
+
+```powershell
+python -m ticket_automation run tickets/example.md --model gpt-5.5 --reasoning-effort high
+```
+
 ## CLI
 
 Show the available commands:
@@ -81,7 +103,7 @@ The target repository must start clean. TicketAutomation deliberately does not s
 
 Run snapshots are stored under `runs/`. A run ID uses a timestamp plus a sanitized ticket identifier, such as `20260911-130512_QDEB-003`. Existing run directories are not overwritten; a numeric suffix is added if a timestamp collision occurs.
 
-Each run directory contains `run.json`, `ticket.md`, and `baseline.json`. These records are enough to reconstruct the original ticket boundary for later workflow stages: the original ticket path, the copied ticket path, the target repository path, the starting branch, the baseline HEAD SHA, the current state, the last completed state, correction and review round counters, timestamps, and a terminal reason when the run reaches `HUMAN_REQUIRED` or `FAILED`.
+Each run directory contains `run.json`, `ticket.md`, and `baseline.json`. These records are enough to reconstruct the original ticket boundary for later workflow stages: the original ticket path, the copied ticket path, the target repository path, the starting branch, the baseline HEAD SHA, the current state, the last completed state, correction and review round counters, the effective Codex model and reasoning effort, timestamps, and a terminal reason when the run reaches `HUMAN_REQUIRED` or `FAILED`.
 
 A successful run also contains `diffs/final.patch` and `final-report.md`. The final patch is always relative to the original baseline SHA and the complete current working tree. The final report separates controller-observed facts from implementation-agent claims, so runner verification and Git evidence are not confused with agent-reported targeted tests.
 

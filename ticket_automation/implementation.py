@@ -174,6 +174,7 @@ def run_implementation_stage(
             output_schema=_IMPLEMENTATION_RESULT_SCHEMA,
             artifact_directory=implementation_dir,
             executable=config.codex.executable,
+            execution_config=config.codex.execution,
             runner=codex_runner,
         )
     except CodexExecutionFailure as error:

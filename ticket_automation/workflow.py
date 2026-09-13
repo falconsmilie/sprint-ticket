@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .codex import CodexProcessRunner
-from .config import AppConfig
+from .config import AppConfig, with_codex_execution_settings
 from .corrections import (
     CorrectionError,
     CorrectionStageResult,
@@ -222,6 +222,7 @@ def resume_ticket_lifecycle(
 
     preflight_result = PreflightResult(())
     run_record = load_run_record(run_dir / RUN_RECORD_FILE)
+    config = with_codex_execution_settings(config, run_record.codex)
     with acquire_repository_run_lock(
         run_record.target_repository_path,
         run_id=run_record.run_id,
