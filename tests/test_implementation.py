@@ -8,7 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from tests.helpers import GIT, create_git_repo, make_config, run_git
+from tests.helpers import (
+    GIT,
+    create_git_repo,
+    make_config,
+    run_git,
+)
+from tests.helpers import create_trusted_prepared_run as create_run_snapshot
 from ticket_automation.codex import (
     CodexCommand,
     CodexFailureKind,
@@ -22,7 +28,7 @@ from ticket_automation.implementation import (
     run_implementation_stage,
 )
 from ticket_automation.models import StageOutcome, WorkflowState
-from ticket_automation.runs import create_run_snapshot, load_run_record, save_run_record
+from ticket_automation.runs import load_run_record, save_run_record
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 IMPLEMENTATION_DIR = "implementation"

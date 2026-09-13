@@ -144,7 +144,13 @@ def test_cli_verification_failure_overrides_agent_claimed_tests(tmp_path, monkey
                 argv=(
                     sys.executable,
                     "-c",
-                    "import sys; print('runner failed'); raise SystemExit(7)",
+                    (
+                        "import pathlib, sys; "
+                        "changed = pathlib.Path('file.txt').read_text() != "
+                        "'initial\\n'; "
+                        "print('runner failed' if changed else 'baseline passed'); "
+                        "raise SystemExit(7 if changed else 0)"
+                    ),
                 ),
                 timeout_seconds=1800,
             ),

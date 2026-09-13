@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
+from ._verification_artifacts import (
+    _baseline_verification_evidence_problem,
+    _verification_commands_fingerprint,
+)
 from .codex import CodexProcessRunner
 from .config import AppConfig, with_codex_execution_settings
 from .corrections import (
@@ -56,6 +61,7 @@ from .runs import (
 from .verification import (
     VerificationProcessRunner,
     VerificationStageResult,
+    _run_baseline_verification_stage,
     run_verification_stage,
 )
 
@@ -147,36 +153,18 @@ def _run_ticket_lifecycle_locked(
     correction_results: list[CorrectionStageResult] = []
 
     try:
-        active_record = _persist_requested_transition(
+        active_record = _complete_preparation(
+            config,
             snapshot.run_dir,
-            snapshot.run_record,
-            WorkflowState.IMPLEMENTING,
+            process_runner=verification_runner,
             clock=clock,
         )
         _update_repository_lock(repository_lock, active_record)
-        implementation_result = run_implementation_stage(
-            config,
-            snapshot.run_dir,
-            codex_runner=codex_runner,
-            clock=clock,
-        )
-        completed_record = _persist_stage_outcome(
-            snapshot.run_dir,
-            implementation_result.run_record,
-            implementation_result.outcome,
-            terminal_reason=implementation_result.controller_message,
-            clock=clock,
-        )
-        implementation_result = replace(
-            implementation_result,
-            run_record=completed_record,
-        )
-        _update_repository_lock(repository_lock, implementation_result.run_record)
         return _drive_lifecycle(
             config,
             snapshot.run_dir,
             snapshot.preflight_result,
-            implementation_result.run_record,
+            active_record,
             implementation_result=implementation_result,
             verification_results=verification_results,
             review_results=review_results,
@@ -283,7 +271,7 @@ def _resume_ticket_lifecycle_locked(
             correction_results=(),
         )
 
-    resume_problem = _resume_preflight_problem(run_dir, run_record)
+    resume_problem = _resume_preflight_problem(config, run_dir, run_record)
     if resume_problem is not None:
         run_record = _mark_human_required(
             run_dir,
@@ -325,8 +313,16 @@ def _resume_ticket_lifecycle_locked(
     verification_results: list[VerificationStageResult] = []
     review_results: list[ReviewStageResult] = []
     correction_results: list[CorrectionStageResult] = []
-
     try:
+        if run_record.state == WorkflowState.PREPARING:
+            run_record = _complete_preparation(
+                config,
+                run_dir,
+                process_runner=verification_runner,
+                clock=clock,
+            )
+            _update_repository_lock(repository_lock, run_record)
+
         if run_record.state == WorkflowState.PREPARED:
             run_record = _persist_requested_transition(
                 run_dir,
@@ -427,6 +423,9 @@ def format_lifecycle_result(result: LifecycleResult) -> str:
         "",
         "Baseline",
         f"  {record.baseline_sha}",
+        "",
+        "Baseline verification:",
+        *_baseline_verification_lines(context),
         "",
         "Files changed",
         f"  {_changed_file_count(context, result)}",
@@ -647,6 +646,38 @@ def _persist_requested_transition(
     return updated_record
 
 
+def _complete_preparation(
+    config: AppConfig,
+    run_dir: Path,
+    *,
+    process_runner: VerificationProcessRunner | None,
+    clock: Callable[[], datetime] | None,
+) -> RunRecord:
+    try:
+        result = _run_baseline_verification_stage(
+            config,
+            run_dir,
+            process_runner=process_runner,
+            clock=clock,
+        )
+    except (OSError, RunError) as error:
+        return _mark_human_required(
+            run_dir,
+            terminal_reason=(
+                "Clean baseline verification could not be completed: "
+                f"{type(error).__name__}: {error}"
+            ),
+            clock=clock,
+        )
+    return _persist_stage_outcome(
+        run_dir,
+        result.run_record,
+        result.outcome,
+        terminal_reason=result.controller_message,
+        clock=clock,
+    )
+
+
 def _persist_stage_outcome(
     run_dir: Path,
     run_record: RunRecord,
@@ -690,6 +721,7 @@ def _record_after_stage_outcome(
     elif outcome == StageOutcome.COMPLETED:
         try:
             state = {
+                WorkflowState.PREPARING: WorkflowState.PREPARED,
                 WorkflowState.IMPLEMENTING: WorkflowState.VERIFYING,
                 WorkflowState.VERIFYING: WorkflowState.REVIEWING,
                 WorkflowState.REVIEWING: WorkflowState.REPORTING,
@@ -716,7 +748,11 @@ def _record_after_stage_outcome(
     )
 
 
-def _resume_preflight_problem(run_dir: Path, run_record: RunRecord) -> str | None:
+def _resume_preflight_problem(
+    config: AppConfig,
+    run_dir: Path,
+    run_record: RunRecord,
+) -> str | None:
     baseline_path = run_dir / BASELINE_RECORD_FILE
     ticket_path = run_dir / RUN_TICKET_FILE
     if not baseline_path.is_file():
@@ -732,6 +768,22 @@ def _resume_preflight_problem(run_dir: Path, run_record: RunRecord) -> str | Non
         return "Run record and baseline artifact disagree on starting branch."
     if baseline.head_sha != run_record.baseline_sha:
         return "Run record and baseline artifact disagree on baseline HEAD."
+    if not baseline.clean_worktree or baseline.has_staged_files:
+        return "Recorded repository baseline is not clean."
+    try:
+        ticket_sha256 = hashlib.sha256(ticket_path.read_bytes()).hexdigest()
+    except OSError as error:
+        return f"Could not inspect snapshotted ticket artifact: {error}"
+    if ticket_sha256 != baseline.ticket_sha256:
+        return "Snapshotted ticket no longer matches the recorded ticket baseline."
+    if (
+        _verification_commands_fingerprint(config.verification.commands)
+        != baseline.verification_commands_fingerprint
+    ):
+        return (
+            "Configured verification_commands_fingerprint no longer matches the "
+            "recorded baseline."
+        )
 
     repository = GitRepository(Path(run_record.target_repository_path))
     if not repository.path.exists():
@@ -745,6 +797,22 @@ def _resume_preflight_problem(run_dir: Path, run_record: RunRecord) -> str | Non
     safety = inspect_git_safety(run_record)
     if not safety.safe:
         return _resume_safety_reason(safety)
+    if run_record.state in {WorkflowState.PREPARING, WorkflowState.PREPARED}:
+        try:
+            snapshot = WorkspaceSnapshot.capture(repository)
+        except (OSError, RuntimeError, ValueError) as error:
+            return f"Could not inspect current workspace for safe resume: {error}"
+        if not snapshot.matches_fingerprint(baseline.workspace_fingerprint):
+            return "Current workspace no longer matches the recorded clean baseline."
+    if run_record.state != WorkflowState.PREPARING:
+        evidence_problem = _baseline_verification_evidence_problem(
+            run_dir,
+            run_record,
+            baseline,
+            verification_commands=config.verification.commands,
+        )
+        if evidence_problem is not None:
+            return evidence_problem
     return None
 
 
@@ -764,9 +832,7 @@ def _resume_checkpoint_problem(run_dir: Path, run_record: RunRecord) -> str | No
         return None
 
     if run_record.state == WorkflowState.PREPARING:
-        return (
-            "Run preparation was interrupted before a complete snapshot was persisted."
-        )
+        return None
 
     if run_record.state == WorkflowState.IMPLEMENTING:
         return (
@@ -1079,6 +1145,27 @@ def _verification_lines(
     return lines
 
 
+def _baseline_verification_lines(
+    context: dict[str, object] | None,
+) -> list[str]:
+    if context is not None:
+        controller = context.get("controller")
+        if isinstance(controller, dict):
+            baseline = controller.get("baseline_verification")
+            if isinstance(baseline, dict):
+                lines = [f"  {baseline.get('status', 'UNKNOWN')}"]
+                commands = baseline.get("commands")
+                if isinstance(commands, list):
+                    lines.extend(
+                        f"  {command.get('name', '<unnamed>'):<10} "
+                        f"{command.get('status', 'UNKNOWN')}"
+                        for command in commands
+                        if isinstance(command, dict)
+                    )
+                return lines
+    return ["  NOT RUN"]
+
+
 def _review_summary(
     context: dict[str, object] | None,
     result: LifecycleResult,
@@ -1124,11 +1211,27 @@ def _git_safety_lines(
     for correction in result.correction_results:
         violations.extend(correction.safety_violations)
     violations.extend(result.safety_violations)
-    if violations:
-        return [
-            f"  {violation.name}: expected {violation.expected}, got {violation.actual}"
-            for violation in violations
-        ]
+    rendered_violations = [
+        f"  {violation.name}: expected {violation.expected}, got {violation.actual}"
+        for violation in violations
+    ]
+
+    if context is not None:
+        controller = context.get("controller")
+        if isinstance(controller, dict):
+            baseline = controller.get("baseline_verification")
+            if isinstance(baseline, dict):
+                baseline_violations = baseline.get("safety_violations")
+                if isinstance(baseline_violations, list):
+                    rendered_violations.extend(
+                        f"  {violation.get('name', '<unnamed>')}: expected "
+                        f"{violation.get('expected', '<unknown>')}, got "
+                        f"{violation.get('actual', '<unknown>')}"
+                        for violation in baseline_violations
+                        if isinstance(violation, dict)
+                    )
+    if rendered_violations:
+        return rendered_violations
 
     if context is not None:
         controller = context["controller"]

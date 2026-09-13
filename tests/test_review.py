@@ -8,7 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from tests.helpers import GIT, create_git_repo, make_config, run_git
+from tests.helpers import (
+    GIT,
+    create_git_repo,
+    make_config,
+    run_git,
+)
+from tests.helpers import create_trusted_prepared_run as create_run_snapshot
 from ticket_automation.codex import (
     CodexCommand,
     CodexProcessResult,
@@ -26,7 +32,7 @@ from ticket_automation.review import (
     run_review_stage,
     validate_review_result_semantics,
 )
-from ticket_automation.runs import create_run_snapshot, load_run_record, save_run_record
+from ticket_automation.runs import load_run_record, save_run_record
 from ticket_automation.verification import (
     VerificationProcessCommand,
     VerificationProcessResult,

@@ -9,7 +9,13 @@ from pathlib import Path
 
 import pytest
 
-from tests.helpers import GIT, create_git_repo, make_config, run_git
+from tests.helpers import (
+    GIT,
+    create_git_repo,
+    make_config,
+    run_git,
+)
+from tests.helpers import create_trusted_prepared_run as create_run_snapshot
 from ticket_automation import corrections as corrections_module
 from ticket_automation.codex import (
     CodexCommand,
@@ -30,7 +36,7 @@ from ticket_automation.git import GitCommandError
 from ticket_automation.models import StageOutcome, WorkflowState
 from ticket_automation.reporting import generate_terminal_report_best_effort
 from ticket_automation.review import ReviewVerdict, run_review_stage
-from ticket_automation.runs import create_run_snapshot, load_run_record, save_run_record
+from ticket_automation.runs import load_run_record, save_run_record
 from ticket_automation.verification import (
     VerificationProcessCommand,
     VerificationProcessResult,
@@ -885,6 +891,7 @@ def prepared_verification_run(
         config,
         ticket,
         runs_dir=tmp_path / "runs",
+        verification_runner=PassingVerificationRunner(),
         clock=fixed_clock,
     )
     repo.joinpath("file.txt").write_text("implemented\n", encoding="utf-8")

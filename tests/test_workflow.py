@@ -9,7 +9,13 @@ from pathlib import Path
 
 import pytest
 
-from tests.helpers import GIT, create_git_repo, make_config, run_git
+from tests.helpers import (
+    GIT,
+    create_git_repo,
+    make_config,
+    run_git,
+)
+from tests.helpers import create_trusted_prepared_run as create_run_snapshot
 from ticket_automation.codex import CodexCommand, CodexProcessResult, Sandbox
 from ticket_automation.config import AppConfig, VerificationCommand
 from ticket_automation.git import GitCommandError
@@ -27,7 +33,7 @@ from ticket_automation.review import (
 from ticket_automation.review import (
     run_review_stage as execute_review_stage,
 )
-from ticket_automation.runs import create_run_snapshot, load_run_record, save_run_record
+from ticket_automation.runs import load_run_record, save_run_record
 from ticket_automation.verification import (
     VerificationProcessCommand,
     VerificationProcessResult,
@@ -208,6 +214,27 @@ class SequencedVerificationRunner:
         )
 
 
+@dataclass
+class PassingBaselineVerificationRunner:
+    subsequent: SequencedVerificationRunner
+    baseline_pending: bool = True
+
+    def run(
+        self,
+        command: VerificationProcessCommand,
+        *,
+        timeout_seconds: float | None,
+    ) -> VerificationProcessResult:
+        if self.baseline_pending:
+            self.baseline_pending = False
+            return VerificationProcessResult(
+                returncode=0,
+                stdout="baseline verification passed\n",
+                stderr="",
+            )
+        return self.subsequent.run(command, timeout_seconds=timeout_seconds)
+
+
 @pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
 def test_lifecycle_first_pass_success_reaches_ready_for_human(tmp_path):
     repo, ticket, config = workflow_inputs(tmp_path)
@@ -227,7 +254,7 @@ def test_lifecycle_first_pass_success_reaches_ready_for_human(tmp_path):
         ticket,
         runs_dir=tmp_path / "runs",
         codex_runner=codex,
-        verification_runner=verification,
+        verification_runner=PassingBaselineVerificationRunner(verification),
         clock=fixed_clock,
     )
 
@@ -278,7 +305,7 @@ def test_lifecycle_review_correction_is_verified_and_rereviewed(tmp_path):
         ticket,
         runs_dir=tmp_path / "runs",
         codex_runner=codex,
-        verification_runner=verification,
+        verification_runner=PassingBaselineVerificationRunner(verification),
         clock=fixed_clock,
     )
 
@@ -338,7 +365,7 @@ def test_lifecycle_verification_failure_drives_correction_without_review(tmp_pat
         ticket,
         runs_dir=tmp_path / "runs",
         codex_runner=codex,
-        verification_runner=verification,
+        verification_runner=PassingBaselineVerificationRunner(verification),
         clock=fixed_clock,
     )
 
@@ -385,7 +412,7 @@ def test_lifecycle_human_review_required_stops_at_human_required(tmp_path):
         ticket,
         runs_dir=tmp_path / "runs",
         codex_runner=codex,
-        verification_runner=verification,
+        verification_runner=PassingBaselineVerificationRunner(verification),
         clock=fixed_clock,
     )
 
@@ -443,7 +470,7 @@ def test_lifecycle_exhausts_shared_correction_limit_before_next_correction(tmp_p
         ticket,
         runs_dir=tmp_path / "runs",
         codex_runner=codex,
-        verification_runner=verification,
+        verification_runner=PassingBaselineVerificationRunner(verification),
         clock=fixed_clock,
     )
 
@@ -483,7 +510,7 @@ def test_lifecycle_git_safety_violation_stops_without_repair(
         ticket,
         runs_dir=tmp_path / "runs",
         codex_runner=codex,
-        verification_runner=verification,
+        verification_runner=PassingBaselineVerificationRunner(verification),
         clock=fixed_clock,
     )
 
@@ -527,7 +554,7 @@ def test_lifecycle_implementation_environment_pollution_stops_before_verificatio
         ticket,
         runs_dir=tmp_path / "runs",
         codex_runner=codex,
-        verification_runner=verification,
+        verification_runner=PassingBaselineVerificationRunner(verification),
         clock=fixed_clock,
     )
 
@@ -574,7 +601,9 @@ def test_lifecycle_started_writable_codex_failure_is_human_required(tmp_path):
         ticket,
         runs_dir=tmp_path / "runs",
         codex_runner=codex,
-        verification_runner=SequencedVerificationRunner(steps=[], calls=[]),
+        verification_runner=PassingBaselineVerificationRunner(
+            SequencedVerificationRunner(steps=[], calls=[])
+        ),
         clock=fixed_clock,
     )
 
@@ -631,7 +660,7 @@ def test_lifecycle_correction_environment_pollution_stops_before_reverification(
         ticket,
         runs_dir=tmp_path / "runs",
         codex_runner=codex,
-        verification_runner=verification,
+        verification_runner=PassingBaselineVerificationRunner(verification),
         clock=fixed_clock,
     )
 
@@ -692,7 +721,7 @@ def test_lifecycle_failed_correction_does_not_count_as_completed_round(tmp_path)
         ticket,
         runs_dir=tmp_path / "runs",
         codex_runner=codex,
-        verification_runner=verification,
+        verification_runner=PassingBaselineVerificationRunner(verification),
         clock=fixed_clock,
     )
 
@@ -723,7 +752,9 @@ def test_lifecycle_proven_codex_start_failure_without_changes_is_failed(tmp_path
         ticket,
         runs_dir=tmp_path / "runs",
         codex_runner=codex,
-        verification_runner=SequencedVerificationRunner(steps=[], calls=[]),
+        verification_runner=PassingBaselineVerificationRunner(
+            SequencedVerificationRunner(steps=[], calls=[])
+        ),
         clock=fixed_clock,
     )
 
@@ -747,7 +778,9 @@ def test_lifecycle_internal_exception_after_snapshot_is_failed(tmp_path):
         ticket,
         runs_dir=tmp_path / "runs",
         codex_runner=codex,
-        verification_runner=SequencedVerificationRunner(steps=[], calls=[]),
+        verification_runner=PassingBaselineVerificationRunner(
+            SequencedVerificationRunner(steps=[], calls=[])
+        ),
         clock=fixed_clock,
     )
 
@@ -778,7 +811,7 @@ def test_lifecycle_broken_verification_environment_is_human_required(tmp_path):
         ticket,
         runs_dir=tmp_path / "runs",
         codex_runner=codex,
-        verification_runner=verification,
+        verification_runner=PassingBaselineVerificationRunner(verification),
         clock=fixed_clock,
     )
 
@@ -814,7 +847,7 @@ def test_lifecycle_pass_with_advisory_findings_does_not_correct(tmp_path):
         ticket,
         runs_dir=tmp_path / "runs",
         codex_runner=codex,
-        verification_runner=verification,
+        verification_runner=PassingBaselineVerificationRunner(verification),
         clock=fixed_clock,
     )
 
@@ -852,9 +885,11 @@ def test_final_report_distinguishes_controller_facts_from_agent_claims(tmp_path)
         ticket,
         runs_dir=tmp_path / "runs",
         codex_runner=codex,
-        verification_runner=SequencedVerificationRunner(
-            steps=[VerificationStep()],
-            calls=[],
+        verification_runner=PassingBaselineVerificationRunner(
+            SequencedVerificationRunner(
+                steps=[VerificationStep()],
+                calls=[],
+            )
         ),
         clock=fixed_clock,
     )
@@ -907,9 +942,11 @@ def test_final_patch_is_complete_baseline_relative_diff_after_correction(tmp_pat
         ticket,
         runs_dir=tmp_path / "runs",
         codex_runner=codex,
-        verification_runner=SequencedVerificationRunner(
-            steps=[VerificationStep(), VerificationStep()],
-            calls=[],
+        verification_runner=PassingBaselineVerificationRunner(
+            SequencedVerificationRunner(
+                steps=[VerificationStep(), VerificationStep()],
+                calls=[],
+            )
         ),
         clock=fixed_clock,
     )

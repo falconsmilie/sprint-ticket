@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from ._verification_artifacts import _baseline_verification_evidence_problem
 from .audit import (
     changed_files_including_untracked as _changed_files_including_untracked,
 )
@@ -38,6 +39,7 @@ from .runs import (
     BASELINE_RECORD_FILE,
     RUN_RECORD_FILE,
     RUN_TICKET_FILE,
+    BaselineRecord,
     RunError,
     RunRecord,
     load_baseline_record,
@@ -135,11 +137,41 @@ def run_implementation_stage(
     if baseline_record.head_sha != run_record.baseline_sha:
         raise ImplementationError("Run record and baseline HEAD do not match.")
 
-    ticket_text = _read_snapshotted_ticket(run_path / RUN_TICKET_FILE)
     repository = GitRepository(Path(run_record.target_repository_path))
     implementation_dir = run_path / _IMPLEMENTATION_DIR_NAME
+    evidence_problem = _baseline_verification_evidence_problem(
+        run_path,
+        run_record,
+        baseline_record,
+        verification_commands=config.verification.commands,
+    )
+    if evidence_problem is not None:
+        return _finish(
+            run_record=run_record,
+            run_dir=run_path,
+            artifact_directory=implementation_dir,
+            execution=None,
+            agent_result=None,
+            safety_violations=(
+                _ImplementationSafetyViolation(
+                    name="baseline-verification",
+                    expected="persisted passing clean-baseline verification",
+                    actual=evidence_problem,
+                    message="Writable implementation is not authorized.",
+                ),
+            ),
+            changed_files=(),
+            patch_path=None,
+            diff_stats_path=None,
+            outcome=StageOutcome.HUMAN_REQUIRED,
+            controller_message=evidence_problem,
+        )
 
-    starting_violations = _inspect_starting_state(repository, run_record)
+    starting_violations = _inspect_starting_state(
+        repository,
+        run_record,
+        baseline_record,
+    )
     if starting_violations:
         return _finish(
             run_record=run_record,
@@ -155,6 +187,7 @@ def run_implementation_stage(
             controller_message="Repository no longer matches the clean implementation baseline.",
         )
 
+    ticket_text = _read_snapshotted_ticket(run_path / RUN_TICKET_FILE)
     active_record = run_record
     prompt = _render_implementation_prompt(ticket_text)
     environment_snapshot = capture_workspace_environment_snapshot(repository.path)
@@ -461,12 +494,30 @@ def _inspect_safety(
 def _inspect_starting_state(
     repository: GitRepository,
     run_record: RunRecord,
+    baseline_record: BaselineRecord,
 ) -> tuple[_ImplementationSafetyViolation, ...]:
-    return _inspect_safety(
-        repository,
-        run_record,
+    snapshot = WorkspaceSnapshot.capture(repository)
+    changes = list(
+        workspace_safety_changes(
+            snapshot,
+            expected_repository_path=run_record.target_repository_path,
+            expected_branch=run_record.starting_branch,
+            expected_head_sha=run_record.baseline_sha,
+            require_clean_worktree=True,
+        )
+    )
+    if snapshot.fingerprint != baseline_record.workspace_fingerprint:
+        changes.append(
+            WorkspaceChange(
+                name="baseline-workspace",
+                expected=baseline_record.workspace_fingerprint,
+                actual=snapshot.fingerprint,
+                message="Workspace no longer matches the verified clean baseline.",
+            )
+        )
+    return _implementation_changes(
+        tuple(changes),
         phase=_SafetyInspectionPhase.BEFORE_IMPLEMENTATION,
-        require_clean_worktree=True,
     )
 
 

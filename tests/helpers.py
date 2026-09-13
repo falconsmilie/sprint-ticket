@@ -5,7 +5,11 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
+from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ticket_automation.config import (
     DEFAULT_CODEX_MODEL,
@@ -17,6 +21,10 @@ from ticket_automation.config import (
     VerificationCommand,
     VerificationSettings,
 )
+
+if TYPE_CHECKING:
+    from ticket_automation.runs import RunCreationResult
+    from ticket_automation.verification import VerificationProcessRunner
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 GIT = shutil.which("git")
@@ -240,6 +248,49 @@ def make_config(
         ),
         source_files=(),
     )
+
+
+def create_trusted_prepared_run(
+    config: AppConfig,
+    ticket_path: Path | str,
+    *,
+    runs_dir: Path | str,
+    verification_runner: VerificationProcessRunner | None = None,
+    clock: Callable[[], datetime] | None = None,
+) -> RunCreationResult:
+    """Build a PREPARED run through the real baseline-verification boundary."""
+    from ticket_automation.models import WorkflowState
+    from ticket_automation.runs import create_run_snapshot, save_run_record
+    from ticket_automation.verification import (
+        VerificationProcessResult,
+        _run_baseline_verification_stage,
+    )
+
+    class PassingBaselineRunner:
+        def run(self, command, *, timeout_seconds):
+            del command, timeout_seconds
+            return VerificationProcessResult(returncode=0, stdout="", stderr="")
+
+    snapshot = create_run_snapshot(
+        config,
+        ticket_path,
+        runs_dir=runs_dir,
+        clock=clock,
+    )
+    verification = _run_baseline_verification_stage(
+        config,
+        snapshot.run_dir,
+        process_runner=verification_runner or PassingBaselineRunner(),
+        clock=clock,
+    )
+    if not verification.successful:
+        raise AssertionError(verification.controller_message)
+    prepared = verification.run_record.transition_to(
+        WorkflowState.PREPARED,
+        updated_timestamp=verification.round_result.ended_at,
+    )
+    save_run_record(prepared, snapshot.run_dir / "run.json")
+    return replace(snapshot, run_record=prepared)
 
 
 def write_preflight_config(

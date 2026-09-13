@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ._verification_artifacts import (
+    BASELINE_VERIFICATION_DIR_NAME,
+    BASELINE_VERIFICATION_JSON_FILE,
+)
 from .audit import (
     changed_files_including_untracked,
     diff_including_untracked,
@@ -225,6 +229,9 @@ def collect_report_context(
         run_path / IMPLEMENTATION_DIR_NAME / RESULT_JSON
     )
     verification_rounds = _read_numbered_json_files(run_path / VERIFICATION_DIR_NAME)
+    baseline_verification = _read_json_if_exists(
+        run_path / BASELINE_VERIFICATION_DIR_NAME / BASELINE_VERIFICATION_JSON_FILE
+    )
     review_results = _read_review_results(run_path)
     correction_ticket_paths = tuple(
         sorted(
@@ -260,6 +267,7 @@ def collect_report_context(
             "additions": additions,
             "deletions": deletions,
             "verification_rounds": verification_rounds,
+            "baseline_verification": baseline_verification,
             "review_results": review_results,
             "workspace_guard_inspections": workspace_guard_inspections,
             "correction_ticket_paths": correction_ticket_paths,
@@ -296,6 +304,7 @@ def render_final_report(
     safety: GitSafetyStatus = controller["git_safety"]
     implementation = agent["implementation"]
     final_review = controller["final_review"]
+    baseline_verification = controller["baseline_verification"]
 
     lines = [
         f"# {record.ticket_id} final report",
@@ -378,6 +387,14 @@ def render_final_report(
             "",
             "### Deterministic verification",
             "",
+            (
+                "- Clean baseline verification: "
+                + (
+                    str(baseline_verification.get("status", "UNKNOWN"))
+                    if isinstance(baseline_verification, dict)
+                    else "NOT RUN"
+                )
+            ),
             f"- Verification rounds: {len(controller['verification_rounds'])}",
         ]
     )

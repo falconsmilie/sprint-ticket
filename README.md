@@ -68,7 +68,7 @@ Create a persistent run record from a local Markdown ticket and run the complete
 python -m ticket_automation run tickets/example.md
 ```
 
-The `run` command performs preflight, copies the ticket verbatim into `runs/<run-id>/ticket.md`, records the starting branch and baseline HEAD SHA, invokes Codex with a `workspace-write` sandbox for implementation, runs all configured deterministic verification commands, and invokes a fresh Codex reviewer with a `read-only` sandbox when verification passes. A passing review transitions through `REPORTING`, writes `diffs/final.patch` and `final-report.md`, then reaches `READY_FOR_HUMAN` only if final verification, review, and Git safety evidence still hold.
+The `run` command performs preflight, copies the ticket verbatim into `runs/<run-id>/ticket.md`, records the starting branch and clean workspace fingerprint, and runs all configured deterministic verification commands against that clean baseline. Only a passing baseline advances to `PREPARED` and permits Codex to start with a `workspace-write` sandbox. After implementation, the same commands run again against the changed workspace, followed by a fresh Codex reviewer with a `read-only` sandbox when verification passes. A passing review transitions through `REPORTING`, writes `diffs/final.patch` and `final-report.md`, then reaches `READY_FOR_HUMAN` only if final verification, review, and Git safety evidence still hold.
 
 List known run records:
 
@@ -103,7 +103,7 @@ The target repository must start clean. TicketAutomation deliberately does not s
 
 Run snapshots are stored under `runs/`. A run ID uses a timestamp plus a sanitized ticket identifier, such as `20260911-130512_QDEB-003`. Existing run directories are not overwritten; a numeric suffix is added if a timestamp collision occurs.
 
-Each run directory contains `run.json`, `ticket.md`, and `baseline.json`. These records are enough to reconstruct the original ticket boundary for later workflow stages: the original ticket path, the copied ticket path, the target repository path, the starting branch, the baseline HEAD SHA, one explicit current state, correction and review round counters, the effective Codex model and reasoning effort, timestamps, and a terminal reason when the run reaches `HUMAN_REQUIRED` or `FAILED`.
+Each run directory contains `run.json`, `ticket.md`, `baseline.json`, and `baseline-verification/verification.json` plus its human-readable log. These records reconstruct the original ticket boundary for later workflow stages: ticket, verification-command, and canonical workspace fingerprints; target repository path; starting branch; baseline HEAD SHA; one explicit current state; correction and review round counters; effective Codex model and reasoning effort; timestamps; and a terminal reason when the run reaches `HUMAN_REQUIRED` or `FAILED`.
 
 A successful run also contains `diffs/final.patch` and `final-report.md`. The final patch is always relative to the original baseline SHA and the complete current working tree. The final report separates controller-observed facts from implementation-agent claims, so runner verification and Git evidence are not confused with agent-reported targeted tests.
 
@@ -113,6 +113,7 @@ A successful run also contains `diffs/final.patch` and `final-report.md`. The fi
 
 ```text
 PREPARING
+  -> run deterministic verification against the clean baseline
   -> PREPARED
   -> IMPLEMENTING
   -> VERIFYING
@@ -137,7 +138,7 @@ Python owns all orchestration decisions. Codex may edit source files during writ
 
 `resume <run-id>` resumes only from explicit checkpoints recorded in `run.json` and the run artifacts. It does not infer safety from a run directory alone. If implementation or correction was interrupted after a writable phase was marked active but before completion was proven, resume stops at `HUMAN_REQUIRED` and explains that the working tree may contain partial modifications.
 
-Read-only and deterministic checkpoints are recoverable when the repository still matches the recorded baseline and writable checkpoint. If deterministic verification finished writing a complete round artifact but `run.json` was not advanced, resume validates that artifact against the current run, round, repository state, and configured verification gates before adopting it. If a read-only review finished writing a valid `result.json` but `run.json` was not advanced, resume validates the saved prompt, controller checkpoint metadata, result schema, and repository invariants before adopting it. Partial verification or review artifacts are preserved under recovery artifact directories and the safe stage is rerun when the repository still matches the checkpoint. If repository contents changed after the evidence was written, resume does not reuse that evidence and stops for human inspection.
+Read-only and deterministic checkpoints are recoverable when the repository still matches the recorded baseline and writable checkpoint. An interrupted `PREPARING` run may rerun or adopt baseline verification only while the current canonical workspace, snapshotted ticket, and configured verification commands still match their recorded fingerprints. If deterministic verification finished writing a complete round artifact but `run.json` was not advanced, resume validates that artifact against the current run, round, repository state, and configured verification gates before adopting it. If a read-only review finished writing a valid `result.json` but `run.json` was not advanced, resume validates the saved prompt, controller checkpoint metadata, result schema, and repository invariants before adopting it. Partial verification or review artifacts are preserved under recovery artifact directories and the safe stage is rerun when the repository still matches the checkpoint. If repository contents changed after the evidence was written, resume does not reuse that evidence and stops for human inspection.
 
 ## Implementation Stage
 
@@ -154,6 +155,8 @@ When implementation completes and the safety checks pass, TicketAutomation captu
 TicketAutomation has two validation levels. Implementation-agent targeted validation is whatever the writable agent chose to run while doing the work. Those claims are kept in `runs/<run-id>/implementation/result.json` as implementation feedback.
 
 Runner deterministic acceptance gates are the configured `[[verification.commands]]` records. TicketAutomation runs those commands itself from the target repository directory, preserves stdout and stderr, and treats those results as authoritative for workflow acceptance. Commands are executed from argument arrays without a shell.
+
+Before implementation, the same runner writes `runs/<run-id>/baseline-verification/verification.json` and a status/timing summary in `verification.log`; command stdout and stderr are stored once in the JSON evidence. Its checkpoint is explicitly marked as the `PREPARING` stage and tied to the clean workspace and configured-command fingerprints. A failing baseline gate, execution error, incomplete repository inspection, or repository mutation stops at `HUMAN_REQUIRED`. Baseline failures never create correction reasons or corrective tickets, never invoke Codex, and are left untouched for human inspection.
 
 The first verification attempt writes `runs/<run-id>/verification/round-0.json` and `runs/<run-id>/verification/round-0.log`. Later correction rounds use `round-1`, `round-2`, and so on. A complete verification round includes checkpoint metadata tying it to the run, round, baseline, branch, source state, and configured verification gates that were used. Passing gates move the run to review. Failing gates move the run to `CORRECTION_PENDING` and produce typed `VerificationFailure` correction reasons. Environment or process execution problems, such as a missing executable or timeout, move the run to `HUMAN_REQUIRED` instead of asking a correction agent to rewrite source code for a broken local environment.
 

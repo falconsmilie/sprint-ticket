@@ -10,6 +10,7 @@ from typing import Any
 
 from ._verification_artifacts import (
     VERIFICATION_DIR_NAME,
+    _baseline_verification_evidence_problem,
     _read_verification_source_fingerprint,
     _VerificationArtifactError,
 )
@@ -227,6 +228,36 @@ def run_correction_stage(
             controller_message=(
                 "Maximum corrective rounds exhausted; human intervention is required."
             ),
+            advance_correction_round=False,
+        )
+
+    evidence_problem = _baseline_verification_evidence_problem(
+        run_path,
+        run_record,
+        baseline_record,
+        verification_commands=config.verification.commands,
+    )
+    if evidence_problem is not None:
+        return _finish(
+            run_record=run_record,
+            run_dir=run_path,
+            correction_round=correction_round,
+            ticket_path=None,
+            artifact_directory=artifact_directory,
+            execution=None,
+            agent_result=None,
+            safety_violations=(
+                CorrectionSafetyViolation(
+                    name="baseline-verification",
+                    expected="persisted passing clean-baseline verification",
+                    actual=evidence_problem,
+                    message="Writable correction is not authorized.",
+                ),
+            ),
+            correction_reasons=(),
+            patch_path=None,
+            outcome=StageOutcome.HUMAN_REQUIRED,
+            controller_message=evidence_problem,
             advance_correction_round=False,
         )
 

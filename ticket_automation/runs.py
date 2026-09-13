@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -11,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from ._verification_artifacts import _verification_commands_fingerprint
 from .config import (
     DEFAULT_CODEX_MODEL,
     DEFAULT_CODEX_REASONING_EFFORT,
@@ -24,7 +26,7 @@ from .models import WorkflowState, _validate_workflow_transition
 from .preflight import PreflightResult, run_preflight
 
 RUN_SCHEMA_VERSION = 2
-BASELINE_SCHEMA_VERSION = 1
+BASELINE_SCHEMA_VERSION = 2
 RUN_RECORD_FORMAT = "ticket_automation.run"
 BASELINE_RECORD_FORMAT = "ticket_automation.baseline"
 RUNS_DIR_NAME = "runs"
@@ -55,6 +57,9 @@ class BaselineRecord:
     clean_worktree: bool
     has_staged_files: bool
     staging_status: str
+    ticket_sha256: str
+    verification_commands_fingerprint: str
+    workspace_fingerprint: str
     snapshot_timestamp: str
     schema_version: int = BASELINE_SCHEMA_VERSION
     format: str = BASELINE_RECORD_FORMAT
@@ -65,6 +70,8 @@ class BaselineRecord:
         repository: GitRepository,
         *,
         snapshot_timestamp: str,
+        ticket_sha256: str,
+        verification_commands_fingerprint: str,
     ) -> BaselineRecord:
         snapshot = WorkspaceSnapshot.capture(repository)
         violations = workspace_safety_changes(
@@ -72,7 +79,8 @@ class BaselineRecord:
             expected_repository_path=repository.path,
             expected_branch=snapshot.branch,
             expected_head_sha=snapshot.head_sha or "<unknown>",
-            require_empty_staging=False,
+            require_empty_staging=True,
+            require_clean_worktree=True,
         )
         if violations:
             details = "; ".join(violation.message for violation in violations)
@@ -88,6 +96,9 @@ class BaselineRecord:
             clean_worktree=snapshot.worktree_clean and not has_staged_files,
             has_staged_files=has_staged_files,
             staging_status="dirty" if has_staged_files else "clean",
+            ticket_sha256=ticket_sha256,
+            verification_commands_fingerprint=verification_commands_fingerprint,
+            workspace_fingerprint=snapshot.fingerprint,
             snapshot_timestamp=snapshot_timestamp,
         )
 
@@ -101,6 +112,11 @@ class BaselineRecord:
             "clean_worktree": self.clean_worktree,
             "has_staged_files": self.has_staged_files,
             "staging_status": self.staging_status,
+            "ticket_sha256": self.ticket_sha256,
+            "verification_commands_fingerprint": (
+                self.verification_commands_fingerprint
+            ),
+            "workspace_fingerprint": self.workspace_fingerprint,
             "snapshot_timestamp": self.snapshot_timestamp,
         }
 
@@ -125,6 +141,12 @@ class BaselineRecord:
             clean_worktree=_require_bool(data, "clean_worktree"),
             has_staged_files=_require_bool(data, "has_staged_files"),
             staging_status=_require_string(data, "staging_status"),
+            ticket_sha256=_require_sha256(data, "ticket_sha256"),
+            verification_commands_fingerprint=_require_sha256(
+                data,
+                "verification_commands_fingerprint",
+            ),
+            workspace_fingerprint=_require_sha256(data, "workspace_fingerprint"),
             snapshot_timestamp=_require_string(data, "snapshot_timestamp"),
         )
 
@@ -258,7 +280,14 @@ def create_run_snapshot(
 
     repository = GitRepository(config.project.repo)
     timestamp = _timestamp(clock)
-    baseline_record = _capture_baseline(repository, snapshot_timestamp=timestamp)
+    baseline_record = _capture_baseline(
+        repository,
+        snapshot_timestamp=timestamp,
+        ticket_sha256=hashlib.sha256(source_ticket.contents).hexdigest(),
+        verification_commands_fingerprint=_verification_commands_fingerprint(
+            config.verification.commands
+        ),
+    )
     ticket_id = sanitize_ticket_id(source_ticket.path.stem)
     run_id, run_dir = _reserve_run_directory(Path(runs_dir), timestamp, ticket_id)
     run_ticket_path = run_dir / RUN_TICKET_FILE
@@ -288,12 +317,6 @@ def create_run_snapshot(
         _copy_ticket(source_ticket.contents, run_ticket_path)
         save_baseline_record(baseline_record, baseline_record_path)
 
-        snapshot_timestamp = _timestamp(clock)
-        run_record = run_record.transition_to(
-            WorkflowState.PREPARED,
-            updated_timestamp=snapshot_timestamp,
-        )
-        save_run_record(run_record, run_record_path)
     except Exception:
         _remove_incomplete_run_directory(run_dir)
         raise
@@ -432,11 +455,15 @@ def _capture_baseline(
     repository: GitRepository,
     *,
     snapshot_timestamp: str,
+    ticket_sha256: str,
+    verification_commands_fingerprint: str,
 ) -> BaselineRecord:
     try:
         return BaselineRecord.capture(
             repository,
             snapshot_timestamp=snapshot_timestamp,
+            ticket_sha256=ticket_sha256,
+            verification_commands_fingerprint=verification_commands_fingerprint,
         )
     except GitCommandError as error:
         raise RunError(f"Could not capture repository baseline: {error}") from error
@@ -632,6 +659,13 @@ def _require_bool(data: dict[str, Any], key: str) -> bool:
     value = data.get(key)
     if not isinstance(value, bool):
         raise RunError(f"Run record field must be a boolean: {key}")
+    return value
+
+
+def _require_sha256(data: dict[str, Any], key: str) -> str:
+    value = _require_string(data, key)
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise RunError(f"Run record field must be a lowercase SHA-256 digest: {key}")
     return value
 
 

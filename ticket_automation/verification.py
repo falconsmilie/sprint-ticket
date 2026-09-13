@@ -14,6 +14,15 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from ._verification_artifacts import (
+    BASELINE_VERIFICATION_DIR_NAME as _BASELINE_VERIFICATION_DIR_NAME,
+)
+from ._verification_artifacts import (
+    BASELINE_VERIFICATION_JSON_FILE as _BASELINE_VERIFICATION_JSON_FILE,
+)
+from ._verification_artifacts import (
+    BASELINE_VERIFICATION_LOG_FILE as _BASELINE_VERIFICATION_LOG_FILE,
+)
+from ._verification_artifacts import (
     VERIFICATION_CHECKPOINT_FORMAT,
     VERIFICATION_CHECKPOINT_SCHEMA_VERSION,
     VERIFICATION_DIR_NAME,
@@ -37,9 +46,13 @@ from .git_safety import (
 from .models import StageOutcome, WorkflowState
 from .process_output import decode_human_output
 from .runs import (
+    BASELINE_RECORD_FILE,
     RUN_RECORD_FILE,
+    RUN_TICKET_FILE,
+    BaselineRecord,
     RunError,
     RunRecord,
+    load_baseline_record,
     load_run_record,
 )
 
@@ -263,6 +276,177 @@ class VerificationStageResult:
         return self.outcome == StageOutcome.COMPLETED
 
 
+def _run_baseline_verification_stage(
+    config: AppConfig,
+    run_dir: Path | str,
+    *,
+    process_runner: VerificationProcessRunner | None = None,
+    clock: Callable[[], datetime] | None = None,
+) -> VerificationStageResult:
+    run_path = Path(run_dir)
+    run_record = load_run_record(run_path / RUN_RECORD_FILE)
+    if run_record.state != WorkflowState.PREPARING:
+        raise VerificationError(
+            "Baseline verification requires run state PREPARING; "
+            f"found {run_record.state.value}."
+        )
+
+    baseline_record = load_baseline_record(run_path / BASELINE_RECORD_FILE)
+    repository = GitRepository(Path(run_record.target_repository_path))
+    artifact_directory = run_path / _BASELINE_VERIFICATION_DIR_NAME
+    json_path = artifact_directory / _BASELINE_VERIFICATION_JSON_FILE
+    log_path = artifact_directory / _BASELINE_VERIFICATION_LOG_FILE
+
+    try:
+        repository_snapshot = WorkspaceSnapshot.capture(repository)
+        starting_violations = _baseline_starting_violations(
+            run_path=run_path,
+            run_record=run_record,
+            baseline_record=baseline_record,
+            repository_snapshot=repository_snapshot,
+            commands=config.verification.commands,
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        repository_snapshot = None
+        starting_violations = (
+            VerificationSafetyViolation(
+                name="repository-inspection",
+                expected="complete clean-baseline repository inspection",
+                actual=f"{type(error).__name__}: {error}",
+                message="Clean baseline repository inspection failed.",
+            ),
+        )
+
+    artifact_state = _verification_artifact_state(json_path, log_path)
+    if artifact_state == _VerificationArtifactState.COMPLETE:
+        if starting_violations:
+            return _finish_unadoptable_verification_checkpoint(
+                run_record=run_record,
+                run_dir=run_path,
+                artifact_directory=artifact_directory,
+                json_path=json_path,
+                log_path=log_path,
+                round_index=0,
+                reason=(
+                    "Existing baseline verification evidence cannot be adopted because "
+                    "the current workspace does not match the recorded clean baseline."
+                ),
+                clock=clock,
+            )
+        assert repository_snapshot is not None
+        existing_round, checkpoint_problem = _load_existing_verification_round(
+            json_path=json_path,
+            log_path=log_path,
+            run_record=run_record,
+            round_index=0,
+            repository_snapshot=repository_snapshot,
+            commands=config.verification.commands,
+            checkpoint_stage=WorkflowState.PREPARING,
+        )
+        if checkpoint_problem is None and existing_round is not None:
+            round_problem = _baseline_round_problem(
+                existing_round,
+                commands=config.verification.commands,
+                cwd=repository.path,
+            )
+            if round_problem is not None:
+                return _finish_unadoptable_verification_checkpoint(
+                    run_record=run_record,
+                    run_dir=run_path,
+                    artifact_directory=artifact_directory,
+                    json_path=json_path,
+                    log_path=log_path,
+                    round_index=0,
+                    reason=round_problem,
+                    clock=clock,
+                )
+            return _finish_baseline_verification_round(
+                run_record=run_record,
+                run_dir=run_path,
+                artifact_directory=artifact_directory,
+                round_result=existing_round,
+            )
+        return _finish_unadoptable_verification_checkpoint(
+            run_record=run_record,
+            run_dir=run_path,
+            artifact_directory=artifact_directory,
+            json_path=json_path,
+            log_path=log_path,
+            round_index=0,
+            reason=(
+                checkpoint_problem
+                or "Baseline verification evidence contains correction reasons."
+            ),
+            clock=clock,
+        )
+
+    if artifact_state == _VerificationArtifactState.PARTIAL:
+        if starting_violations:
+            return _finish_unadoptable_verification_checkpoint(
+                run_record=run_record,
+                run_dir=run_path,
+                artifact_directory=artifact_directory,
+                json_path=json_path,
+                log_path=log_path,
+                round_index=0,
+                reason=(
+                    "Partial baseline verification evidence cannot be retried because "
+                    "the current workspace does not match the recorded clean baseline."
+                ),
+                clock=clock,
+            )
+        _archive_incomplete_verification_artifacts(
+            artifact_directory=artifact_directory,
+            round_name="baseline",
+            json_path=json_path,
+            log_path=log_path,
+        )
+
+    if starting_violations:
+        round_result = _write_controller_error_round(
+            run_record=run_record,
+            round_index=0,
+            json_path=json_path,
+            log_path=log_path,
+            repository_snapshot=repository_snapshot,
+            commands=config.verification.commands,
+            safety_violations=starting_violations,
+            checkpoint_stage=WorkflowState.PREPARING,
+            clock=clock,
+        )
+        return _finish_baseline_verification_round(
+            run_record=run_record,
+            run_dir=run_path,
+            artifact_directory=artifact_directory,
+            round_result=round_result,
+        )
+
+    assert repository_snapshot is not None
+    round_result = _run_verification_round(
+        config.verification.commands,
+        cwd=repository.path,
+        round_index=0,
+        json_path=json_path,
+        log_path=log_path,
+        process_runner=process_runner,
+        repository=repository,
+        repository_snapshot=repository_snapshot,
+        baseline_sha=run_record.baseline_sha,
+        run_record=run_record,
+        checkpoint_stage=WorkflowState.PREPARING,
+        include_correction_reasons=False,
+        include_command_output_in_log=False,
+        capture_inspection_errors=True,
+        clock=clock,
+    )
+    return _finish_baseline_verification_round(
+        run_record=run_record,
+        run_dir=run_path,
+        artifact_directory=artifact_directory,
+        round_result=round_result,
+    )
+
+
 def run_verification_stage(
     config: AppConfig,
     run_dir: Path | str,
@@ -441,6 +625,120 @@ def _finish_verification_round(
     )
 
 
+def _finish_baseline_verification_round(
+    *,
+    run_record: RunRecord,
+    run_dir: Path,
+    artifact_directory: Path,
+    round_result: VerificationRound,
+) -> VerificationStageResult:
+    if round_result.safety_violations:
+        outcome = StageOutcome.HUMAN_REQUIRED
+        controller_message = (
+            "Baseline verification changed or could not inspect the clean repository; "
+            "human intervention is required."
+        )
+    elif round_result.errored_commands:
+        outcome = StageOutcome.HUMAN_REQUIRED
+        controller_message = (
+            "Baseline verification could not execute completely; human intervention "
+            "is required."
+        )
+    elif round_result.failed_commands:
+        outcome = StageOutcome.HUMAN_REQUIRED
+        controller_message = (
+            "The clean repository baseline failed deterministic verification; human "
+            "intervention is required."
+        )
+    elif round_result.correction_reasons:
+        outcome = StageOutcome.HUMAN_REQUIRED
+        controller_message = (
+            "Baseline verification evidence unexpectedly contains correction reasons; "
+            "human intervention is required."
+        )
+    elif not round_result.passed:
+        outcome = StageOutcome.HUMAN_REQUIRED
+        controller_message = (
+            "Baseline verification evidence is not a complete passing result; human "
+            "intervention is required."
+        )
+    else:
+        outcome = StageOutcome.COMPLETED
+        controller_message = (
+            "The clean repository baseline passed deterministic verification."
+        )
+
+    return VerificationStageResult(
+        run_dir=run_dir,
+        run_record=run_record,
+        outcome=outcome,
+        artifact_directory=artifact_directory,
+        round_result=round_result,
+        controller_message=controller_message,
+    )
+
+
+def _baseline_round_problem(
+    round_result: VerificationRound,
+    *,
+    commands: tuple[VerificationCommand, ...],
+    cwd: Path,
+) -> str | None:
+    if round_result.correction_reasons:
+        return "Baseline verification evidence contains correction reasons."
+
+    if not round_result.commands:
+        if (
+            round_result.status == VerificationStatus.ERROR
+            and round_result.safety_violations
+        ):
+            return None
+        return "Baseline verification evidence has an unexpected command set."
+
+    if len(round_result.commands) != len(commands):
+        return "Baseline verification evidence has an unexpected command set."
+
+    expected_cwd = cwd.resolve()
+    for result, command in zip(round_result.commands, commands, strict=True):
+        if (
+            result.name != command.name
+            or result.argv != command.argv
+            or result.cwd.resolve() != expected_cwd
+        ):
+            return (
+                "Baseline verification command evidence does not match configuration."
+            )
+        if result.status == VerificationStatus.PASS:
+            internally_consistent = (
+                result.exit_code == 0
+                and result.error_kind is None
+                and result.error_message is None
+            )
+        elif result.status == VerificationStatus.FAIL:
+            internally_consistent = (
+                result.exit_code is not None
+                and result.exit_code != 0
+                and result.error_kind is None
+                and result.error_message is None
+            )
+        else:
+            internally_consistent = (
+                result.exit_code is None
+                and result.error_kind is not None
+                and bool(result.error_message)
+            )
+        if not internally_consistent:
+            return "Baseline verification command evidence is internally inconsistent."
+
+    expected_status = _round_status(
+        round_result.commands,
+        safety_violations=round_result.safety_violations,
+    )
+    if round_result.status != expected_status:
+        return "Baseline verification result status is internally inconsistent."
+    return None
+
+
 def _finish_unadoptable_verification_checkpoint(
     *,
     run_record: RunRecord,
@@ -495,6 +793,43 @@ def run_verification_round(
     run_record: RunRecord | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> VerificationRound:
+    return _run_verification_round(
+        commands,
+        cwd=cwd,
+        round_index=round_index,
+        json_path=json_path,
+        log_path=log_path,
+        process_runner=process_runner,
+        repository=repository,
+        repository_snapshot=repository_snapshot,
+        baseline_sha=baseline_sha,
+        run_record=run_record,
+        checkpoint_stage=WorkflowState.VERIFYING,
+        include_correction_reasons=True,
+        include_command_output_in_log=True,
+        capture_inspection_errors=False,
+        clock=clock,
+    )
+
+
+def _run_verification_round(
+    commands: tuple[VerificationCommand, ...],
+    *,
+    cwd: Path,
+    round_index: int,
+    json_path: Path,
+    log_path: Path,
+    process_runner: VerificationProcessRunner | None,
+    repository: GitRepository | None,
+    repository_snapshot: WorkspaceSnapshot | None,
+    baseline_sha: str | None,
+    run_record: RunRecord | None,
+    checkpoint_stage: WorkflowState,
+    include_correction_reasons: bool,
+    include_command_output_in_log: bool,
+    capture_inspection_errors: bool,
+    clock: Callable[[], datetime] | None,
+) -> VerificationRound:
     runner = process_runner or SubprocessVerificationRunner()
     started = _utcnow(clock)
     command_results = tuple(
@@ -502,13 +837,34 @@ def run_verification_round(
         for command in commands
     )
     ended = _utcnow(clock)
-    safety_violations = _verification_safety_violations(
-        repository=repository,
-        repository_snapshot=repository_snapshot,
-        baseline_sha=baseline_sha,
-    )
+    if capture_inspection_errors:
+        try:
+            safety_violations = _verification_safety_violations(
+                repository=repository,
+                repository_snapshot=repository_snapshot,
+                baseline_sha=baseline_sha,
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            safety_violations = (
+                VerificationSafetyViolation(
+                    name="repository-inspection",
+                    expected="complete repository inspection after verification",
+                    actual=f"{type(error).__name__}: {error}",
+                    message="Repository inspection failed after verification.",
+                ),
+            )
+    else:
+        safety_violations = _verification_safety_violations(
+            repository=repository,
+            repository_snapshot=repository_snapshot,
+            baseline_sha=baseline_sha,
+        )
     status = _round_status(command_results, safety_violations=safety_violations)
-    correction_reasons = _correction_reasons(command_results, log_path=log_path)
+    correction_reasons = (
+        _correction_reasons(command_results, log_path=log_path)
+        if include_correction_reasons
+        else ()
+    )
     round_result = VerificationRound(
         round_index=round_index,
         started_at=_format_timestamp(started),
@@ -528,11 +884,16 @@ def run_verification_round(
                 round_index=round_index,
                 repository_snapshot=repository_snapshot,
                 commands=commands,
+                stage=checkpoint_stage,
             )
         ),
     )
     _write_json(json_path, round_result.to_dict())
-    _write_log(log_path, round_result)
+    _write_log(
+        log_path,
+        round_result,
+        include_command_output=include_command_output_in_log,
+    )
     return round_result
 
 
@@ -603,7 +964,6 @@ def _run_command(
             message=f"Could not start verification command: {error}",
             stderr=f"{error}\n",
         )
-
     ended = _utcnow(clock)
     status = (
         VerificationStatus.PASS if process.returncode == 0 else VerificationStatus.FAIL
@@ -704,6 +1064,100 @@ def _capture_starting_repository_snapshot(
     return snapshot, _verification_changes(changes)
 
 
+def _baseline_starting_violations(
+    *,
+    run_path: Path,
+    run_record: RunRecord,
+    baseline_record: BaselineRecord,
+    repository_snapshot: WorkspaceSnapshot,
+    commands: tuple[VerificationCommand, ...],
+) -> tuple[VerificationSafetyViolation, ...]:
+    changes = list(
+        workspace_safety_changes(
+            repository_snapshot,
+            expected_repository_path=run_record.target_repository_path,
+            expected_branch=run_record.starting_branch,
+            expected_head_sha=run_record.baseline_sha,
+            require_clean_worktree=True,
+        )
+    )
+    if baseline_record.branch != run_record.starting_branch:
+        changes.append(
+            WorkspaceChange(
+                name="baseline-branch",
+                expected=run_record.starting_branch,
+                actual=baseline_record.branch,
+                message="Run and baseline records disagree on the starting branch.",
+            )
+        )
+    if baseline_record.head_sha != run_record.baseline_sha:
+        changes.append(
+            WorkspaceChange(
+                name="baseline-HEAD",
+                expected=run_record.baseline_sha,
+                actual=baseline_record.head_sha,
+                message="Run and baseline records disagree on the baseline HEAD.",
+            )
+        )
+    if not baseline_record.clean_worktree or baseline_record.has_staged_files:
+        changes.append(
+            WorkspaceChange(
+                name="baseline-cleanliness",
+                expected="clean worktree and empty staging area",
+                actual=(
+                    f"clean_worktree={baseline_record.clean_worktree}, "
+                    f"has_staged_files={baseline_record.has_staged_files}"
+                ),
+                message="The recorded workspace baseline is not clean.",
+            )
+        )
+    if repository_snapshot.fingerprint != baseline_record.workspace_fingerprint:
+        changes.append(
+            WorkspaceChange(
+                name="baseline-workspace",
+                expected=baseline_record.workspace_fingerprint,
+                actual=repository_snapshot.fingerprint,
+                message="Current workspace does not match the recorded clean baseline.",
+            )
+        )
+
+    commands_fingerprint = _verification_commands_fingerprint(commands)
+    if commands_fingerprint != baseline_record.verification_commands_fingerprint:
+        changes.append(
+            WorkspaceChange(
+                name="baseline-verification-config",
+                expected=baseline_record.verification_commands_fingerprint,
+                actual=commands_fingerprint,
+                message="Configured verification commands changed after run creation.",
+            )
+        )
+
+    try:
+        ticket_fingerprint = hashlib.sha256(
+            (run_path / RUN_TICKET_FILE).read_bytes()
+        ).hexdigest()
+    except OSError as error:
+        changes.append(
+            WorkspaceChange(
+                name="baseline-ticket",
+                expected=baseline_record.ticket_sha256,
+                actual=f"unavailable: {error}",
+                message="Could not inspect the snapshotted ticket.",
+            )
+        )
+    else:
+        if ticket_fingerprint != baseline_record.ticket_sha256:
+            changes.append(
+                WorkspaceChange(
+                    name="baseline-ticket",
+                    expected=baseline_record.ticket_sha256,
+                    actual=ticket_fingerprint,
+                    message="Snapshotted ticket changed after run creation.",
+                )
+            )
+    return _verification_changes(tuple(changes))
+
+
 def _verification_safety_violations(
     *,
     repository: GitRepository | None,
@@ -739,6 +1193,7 @@ def _write_controller_error_round(
     repository_snapshot: WorkspaceSnapshot | None,
     commands: tuple[VerificationCommand, ...],
     safety_violations: tuple[VerificationSafetyViolation, ...],
+    checkpoint_stage: WorkflowState = WorkflowState.VERIFYING,
     clock: Callable[[], datetime] | None,
 ) -> VerificationRound:
     started = _utcnow(clock)
@@ -759,6 +1214,7 @@ def _write_controller_error_round(
             round_index=round_index,
             repository_snapshot=repository_snapshot,
             commands=commands,
+            stage=checkpoint_stage,
         ),
     )
     _write_json(json_path, round_result.to_dict())
@@ -787,6 +1243,7 @@ def _load_existing_verification_round(
     round_index: int,
     repository_snapshot: WorkspaceSnapshot,
     commands: tuple[VerificationCommand, ...],
+    checkpoint_stage: WorkflowState = WorkflowState.VERIFYING,
 ) -> tuple[VerificationRound | None, str | None]:
     try:
         data = json.loads(json_path.read_text(encoding="utf-8"))
@@ -801,6 +1258,7 @@ def _load_existing_verification_round(
         round_index=round_index,
         repository_snapshot=repository_snapshot,
         commands=commands,
+        checkpoint_stage=checkpoint_stage,
     )
     if metadata_problem is not None:
         return None, metadata_problem
@@ -826,6 +1284,7 @@ def _verification_checkpoint_problem(
     round_index: int,
     repository_snapshot: WorkspaceSnapshot,
     commands: tuple[VerificationCommand, ...],
+    checkpoint_stage: WorkflowState = WorkflowState.VERIFYING,
 ) -> str | None:
     if data.get("schema_version") != VERIFICATION_SCHEMA_VERSION:
         return "Existing verification artifact has an unsupported schema version."
@@ -843,6 +1302,7 @@ def _verification_checkpoint_problem(
         round_index=round_index,
         repository_snapshot=repository_snapshot,
         commands=commands,
+        stage=checkpoint_stage,
     )
     for key, expected_value in expected.items():
         if checkpoint.get(key) != expected_value:
@@ -926,11 +1386,12 @@ def _verification_checkpoint(
     round_index: int,
     repository_snapshot: WorkspaceSnapshot | None,
     commands: tuple[VerificationCommand, ...],
+    stage: WorkflowState = WorkflowState.VERIFYING,
 ) -> dict[str, Any]:
     checkpoint: dict[str, Any] = {
         "schema_version": VERIFICATION_CHECKPOINT_SCHEMA_VERSION,
         "format": VERIFICATION_CHECKPOINT_FORMAT,
-        "stage": WorkflowState.VERIFYING.value,
+        "stage": stage.value,
         "status": "COMPLETE",
         "run_id": run_record.run_id,
         "round_index": round_index,
@@ -1047,8 +1508,19 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
     _atomic_write_text(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
 
 
-def _write_log(path: Path, round_result: VerificationRound) -> None:
-    _atomic_write_text(path, _format_round_log(round_result))
+def _write_log(
+    path: Path,
+    round_result: VerificationRound,
+    *,
+    include_command_output: bool = True,
+) -> None:
+    _atomic_write_text(
+        path,
+        _format_round_log(
+            round_result,
+            include_command_output=include_command_output,
+        ),
+    )
 
 
 def _atomic_write_text(path: Path, contents: str) -> None:
@@ -1082,7 +1554,11 @@ def _atomic_write_text(path: Path, contents: str) -> None:
         raise
 
 
-def _format_round_log(round_result: VerificationRound) -> str:
+def _format_round_log(
+    round_result: VerificationRound,
+    *,
+    include_command_output: bool = True,
+) -> str:
     lines = [
         f"Verification round: round-{round_result.round_index}",
         f"Status: {round_result.status.value}",
@@ -1111,14 +1587,15 @@ def _format_round_log(round_result: VerificationRound) -> str:
             lines.append(f"Error kind: {command.error_kind.value}")
         if command.error_message:
             lines.append(f"Error message: {command.error_message}")
-        lines.extend(
-            [
-                "Stdout:",
-                command.stdout.rstrip("\n"),
-                "Stderr:",
-                command.stderr.rstrip("\n"),
-            ]
-        )
+        if include_command_output:
+            lines.extend(
+                [
+                    "Stdout:",
+                    command.stdout.rstrip("\n"),
+                    "Stderr:",
+                    command.stderr.rstrip("\n"),
+                ]
+            )
     if round_result.safety_violations:
         lines.append("")
         lines.append("Safety violations:")

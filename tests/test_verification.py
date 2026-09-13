@@ -8,7 +8,12 @@ from pathlib import Path
 
 import pytest
 
-from tests.helpers import GIT, create_git_repo, make_config
+from tests.helpers import (
+    GIT,
+    create_git_repo,
+    make_config,
+)
+from tests.helpers import create_trusted_prepared_run as create_run_snapshot
 from ticket_automation.config import VerificationCommand
 from ticket_automation.corrections import (
     CorrectionReasonKind,
@@ -18,7 +23,7 @@ from ticket_automation.corrections import (
 from ticket_automation.git import GitRepository
 from ticket_automation.git_safety import WorkspaceSnapshot
 from ticket_automation.models import StageOutcome, WorkflowState
-from ticket_automation.runs import create_run_snapshot, load_run_record, save_run_record
+from ticket_automation.runs import load_run_record, save_run_record
 from ticket_automation.verification import (
     SubprocessVerificationRunner,
     VerificationError,
@@ -433,6 +438,57 @@ def test_correction_reason_kinds_distinguish_review_findings():
         ).to_dict()["kind"]
         == "VerificationFailure"
     )
+
+
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for verification tests"
+)
+def test_unexpected_process_runner_bug_still_propagates(tmp_path):
+    repo, run_dir = implementation_ready_run(tmp_path)
+    config = make_config(repo)
+
+    class BrokenRunner:
+        def run(self, command, *, timeout_seconds):
+            del command, timeout_seconds
+            raise RuntimeError("runner contract bug")
+
+    with pytest.raises(RuntimeError, match="runner contract bug"):
+        run_verification_stage(
+            config,
+            run_dir,
+            process_runner=BrokenRunner(),
+            clock=fixed_clock,
+        )
+
+
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for verification tests"
+)
+def test_post_change_repository_inspection_bug_still_propagates(
+    tmp_path,
+    monkeypatch,
+):
+    repo, run_dir = implementation_ready_run(tmp_path)
+    config = make_config(repo)
+
+    class BreakEndingInspectionRunner:
+        def run(self, command, *, timeout_seconds):
+            del command, timeout_seconds
+
+            def fail_capture(repository):
+                del repository
+                raise RuntimeError("inspection contract bug")
+
+            monkeypatch.setattr(WorkspaceSnapshot, "capture", fail_capture)
+            return VerificationProcessResult(returncode=0, stdout="", stderr="")
+
+    with pytest.raises(RuntimeError, match="inspection contract bug"):
+        run_verification_stage(
+            config,
+            run_dir,
+            process_runner=BreakEndingInspectionRunner(),
+            clock=fixed_clock,
+        )
 
 
 def implementation_ready_run(tmp_path):

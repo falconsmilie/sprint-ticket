@@ -76,7 +76,7 @@ def test_valid_run_directory_creation(tmp_path):
     assert result.run_dir.joinpath("run.json").is_file()
     assert result.run_dir.joinpath("ticket.md").is_file()
     assert result.run_dir.joinpath("baseline.json").is_file()
-    assert result.run_record.state == WorkflowState.PREPARED
+    assert result.run_record.state == WorkflowState.PREPARING
     assert "last_completed_state" not in json.loads(
         result.run_dir.joinpath("run.json").read_text(encoding="utf-8")
     )
@@ -270,6 +270,35 @@ def test_baseline_record_rejects_unsupported_schema_metadata(
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
+@pytest.mark.parametrize(
+    "field",
+    [
+        "ticket_sha256",
+        "verification_commands_fingerprint",
+        "workspace_fingerprint",
+    ],
+)
+@pytest.mark.parametrize("value", ["too-short", "A" * 64, "g" * 64])
+def test_baseline_record_rejects_invalid_sha256_evidence(tmp_path, field, value):
+    repo = create_git_repo(tmp_path / "repo")
+    ticket = tmp_path / "QDEB-003.md"
+    ticket.write_text("# Ticket\n", encoding="utf-8")
+    result = create_run_snapshot(
+        make_config(repo),
+        ticket,
+        runs_dir=tmp_path / "runs",
+        clock=fixed_clock,
+    )
+    record_path = result.run_dir / "baseline.json"
+    data = json.loads(record_path.read_text(encoding="utf-8"))
+    data[field] = value
+    record_path.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(RunError, match="lowercase SHA-256 digest"):
+        load_baseline_record(record_path)
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
 def test_record_schema_metadata_uses_current_supported_formats(tmp_path):
     repo = create_git_repo(tmp_path / "repo")
     ticket = tmp_path / "QDEB-003.md"
@@ -290,7 +319,7 @@ def test_record_schema_metadata_uses_current_supported_formats(tmp_path):
 
     assert run_data["schema_version"] == 2
     assert run_data["format"] == RUN_RECORD_FORMAT
-    assert baseline_data["schema_version"] == 1
+    assert baseline_data["schema_version"] == 2
     assert baseline_data["format"] == BASELINE_RECORD_FORMAT
 
 
@@ -535,7 +564,7 @@ def test_atomic_run_persistence_keeps_previous_record_when_replace_fails(
     record_path = result.run_dir / "run.json"
     original_record = result.run_record
     changed_record = original_record.transition_to(
-        WorkflowState.IMPLEMENTING,
+        WorkflowState.PREPARED,
         updated_timestamp="2026-09-11T13:05:13Z",
     )
 
@@ -570,7 +599,7 @@ def test_status_can_read_multiple_run_records(tmp_path):
     records = list_run_records(runs_dir)
 
     assert {record.ticket_id for record in records} == {"QDEB-003", "QDEB-004"}
-    assert {record.state for record in records} == {WorkflowState.PREPARED}
+    assert {record.state for record in records} == {WorkflowState.PREPARING}
 
 
 def test_ticket_id_is_sanitized_for_paths():
