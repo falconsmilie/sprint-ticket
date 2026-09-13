@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+import ticket_automation.implementation as implementation_module
+import ticket_automation.writable_attempts as writable_attempts_module
 from tests.helpers import (
     GIT,
     create_git_repo,
@@ -25,7 +27,12 @@ from ticket_automation.implementation import (
 from ticket_automation.implementation import (
     run_implementation_stage as execute_implementation_stage,
 )
-from ticket_automation.models import StageOutcome, WorkflowState
+from ticket_automation.models import (
+    StageOutcome,
+    StopCategory,
+    StopReason,
+    WorkflowState,
+)
 from ticket_automation.review import (
     ReviewStageResult,
     ReviewVerdict,
@@ -121,6 +128,15 @@ def persist_stage_result(result):
             WorkflowState.VERIFYING: WorkflowState.REVIEWING,
             WorkflowState.REVIEWING: WorkflowState.REPORTING,
         }[run_record.state]
+    stop_reason = (
+        StopReason(
+            category=StopCategory.HUMAN_JUDGMENT_REQUIRED,
+            message=result.controller_message,
+            retryable=False,
+        )
+        if state in {WorkflowState.HUMAN_REQUIRED, WorkflowState.FAILED}
+        else None
+    )
     updated_record = run_record.transition_to(
         state,
         updated_timestamp="2026-09-11T13:05:17Z",
@@ -129,11 +145,8 @@ def persist_stage_result(result):
             if run_record.state == WorkflowState.REVIEWING
             else None
         ),
-        terminal_reason=(
-            result.controller_message
-            if state in {WorkflowState.HUMAN_REQUIRED, WorkflowState.FAILED}
-            else None
-        ),
+        terminal_reason=None if stop_reason is None else stop_reason.message,
+        stop_reason=stop_reason,
     )
     save_run_record(updated_record, Path(result.run_dir) / "run.json")
     return replace(result, run_record=updated_record)
@@ -417,6 +430,10 @@ def test_lifecycle_human_review_required_stops_at_human_required(tmp_path):
     )
 
     assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.run_record.stop_reason is not None
+    assert (
+        result.run_record.stop_reason.category == StopCategory.HUMAN_JUDGMENT_REQUIRED
+    )
     assert result.run_record.current_correction_round == 0
     assert result.run_record.current_review_round == 1
     assert result.correction_results == ()
@@ -726,6 +743,8 @@ def test_lifecycle_failed_correction_does_not_count_as_completed_round(tmp_path)
     )
 
     assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.run_record.stop_reason is not None
+    assert result.run_record.stop_reason.category == StopCategory.REPOSITORY_UNCERTAIN
     assert result.run_record.current_correction_round == 0
     assert result.run_record.current_review_round == 0
     assert result.review_results == ()
@@ -759,10 +778,79 @@ def test_lifecycle_proven_codex_start_failure_without_changes_is_failed(tmp_path
     )
 
     assert result.run_record.state == WorkflowState.FAILED
+    assert result.run_record.stop_reason is not None
+    assert result.run_record.stop_reason.category == StopCategory.EXTERNAL_TOOL_FAILURE
+    assert result.run_record.stop_reason.retryable is True
+    persisted = json.loads(
+        result.run_dir.joinpath("run.json").read_text(encoding="utf-8")
+    )
+    assert persisted["stop_reason"] == {
+        "category": "EXTERNAL_TOOL_FAILURE",
+        "message": result.run_record.terminal_reason,
+        "retryable": True,
+    }
     assert "Codex executable is unavailable" in result.run_record.terminal_reason
     assert result.verification_results == ()
     assert result.review_results == ()
     assert result.correction_results == ()
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_malformed_writable_result_requires_human_and_persists_uncertainty(tmp_path):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+    malformed_result = implementation_result()
+    malformed_result["status"] = "UNSUPPORTED"
+
+    result = run_ticket_lifecycle(
+        config,
+        ticket,
+        runs_dir=tmp_path / "runs",
+        codex_runner=SequencedCodexRunner(
+            steps=[CodexStep(result=malformed_result)],
+            calls=[],
+        ),
+        verification_runner=PassingBaselineVerificationRunner(
+            SequencedVerificationRunner(steps=[], calls=[])
+        ),
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.run_record.stop_reason is not None
+    assert result.run_record.stop_reason.category == StopCategory.REPOSITORY_UNCERTAIN
+    assert result.run_record.stop_reason.retryable is False
+    execution = json.loads(
+        result.run_dir.joinpath("implementation", "execution.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert execution["failure_kind"] == "INVALID_STRUCTURED_RESULT"
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_blocked_writable_result_requires_human_judgment(tmp_path):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+
+    result = run_ticket_lifecycle(
+        config,
+        ticket,
+        runs_dir=tmp_path / "runs",
+        codex_runner=SequencedCodexRunner(
+            steps=[CodexStep(result=implementation_result(status="BLOCKED"))],
+            calls=[],
+        ),
+        verification_runner=PassingBaselineVerificationRunner(
+            SequencedVerificationRunner(steps=[], calls=[])
+        ),
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.run_record.stop_reason is not None
+    assert (
+        result.run_record.stop_reason.category == StopCategory.HUMAN_JUDGMENT_REQUIRED
+    )
+    assert result.run_record.stop_reason.retryable is False
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
@@ -785,9 +873,155 @@ def test_lifecycle_internal_exception_after_snapshot_is_failed(tmp_path):
     )
 
     assert result.run_record.state == WorkflowState.FAILED
+    assert result.run_record.stop_reason is not None
+    assert result.run_record.stop_reason.category == StopCategory.CONTROLLER_FAILURE
+    assert result.run_record.stop_reason.retryable is False
     assert result.controller_error == result.run_record.terminal_reason
     assert "Internal TicketAutomation exception" in result.run_record.terminal_reason
     assert "synthetic internal failure" in result.run_record.terminal_reason
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_unexpected_writable_exception_after_changed_workspace_requires_human(tmp_path):
+    repo, ticket, config = workflow_inputs(tmp_path)
+
+    def mutate_then_fail(cwd: Path) -> None:
+        cwd.joinpath("file.txt").write_text(
+            "partial implementation\n", encoding="utf-8"
+        )
+        raise RuntimeError("synthetic failure after mutation")
+
+    result = run_ticket_lifecycle(
+        config,
+        ticket,
+        runs_dir=tmp_path / "runs",
+        codex_runner=SequencedCodexRunner(
+            steps=[CodexStep(mutation=mutate_then_fail)],
+            calls=[],
+        ),
+        verification_runner=PassingBaselineVerificationRunner(
+            SequencedVerificationRunner(steps=[VerificationStep()], calls=[])
+        ),
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.run_record.stop_reason is not None
+    assert result.run_record.stop_reason.category == StopCategory.REPOSITORY_UNCERTAIN
+    assert result.run_record.stop_reason.retryable is False
+    assert repo.joinpath("file.txt").read_text(encoding="utf-8") == (
+        "partial implementation\n"
+    )
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_unexpected_writable_exception_before_process_start_is_failed(
+    monkeypatch, tmp_path
+):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+
+    def fail_before_process(**_kwargs):
+        raise RuntimeError("synthetic failure before process start")
+
+    monkeypatch.setattr(implementation_module, "execute_codex", fail_before_process)
+
+    result = run_ticket_lifecycle(
+        config,
+        ticket,
+        runs_dir=tmp_path / "runs",
+        verification_runner=PassingBaselineVerificationRunner(
+            SequencedVerificationRunner(steps=[], calls=[])
+        ),
+        clock=fixed_clock,
+    )
+
+    attempt = json.loads(
+        result.run_dir.joinpath("writable-attempts", "implementation.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert attempt["process_started"] is False
+    assert result.run_record.state == WorkflowState.FAILED
+    assert result.run_record.stop_reason is not None
+    assert result.run_record.stop_reason.category == StopCategory.CONTROLLER_FAILURE
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_failed_post_writable_inspection_requires_human(monkeypatch, tmp_path):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+    original_capture = writable_attempts_module.WorkspaceSnapshot.capture
+    writable_process_failed = False
+
+    def capture_snapshot(repository):
+        if writable_process_failed:
+            raise OSError("synthetic post-call inspection failure")
+        return original_capture(repository)
+
+    def fail_after_writable_process_start(_cwd):
+        nonlocal writable_process_failed
+        writable_process_failed = True
+        raise RuntimeError("synthetic process failure")
+
+    monkeypatch.setattr(
+        writable_attempts_module.WorkspaceSnapshot,
+        "capture",
+        capture_snapshot,
+    )
+
+    result = run_ticket_lifecycle(
+        config,
+        ticket,
+        runs_dir=tmp_path / "runs",
+        codex_runner=SequencedCodexRunner(
+            steps=[CodexStep(mutation=fail_after_writable_process_start)],
+            calls=[],
+        ),
+        verification_runner=PassingBaselineVerificationRunner(
+            SequencedVerificationRunner(steps=[], calls=[])
+        ),
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.run_record.stop_reason is not None
+    assert result.run_record.stop_reason.category == StopCategory.REPOSITORY_UNCERTAIN
+    assert "post-call inspection failure" in result.run_record.terminal_reason
+    attempt = json.loads(
+        result.run_dir.joinpath("writable-attempts", "implementation.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert attempt["after_snapshot"] is None
+    assert "post-call inspection failure" in attempt["after_error"]
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_read_only_review_failure_is_a_retryable_safe_stop(tmp_path):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+    result = run_ticket_lifecycle(
+        config,
+        ticket,
+        runs_dir=tmp_path / "runs",
+        codex_runner=SequencedCodexRunner(
+            steps=[
+                CodexStep(
+                    result=implementation_result(),
+                    mutation=write_file("implemented\n"),
+                ),
+                CodexStep(returncode=2, stderr="review service failed"),
+            ],
+            calls=[],
+        ),
+        verification_runner=PassingBaselineVerificationRunner(
+            SequencedVerificationRunner(steps=[VerificationStep()], calls=[])
+        ),
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.FAILED
+    assert result.run_record.stop_reason is not None
+    assert result.run_record.stop_reason.category == StopCategory.EXTERNAL_TOOL_FAILURE
+    assert result.run_record.stop_reason.retryable is True
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
@@ -1682,14 +1916,20 @@ def test_resume_terminal_run_does_not_regenerate_report_artifacts(
     }[terminal_state]
     run_record = snapshot.run_record
     for state in transition_path:
+        stop_reason = (
+            StopReason(
+                category=StopCategory.CONTROLLER_FAILURE,
+                message="synthetic terminal reason",
+                retryable=False,
+            )
+            if state in {WorkflowState.HUMAN_REQUIRED, WorkflowState.FAILED}
+            else None
+        )
         run_record = run_record.transition_to(
             state,
             updated_timestamp="2026-09-11T13:05:17Z",
-            terminal_reason=(
-                "synthetic terminal reason"
-                if state in {WorkflowState.HUMAN_REQUIRED, WorkflowState.FAILED}
-                else None
-            ),
+            terminal_reason=None if stop_reason is None else stop_reason.message,
+            stop_reason=stop_reason,
         )
     save_run_record(run_record, snapshot.run_dir / "run.json")
     final_patch = snapshot.run_dir / "diffs" / "final.patch"

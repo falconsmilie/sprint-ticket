@@ -522,7 +522,7 @@ def test_oversized_logs_are_not_blindly_embedded(tmp_path):
 @pytest.mark.skipif(
     GIT is None, reason="git executable is required for correction tests"
 )
-def test_codex_boundary_failure_requires_human_with_canonical_execution_artifact(
+def test_unchanged_codex_boundary_failure_is_safely_failed_with_canonical_artifact(
     tmp_path,
 ):
     _repo, run_dir, config = review_correct_run(tmp_path)
@@ -535,16 +535,15 @@ def test_codex_boundary_failure_requires_human_with_canonical_execution_artifact
         artifact_dir.joinpath("execution.json").read_text(encoding="utf-8")
     )
     assert runner.calls == 1
-    assert result.outcome == StageOutcome.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.FAILED
     assert artifact_dir.joinpath("prompt.md").is_file()
     assert artifact_dir.joinpath("events.jsonl").is_file()
     assert artifact_dir.joinpath("stderr.log").is_file()
     assert not artifact_dir.joinpath("result.json").exists()
     assert result.patch_path == run_dir / "diffs" / "failed-correction-1.patch"
     assert result.patch_path.is_file()
-    assert "worktree" in {violation.name for violation in result.safety_violations}
-    assert "Process started: yes" in result.controller_message
-    assert "Execution metadata:" in result.controller_message
+    assert result.safety_violations == ()
+    assert result.controller_message == "Codex exited with code 2."
     assert execution_record["status"] == "FAILED"
     assert execution_record["failure_kind"] == CodexFailureKind.NON_ZERO_EXIT.value
     assert execution_record["process_exit_code"] == 2

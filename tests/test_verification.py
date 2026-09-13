@@ -22,7 +22,12 @@ from ticket_automation.corrections import (
 )
 from ticket_automation.git import GitRepository
 from ticket_automation.git_safety import WorkspaceSnapshot
-from ticket_automation.models import StageOutcome, WorkflowState
+from ticket_automation.models import (
+    StageOutcome,
+    StopCategory,
+    StopReason,
+    WorkflowState,
+)
 from ticket_automation.runs import load_run_record, save_run_record
 from ticket_automation.verification import (
     SubprocessVerificationRunner,
@@ -124,10 +129,21 @@ def test_one_passing_command_moves_run_to_verify_and_writes_round_zero(tmp_path)
 def test_verification_rejects_untrusted_starting_states(tmp_path, state):
     repo, run_dir = implementation_ready_run(tmp_path)
     run_record_path = run_dir / "run.json"
+    stop_reason = (
+        StopReason(
+            category=StopCategory.HUMAN_JUDGMENT_REQUIRED,
+            message="Synthetic terminal state for validation.",
+            retryable=False,
+        )
+        if state == WorkflowState.HUMAN_REQUIRED
+        else None
+    )
     run_record = replace(
         load_run_record(run_record_path),
         state=state,
         updated_timestamp="2026-09-11T13:05:15Z",
+        terminal_reason=None if stop_reason is None else stop_reason.message,
+        stop_reason=stop_reason,
     )
     save_run_record(run_record, run_record_path)
 

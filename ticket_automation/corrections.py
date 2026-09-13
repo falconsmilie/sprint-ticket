@@ -26,6 +26,7 @@ from .audit import (
 from .codex import (
     CodexExecution,
     CodexExecutionFailure,
+    CodexFailureKind,
     CodexProcessRunner,
     Sandbox,
 )
@@ -33,6 +34,7 @@ from .codex import (
     execute as execute_codex,
 )
 from .config import AppConfig, VerificationCommand
+from .failure_classification import classify_writable_failure
 from .git import GitCommandError, GitRepository
 from .git_safety import (
     WorkspaceChange,
@@ -41,7 +43,7 @@ from .git_safety import (
     _write_workspace_fingerprint,
     workspace_safety_changes,
 )
-from .models import StageOutcome, WorkflowState
+from .models import StageOutcome, StopCategory, WorkflowState
 from .runs import (
     BASELINE_RECORD_FILE,
     RUN_RECORD_FILE,
@@ -57,6 +59,11 @@ from .workspace_guard import (
     correction_guard_artifact_path,
     format_workspace_hygiene_violation,
     inspect_workspace_environment_change,
+)
+from .writable_attempts import (
+    WritableAttempt,
+    _track_writable_process_start,
+    capture_writable_attempt,
 )
 
 
@@ -322,6 +329,31 @@ def run_correction_stage(
         ),
     )
     environment_snapshot = capture_workspace_environment_snapshot(repository.path)
+    writable_attempt = capture_writable_attempt(
+        repository,
+        run_path,
+        operation=f"correction-round-{correction_round}",
+    )
+    if not writable_attempt.before_complete:
+        return _finish(
+            run_record=active_record,
+            run_dir=run_path,
+            correction_round=correction_round,
+            ticket_path=ticket_path,
+            artifact_directory=artifact_directory,
+            execution=None,
+            agent_result=None,
+            safety_violations=(),
+            correction_reasons=reasons,
+            patch_path=None,
+            workspace_guard=None,
+            outcome=StageOutcome.HUMAN_REQUIRED,
+            controller_message=(
+                "Could not capture a complete workspace snapshot before writable "
+                "correction."
+            ),
+            advance_correction_round=False,
+        )
 
     try:
         execution = execute_codex(
@@ -332,9 +364,10 @@ def run_correction_stage(
             artifact_directory=artifact_directory,
             executable=config.codex.executable,
             execution_config=config.codex.execution,
-            runner=codex_runner,
+            runner=_track_writable_process_start(codex_runner, writable_attempt),
         )
     except CodexExecutionFailure as error:
+        writable_attempt.record_process_started(error.execution.process_started)
         workspace_guard = inspect_workspace_environment_change(
             before=environment_snapshot,
             phase=WorkflowState.CORRECTING.value,
@@ -350,11 +383,29 @@ def run_correction_stage(
             active_record,
             round_number=correction_round,
             execution=error.execution,
+            writable_attempt=writable_attempt,
             workspace_guard=workspace_guard,
+        )
+        decision = classify_writable_failure(
+            repository,
+            attempt=writable_attempt,
+            message=error.execution.failure_message or str(error),
+            category_if_safe=StopCategory.EXTERNAL_TOOL_FAILURE,
+            retryable_if_safe=True,
+            malformed_result=error.kind
+            in {
+                CodexFailureKind.MISSING_STRUCTURED_RESULT,
+                CodexFailureKind.INVALID_STRUCTURED_RESULT,
+            },
+            untrusted_completion=error.kind
+            in {
+                CodexFailureKind.MALFORMED_EVENT_STREAM,
+                CodexFailureKind.TIMEOUT,
+            },
         )
         outcome = (
             StageOutcome.HUMAN_REQUIRED
-            if failed_audit.human_required
+            if decision.state == WorkflowState.HUMAN_REQUIRED
             else StageOutcome.FAILED
         )
         message = (
@@ -364,8 +415,8 @@ def run_correction_stage(
                 audit=failed_audit,
                 run_dir=run_path,
             )
-            if failed_audit.human_required
-            else error.execution.failure_message or str(error)
+            if outcome == StageOutcome.HUMAN_REQUIRED
+            else decision.reason.message
         )
         return _finish(
             run_record=active_record,
@@ -1170,6 +1221,7 @@ def _audit_failed_writable_invocation(
     *,
     round_number: int,
     execution: CodexExecution,
+    writable_attempt: WritableAttempt,
     workspace_guard: WorkspaceGuardInspection | None,
 ) -> _FailedWritableAudit:
     violations = list(
@@ -1195,7 +1247,10 @@ def _audit_failed_writable_invocation(
             )
         )
 
-    if changed_files:
+    if changed_files and _workspace_changed_since_writable_attempt(
+        repository,
+        writable_attempt,
+    ):
         violations.append(
             CorrectionSafetyViolation(
                 name="worktree",
@@ -1232,6 +1287,19 @@ def _audit_failed_writable_invocation(
         workspace_guard=workspace_guard,
         human_required=human_required,
     )
+
+
+def _workspace_changed_since_writable_attempt(
+    repository: GitRepository,
+    writable_attempt: WritableAttempt,
+) -> bool:
+    before = writable_attempt.before_snapshot
+    if before is None:
+        return True
+    try:
+        return not before.matches(WorkspaceSnapshot.capture(repository))
+    except (GitCommandError, OSError, RuntimeError, ValueError):
+        return True
 
 
 def _failed_writable_message(

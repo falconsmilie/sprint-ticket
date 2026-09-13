@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Final
@@ -25,6 +26,36 @@ class StageOutcome(StrEnum):
     CORRECTION_REQUIRED = "CORRECTION_REQUIRED"
     HUMAN_REQUIRED = "HUMAN_REQUIRED"
     FAILED = "FAILED"
+
+
+class StopCategory(StrEnum):
+    """Stable classification for a terminal automation stop."""
+
+    PREPARATION_REJECTED = "PREPARATION_REJECTED"
+    BASELINE_FAILURE = "BASELINE_FAILURE"
+    EXTERNAL_TOOL_FAILURE = "EXTERNAL_TOOL_FAILURE"
+    VERIFICATION_INFRASTRUCTURE = "VERIFICATION_INFRASTRUCTURE"
+    SAFETY_VIOLATION = "SAFETY_VIOLATION"
+    REPOSITORY_UNCERTAIN = "REPOSITORY_UNCERTAIN"
+    HUMAN_JUDGMENT_REQUIRED = "HUMAN_JUDGMENT_REQUIRED"
+    CONTROLLER_FAILURE = "CONTROLLER_FAILURE"
+
+
+@dataclass(frozen=True)
+class StopReason:
+    """Persisted explanation for a non-successful terminal workflow state."""
+
+    category: StopCategory
+    message: str
+    retryable: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.category, StopCategory):
+            raise TypeError("Stop reason category must be a StopCategory value.")
+        if not isinstance(self.message, str) or not self.message.strip():
+            raise ValueError("Stop reason message must be a non-empty string.")
+        if not isinstance(self.retryable, bool):
+            raise TypeError("Stop reason retryable must be a boolean.")
 
 
 _ACTIVE_FAILURE_TRANSITIONS = frozenset(

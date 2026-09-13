@@ -20,6 +20,11 @@ from .corrections import (
     review_findings_from_result,
     run_correction_stage,
 )
+from .failure_classification import (
+    TerminalStop,
+    classify_stage_stop,
+    classify_unexpected_controller_failure,
+)
 from .git import GitCommandError, GitRepository
 from .git_safety import (
     WorkspaceSnapshot,
@@ -30,7 +35,7 @@ from .implementation import (
     run_implementation_stage,
 )
 from .locking import RepositoryRunLock, acquire_repository_run_lock
-from .models import StageOutcome, WorkflowState
+from .models import StageOutcome, StopCategory, StopReason, WorkflowState
 from .preflight import PreflightResult
 from .reporting import (
     ReportStageResult,
@@ -175,9 +180,10 @@ def _run_ticket_lifecycle_locked(
             clock=clock,
         )
     except RunError as error:
-        run_record = _mark_failed(
+        controller_error = str(error)
+        run_record = _mark_controller_exception(
             snapshot.run_dir,
-            terminal_reason=str(error),
+            controller_error=controller_error,
             clock=clock,
         )
         _update_repository_lock(repository_lock, run_record)
@@ -190,15 +196,15 @@ def _run_ticket_lifecycle_locked(
             verification_results=tuple(verification_results),
             review_results=tuple(review_results),
             correction_results=tuple(correction_results),
-            controller_error=str(error),
+            controller_error=controller_error,
         )
-    except Exception as error:  # noqa: BLE001 - internal errors must persist FAILED.
+    except Exception as error:  # noqa: BLE001 - terminal evidence must be persisted.
         controller_error = (
             f"Internal TicketAutomation exception: {type(error).__name__}: {error}"
         )
-        run_record = _mark_failed(
+        run_record = _mark_controller_exception(
             snapshot.run_dir,
-            terminal_reason=controller_error,
+            controller_error=controller_error,
             clock=clock,
         )
         _update_repository_lock(repository_lock, run_record)
@@ -342,6 +348,7 @@ def _resume_ticket_lifecycle_locked(
                 implementation_result.run_record,
                 implementation_result.outcome,
                 terminal_reason=implementation_result.controller_message,
+                stop_category=_implementation_stop_category(implementation_result),
                 clock=clock,
             )
             implementation_result = replace(
@@ -365,9 +372,10 @@ def _resume_ticket_lifecycle_locked(
             clock=clock,
         )
     except RunError as error:
-        run_record = _mark_failed(
+        controller_error = str(error)
+        run_record = _mark_controller_exception(
             run_dir,
-            terminal_reason=str(error),
+            controller_error=controller_error,
             clock=clock,
         )
         _update_repository_lock(repository_lock, run_record)
@@ -380,16 +388,16 @@ def _resume_ticket_lifecycle_locked(
             verification_results=tuple(verification_results),
             review_results=tuple(review_results),
             correction_results=tuple(correction_results),
-            controller_error=str(error),
+            controller_error=controller_error,
         )
-    except Exception as error:  # noqa: BLE001 - internal errors must persist FAILED.
+    except Exception as error:  # noqa: BLE001 - terminal evidence must be persisted.
         controller_error = (
             "Internal TicketAutomation exception during resume: "
             f"{type(error).__name__}: {error}"
         )
-        run_record = _mark_failed(
+        run_record = _mark_controller_exception(
             run_dir,
-            terminal_reason=controller_error,
+            controller_error=controller_error,
             clock=clock,
         )
         _update_repository_lock(repository_lock, run_record)
@@ -502,6 +510,7 @@ def _drive_lifecycle(
                 implementation_result.run_record,
                 implementation_result.outcome,
                 terminal_reason=implementation_result.controller_message,
+                stop_category=_implementation_stop_category(implementation_result),
                 clock=clock,
             )
             implementation_result = replace(
@@ -523,6 +532,7 @@ def _drive_lifecycle(
                 verification.run_record,
                 verification.outcome,
                 terminal_reason=verification.controller_message,
+                stop_category=_verification_stop_category(verification),
                 clock=clock,
             )
             verification = replace(verification, run_record=run_record)
@@ -542,6 +552,7 @@ def _drive_lifecycle(
                 review.run_record,
                 review.outcome,
                 terminal_reason=review.controller_message,
+                stop_category=_review_stop_category(review),
                 current_review_round=review.run_record.current_review_round + 1,
                 clock=clock,
             )
@@ -581,6 +592,7 @@ def _drive_lifecycle(
                 correction.run_record,
                 correction.outcome,
                 terminal_reason=correction.controller_message,
+                stop_category=_correction_stop_category(correction),
                 current_correction_round=(
                     correction.correction_round
                     if correction.advance_correction_round
@@ -668,12 +680,18 @@ def _complete_preparation(
                 f"{type(error).__name__}: {error}"
             ),
             clock=clock,
+            category=StopCategory.BASELINE_FAILURE,
         )
     return _persist_stage_outcome(
         run_dir,
         result.run_record,
         result.outcome,
         terminal_reason=result.controller_message,
+        stop_category=(
+            StopCategory.BASELINE_FAILURE
+            if result.outcome == StageOutcome.HUMAN_REQUIRED
+            else None
+        ),
         clock=clock,
     )
 
@@ -684,6 +702,7 @@ def _persist_stage_outcome(
     outcome: StageOutcome,
     *,
     terminal_reason: str,
+    stop_category: StopCategory | None = None,
     clock: Callable[[], datetime] | None,
     current_correction_round: int | None = None,
     current_review_round: int | None = None,
@@ -692,6 +711,7 @@ def _persist_stage_outcome(
         run_record,
         outcome,
         terminal_reason=terminal_reason,
+        stop_category=stop_category,
         clock=clock,
         current_correction_round=current_correction_round,
         current_review_round=current_review_round,
@@ -705,14 +725,30 @@ def _record_after_stage_outcome(
     outcome: StageOutcome,
     *,
     terminal_reason: str | None,
+    stop_category: StopCategory | None = None,
     clock: Callable[[], datetime] | None,
     current_correction_round: int | None = None,
     current_review_round: int | None = None,
 ) -> RunRecord:
+    stop_reason: StopReason | None = None
     if outcome == StageOutcome.HUMAN_REQUIRED:
-        state = WorkflowState.HUMAN_REQUIRED
+        stop = classify_stage_stop(
+            run_record,
+            outcome,
+            message=terminal_reason
+            or "The workflow stopped because human intervention is required.",
+            category=stop_category,
+        )
+        state = stop.state
+        stop_reason = stop.reason
     elif outcome == StageOutcome.FAILED:
-        state = WorkflowState.FAILED
+        stop = classify_stage_stop(
+            run_record,
+            outcome,
+            message=terminal_reason or "An external automation operation failed.",
+        )
+        state = stop.state
+        stop_reason = stop.reason
     elif outcome == StageOutcome.CORRECTION_REQUIRED and run_record.state in {
         WorkflowState.VERIFYING,
         WorkflowState.REVIEWING,
@@ -744,8 +780,65 @@ def _record_after_stage_outcome(
         updated_timestamp=_timestamp(clock),
         current_correction_round=current_correction_round,
         current_review_round=current_review_round,
-        terminal_reason=(terminal_reason if state in TERMINAL_STATES else None),
+        terminal_reason=(stop_reason.message if stop_reason is not None else None),
+        stop_reason=stop_reason,
     )
+
+
+def _implementation_stop_category(
+    result: ImplementationStageResult,
+) -> StopCategory | None:
+    if result.outcome != StageOutcome.HUMAN_REQUIRED:
+        return None
+    if (
+        result.codex_execution is not None
+        and result.codex_execution.failure_kind is not None
+    ):
+        return StopCategory.REPOSITORY_UNCERTAIN
+    if result.safety_violations or (
+        result.workspace_guard is not None and result.workspace_guard.has_violation
+    ):
+        return StopCategory.SAFETY_VIOLATION
+    if result.agent_result is not None:
+        return StopCategory.HUMAN_JUDGMENT_REQUIRED
+    return StopCategory.REPOSITORY_UNCERTAIN
+
+
+def _correction_stop_category(
+    result: CorrectionStageResult,
+) -> StopCategory | None:
+    if result.outcome != StageOutcome.HUMAN_REQUIRED:
+        return None
+    if (
+        result.codex_execution is not None
+        and result.codex_execution.failure_kind is not None
+    ):
+        return StopCategory.REPOSITORY_UNCERTAIN
+    if result.safety_violations or (
+        result.workspace_guard is not None and result.workspace_guard.has_violation
+    ):
+        return StopCategory.SAFETY_VIOLATION
+    if result.agent_result is not None:
+        return StopCategory.HUMAN_JUDGMENT_REQUIRED
+    return StopCategory.REPOSITORY_UNCERTAIN
+
+
+def _verification_stop_category(
+    result: VerificationStageResult,
+) -> StopCategory | None:
+    if result.outcome != StageOutcome.HUMAN_REQUIRED:
+        return None
+    if result.round_result.safety_violations:
+        return StopCategory.SAFETY_VIOLATION
+    return StopCategory.VERIFICATION_INFRASTRUCTURE
+
+
+def _review_stop_category(result: ReviewStageResult) -> StopCategory | None:
+    if result.outcome != StageOutcome.HUMAN_REQUIRED:
+        return None
+    if result.safety_violations:
+        return StopCategory.SAFETY_VIOLATION
+    return StopCategory.HUMAN_JUDGMENT_REQUIRED
 
 
 def _resume_preflight_problem(
@@ -1024,18 +1117,34 @@ def _read_json_dict(path: Path) -> dict[str, object] | None:
     return data if isinstance(data, dict) else None
 
 
-def _mark_failed(
+def _mark_controller_exception(
     run_dir: Path,
     *,
-    terminal_reason: str,
+    controller_error: str,
+    clock: Callable[[], datetime] | None,
+) -> RunRecord:
+    run_record = load_run_record(run_dir / RUN_RECORD_FILE)
+    stop = classify_unexpected_controller_failure(
+        run_dir,
+        run_record,
+        message=controller_error,
+    )
+    return _mark_terminal_stop(run_dir, stop=stop, clock=clock)
+
+
+def _mark_terminal_stop(
+    run_dir: Path,
+    *,
+    stop: TerminalStop,
     clock: Callable[[], datetime] | None,
 ) -> RunRecord:
     record_path = run_dir / RUN_RECORD_FILE
     run_record = load_run_record(record_path)
     updated_record = run_record.transition_to(
-        WorkflowState.FAILED,
+        stop.state,
         updated_timestamp=_timestamp(clock),
-        terminal_reason=terminal_reason,
+        terminal_reason=stop.reason.message,
+        stop_reason=stop.reason,
     )
     save_run_record(updated_record, record_path)
     return updated_record
@@ -1046,16 +1155,20 @@ def _mark_human_required(
     *,
     terminal_reason: str,
     clock: Callable[[], datetime] | None,
+    category: StopCategory = StopCategory.HUMAN_JUDGMENT_REQUIRED,
 ) -> RunRecord:
-    record_path = run_dir / RUN_RECORD_FILE
-    run_record = load_run_record(record_path)
-    updated_record = run_record.transition_to(
-        WorkflowState.HUMAN_REQUIRED,
-        updated_timestamp=_timestamp(clock),
-        terminal_reason=terminal_reason,
+    return _mark_terminal_stop(
+        run_dir,
+        stop=TerminalStop(
+            state=WorkflowState.HUMAN_REQUIRED,
+            reason=StopReason(
+                category=category,
+                message=terminal_reason,
+                retryable=False,
+            ),
+        ),
+        clock=clock,
     )
-    save_run_record(updated_record, record_path)
-    return updated_record
 
 
 def _terminal_label(state: WorkflowState) -> str:

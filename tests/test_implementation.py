@@ -19,6 +19,8 @@ from ticket_automation.codex import (
     CodexCommand,
     CodexFailureKind,
     CodexProcessResult,
+    CodexProcessTimedOut,
+    CodexProcessTimeout,
     CodexResultValidationError,
     Sandbox,
     validate_json_schema,
@@ -27,7 +29,12 @@ from ticket_automation.implementation import (
     ImplementationError,
     run_implementation_stage,
 )
-from ticket_automation.models import StageOutcome, WorkflowState
+from ticket_automation.models import (
+    StageOutcome,
+    StopCategory,
+    StopReason,
+    WorkflowState,
+)
 from ticket_automation.runs import load_run_record, save_run_record
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -285,6 +292,12 @@ def test_wrong_run_state_is_rejected_before_invocation(tmp_path):
     run_record = load_run_record(run_record_path).transition_to(
         WorkflowState.HUMAN_REQUIRED,
         updated_timestamp="2026-09-11T13:05:14Z",
+        terminal_reason="Synthetic human stop.",
+        stop_reason=StopReason(
+            category=StopCategory.HUMAN_JUDGMENT_REQUIRED,
+            message="Synthetic human stop.",
+            retryable=False,
+        ),
     )
     save_run_record(run_record, run_record_path)
 
@@ -591,20 +604,19 @@ def test_preexisting_ignored_environment_does_not_block_implementation(tmp_path)
 @pytest.mark.skipif(
     GIT is None, reason="git executable is required for implementation tests"
 )
-def test_started_process_failure_becomes_human_required(tmp_path):
+def test_unchanged_started_process_failure_is_safely_failed(tmp_path):
     _repo, run_dir, config = snapshot(tmp_path)
     runner = MutatingRunner(returncode=2, stderr="boom\n")
 
     result = run_implementation_stage(config, run_dir, codex_runner=runner)
 
-    assert result.outcome == StageOutcome.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.FAILED
     assert result.codex_execution.failure_message == "Codex exited with code 2."
     assert result.codex_execution.process_started is True
     assert (
         result.codex_execution.stderr_log_path.read_text(encoding="utf-8") == "boom\n"
     )
-    assert "Process started: yes" in result.controller_message
-    assert "may have left partial source changes" in result.controller_message
+    assert result.controller_message == "Codex exited with code 2."
     assert result.patch_path == run_dir / DIFFS_DIR / "failed-implementation.patch"
     assert result.patch_path.is_file()
     execution_record = json.loads(
@@ -677,6 +689,39 @@ def test_started_untrusted_completion_without_changes_is_human_required(tmp_path
         == CodexFailureKind.MISSING_STRUCTURED_RESULT
     )
     assert "Process started: yes" in result.controller_message
+
+
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
+def test_writable_timeout_after_process_start_requires_human_even_if_unchanged(
+    tmp_path,
+):
+    _repo, run_dir, config = snapshot(tmp_path)
+
+    result = run_implementation_stage(
+        config,
+        run_dir,
+        codex_runner=MutatingRunner(
+            error=CodexProcessTimedOut(
+                CodexProcessTimeout(
+                    stdout="",
+                    stderr="timed out",
+                    timeout_seconds=1,
+                )
+            )
+        ),
+    )
+
+    attempt = json.loads(
+        run_dir.joinpath("writable-attempts", "implementation.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
+    assert result.codex_execution.process_started is True
+    assert attempt["process_started"] is True
+    assert attempt["before_fingerprint"] == attempt["after_fingerprint"]
 
 
 @pytest.mark.skipif(

@@ -22,10 +22,15 @@ from .config import (
 )
 from .git import GitCommandError, GitRepository
 from .git_safety import WorkspaceSnapshot, workspace_safety_changes
-from .models import WorkflowState, _validate_workflow_transition
+from .models import (
+    StopCategory,
+    StopReason,
+    WorkflowState,
+    _validate_workflow_transition,
+)
 from .preflight import PreflightResult, run_preflight
 
-RUN_SCHEMA_VERSION = 2
+RUN_SCHEMA_VERSION = 3
 BASELINE_SCHEMA_VERSION = 2
 RUN_RECORD_FORMAT = "ticket_automation.run"
 BASELINE_RECORD_FORMAT = "ticket_automation.baseline"
@@ -166,10 +171,33 @@ class RunRecord:
     current_review_round: int
     codex: CodexExecutionSettings
     terminal_reason: str | None
+    stop_reason: StopReason | None
     created_timestamp: str
     updated_timestamp: str
     schema_version: int = RUN_SCHEMA_VERSION
     format: str = RUN_RECORD_FORMAT
+
+    def __post_init__(self) -> None:
+        """Keep terminal stop evidence inseparable from terminal failure state."""
+
+        is_failure_stop = self.state in {
+            WorkflowState.HUMAN_REQUIRED,
+            WorkflowState.FAILED,
+        }
+        if is_failure_stop:
+            if self.stop_reason is None:
+                raise ValueError(
+                    "Terminal HUMAN_REQUIRED and FAILED records require stop_reason."
+                )
+            if self.terminal_reason != self.stop_reason.message:
+                raise ValueError(
+                    "Terminal reason must exactly match stop_reason.message."
+                )
+            return
+        if self.stop_reason is not None or self.terminal_reason is not None:
+            raise ValueError(
+                "Only HUMAN_REQUIRED and FAILED records may contain a terminal stop."
+            )
 
     def transition_to(
         self,
@@ -179,6 +207,7 @@ class RunRecord:
         current_correction_round: int | None = None,
         current_review_round: int | None = None,
         terminal_reason: str | None = None,
+        stop_reason: StopReason | None = None,
     ) -> RunRecord:
         _validate_workflow_transition(self.state, state)
         return replace(
@@ -195,6 +224,7 @@ class RunRecord:
                 else current_review_round
             ),
             terminal_reason=terminal_reason,
+            stop_reason=stop_reason,
             updated_timestamp=updated_timestamp,
         )
 
@@ -218,6 +248,15 @@ class RunRecord:
                 "reasoning_effort": self.codex.reasoning_effort,
             },
             "terminal_reason": self.terminal_reason,
+            "stop_reason": (
+                None
+                if self.stop_reason is None
+                else {
+                    "category": self.stop_reason.category.value,
+                    "message": self.stop_reason.message,
+                    "retryable": self.stop_reason.retryable,
+                }
+            ),
             "created_timestamp": self.created_timestamp,
             "updated_timestamp": self.updated_timestamp,
         }
@@ -230,32 +269,36 @@ class RunRecord:
             "format",
             expected=RUN_RECORD_FORMAT,
         )
-        return cls(
-            schema_version=schema_version,
-            format=format_value,
-            run_id=_require_string(data, "run_id"),
-            ticket_id=_require_string(data, "ticket_id"),
-            original_ticket_path=_require_string(data, "original_ticket_path"),
-            run_ticket_copy_path=_require_string(data, "run_ticket_copy_path"),
-            target_repository_path=_require_string(data, "target_repository_path"),
-            state=_require_workflow_state(data, "state"),
-            starting_branch=_require_string(data, "starting_branch"),
-            baseline_sha=_require_string(data, "baseline_sha"),
-            current_correction_round=_require_non_negative_int(
-                data,
-                "current_correction_round",
-            ),
-            max_correction_rounds=_require_int(data, "max_correction_rounds"),
-            current_review_round=_optional_non_negative_int(
-                data,
-                "current_review_round",
-                default=0,
-            ),
-            codex=_optional_codex_execution_settings(data),
-            terminal_reason=_optional_nullable_string(data, "terminal_reason"),
-            created_timestamp=_require_string(data, "created_timestamp"),
-            updated_timestamp=_require_string(data, "updated_timestamp"),
-        )
+        try:
+            return cls(
+                schema_version=schema_version,
+                format=format_value,
+                run_id=_require_string(data, "run_id"),
+                ticket_id=_require_string(data, "ticket_id"),
+                original_ticket_path=_require_string(data, "original_ticket_path"),
+                run_ticket_copy_path=_require_string(data, "run_ticket_copy_path"),
+                target_repository_path=_require_string(data, "target_repository_path"),
+                state=_require_workflow_state(data, "state"),
+                starting_branch=_require_string(data, "starting_branch"),
+                baseline_sha=_require_string(data, "baseline_sha"),
+                current_correction_round=_require_non_negative_int(
+                    data,
+                    "current_correction_round",
+                ),
+                max_correction_rounds=_require_int(data, "max_correction_rounds"),
+                current_review_round=_optional_non_negative_int(
+                    data,
+                    "current_review_round",
+                    default=0,
+                ),
+                codex=_optional_codex_execution_settings(data),
+                terminal_reason=_optional_nullable_string(data, "terminal_reason"),
+                stop_reason=_optional_stop_reason(data),
+                created_timestamp=_require_string(data, "created_timestamp"),
+                updated_timestamp=_require_string(data, "updated_timestamp"),
+            )
+        except (TypeError, ValueError) as error:
+            raise RunError(f"Invalid terminal stop record: {error}") from error
 
 
 @dataclass(frozen=True)
@@ -309,6 +352,7 @@ def create_run_snapshot(
             current_review_round=0,
             codex=config.codex.execution,
             terminal_reason=None,
+            stop_reason=None,
             created_timestamp=timestamp,
             updated_timestamp=timestamp,
         )
@@ -585,6 +629,26 @@ def _optional_nullable_string(data: dict[str, Any], key: str) -> str | None:
     if not isinstance(value, str) or not value:
         raise RunError(f"Run record field must be a non-empty string or null: {key}")
     return value
+
+
+def _optional_stop_reason(data: dict[str, Any]) -> StopReason | None:
+    value = data.get("stop_reason")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise RunError("Run record field must be an object or null: stop_reason")
+    category_value = _require_nested_string(value, "stop_reason", "category")
+    try:
+        category = StopCategory(category_value)
+    except ValueError as error:
+        raise RunError(
+            "Run record field has unsupported stop category: stop_reason.category"
+        ) from error
+    message = _require_nested_string(value, "stop_reason", "message")
+    retryable = value.get("retryable")
+    if not isinstance(retryable, bool):
+        raise RunError("Run record field must be a boolean: stop_reason.retryable")
+    return StopReason(category=category, message=message, retryable=retryable)
 
 
 def _optional_codex_execution_settings(

@@ -8,7 +8,7 @@ import pytest
 
 import ticket_automation.runs as runs_module
 from tests.helpers import GIT, create_git_repo, make_config, run_git
-from ticket_automation.models import WorkflowState
+from ticket_automation.models import StopCategory, StopReason, WorkflowState
 from ticket_automation.runs import (
     BASELINE_RECORD_FORMAT,
     RUN_RECORD_FORMAT,
@@ -148,10 +148,13 @@ def test_run_json_survives_load_save_round_trip(tmp_path):
 @pytest.mark.parametrize(("source", "target"), _VALID_TRANSITIONS)
 def test_run_record_accepts_every_legal_transition(source, target):
     run_record = trusted_run_record(source)
+    stop_reason = terminal_stop_reason(target)
 
     transitioned = run_record.transition_to(
         target,
         updated_timestamp="2026-09-11T13:05:13Z",
+        terminal_reason=None if stop_reason is None else stop_reason.message,
+        stop_reason=stop_reason,
     )
 
     assert transitioned.state == target
@@ -181,6 +184,58 @@ def test_run_record_rejects_representative_invalid_transitions(source, target):
 @pytest.mark.parametrize("state", list(WorkflowState))
 def test_run_record_accepts_each_state_at_trusted_deserialization_boundary(state):
     assert trusted_run_record(state).state == state
+
+
+@pytest.mark.parametrize(
+    "state",
+    (WorkflowState.HUMAN_REQUIRED, WorkflowState.FAILED),
+)
+def test_terminal_stop_requires_typed_reason(state):
+    with pytest.raises(ValueError, match="require stop_reason"):
+        trusted_run_record(WorkflowState.PREPARING).transition_to(
+            state,
+            updated_timestamp="2026-09-11T13:05:13Z",
+        )
+
+
+@pytest.mark.parametrize(
+    ("patch", "message"),
+    [
+        ({"stop_reason": None}, "require stop_reason"),
+        (
+            {
+                "stop_reason": {
+                    "category": "UNSUPPORTED",
+                    "message": "stop",
+                    "retryable": False,
+                }
+            },
+            "unsupported stop category",
+        ),
+        (
+            {
+                "stop_reason": {
+                    "category": "CONTROLLER_FAILURE",
+                    "message": "stop",
+                    "retryable": "no",
+                }
+            },
+            "boolean: stop_reason.retryable",
+        ),
+        (
+            {
+                "terminal_reason": "different message",
+            },
+            "must exactly match",
+        ),
+    ],
+)
+def test_terminal_stop_record_rejects_missing_or_inconsistent_evidence(patch, message):
+    data = trusted_run_record(WorkflowState.FAILED).to_dict()
+    data.update(patch)
+
+    with pytest.raises(RunError, match=message):
+        RunRecord.from_dict(data)
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
@@ -317,7 +372,7 @@ def test_record_schema_metadata_uses_current_supported_formats(tmp_path):
         result.run_dir.joinpath("baseline.json").read_text(encoding="utf-8")
     )
 
-    assert run_data["schema_version"] == 2
+    assert run_data["schema_version"] == 3
     assert run_data["format"] == RUN_RECORD_FORMAT
     assert baseline_data["schema_version"] == 2
     assert baseline_data["format"] == BASELINE_RECORD_FORMAT
@@ -342,6 +397,7 @@ def test_correction_round_and_maximum_are_persisted(tmp_path):
     assert data["current_review_round"] == 0
     assert "last_completed_state" not in data
     assert data["terminal_reason"] is None
+    assert data["stop_reason"] is None
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
@@ -608,6 +664,7 @@ def test_ticket_id_is_sanitized_for_paths():
 
 
 def trusted_run_record(state: WorkflowState) -> RunRecord:
+    stop_reason = terminal_stop_reason(state)
     return RunRecord.from_dict(
         {
             "schema_version": RUN_SCHEMA_VERSION,
@@ -624,8 +681,27 @@ def trusted_run_record(state: WorkflowState) -> RunRecord:
             "max_correction_rounds": 3,
             "current_review_round": 0,
             "codex": {"model": "test-model", "reasoning_effort": "high"},
-            "terminal_reason": None,
+            "terminal_reason": None if stop_reason is None else stop_reason.message,
+            "stop_reason": (
+                None
+                if stop_reason is None
+                else {
+                    "category": stop_reason.category.value,
+                    "message": stop_reason.message,
+                    "retryable": stop_reason.retryable,
+                }
+            ),
             "created_timestamp": "2026-09-11T13:05:12Z",
             "updated_timestamp": "2026-09-11T13:05:12Z",
         }
+    )
+
+
+def terminal_stop_reason(state: WorkflowState) -> StopReason | None:
+    if state not in {WorkflowState.HUMAN_REQUIRED, WorkflowState.FAILED}:
+        return None
+    return StopReason(
+        category=StopCategory.CONTROLLER_FAILURE,
+        message=f"Trusted terminal stop: {state.value}.",
+        retryable=False,
     )
