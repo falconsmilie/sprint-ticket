@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -12,16 +12,30 @@ import pytest
 from tests.helpers import GIT, create_git_repo, make_config, run_git
 from ticket_automation import reporting as reporting_module
 from ticket_automation.codex import CodexCommand, CodexProcessResult, Sandbox
-from ticket_automation.config import VerificationCommand
+from ticket_automation.config import AppConfig, VerificationCommand
 from ticket_automation.git import GitCommandError
-from ticket_automation.implementation import run_implementation_stage
-from ticket_automation.models import WorkflowState
-from ticket_automation.review import ReviewVerdict, run_review_stage
+from ticket_automation.implementation import (
+    ImplementationStageResult,
+)
+from ticket_automation.implementation import (
+    run_implementation_stage as execute_implementation_stage,
+)
+from ticket_automation.models import StageOutcome, WorkflowState
+from ticket_automation.review import (
+    ReviewStageResult,
+    ReviewVerdict,
+)
+from ticket_automation.review import (
+    run_review_stage as execute_review_stage,
+)
 from ticket_automation.runs import create_run_snapshot, load_run_record, save_run_record
 from ticket_automation.verification import (
     VerificationProcessCommand,
     VerificationProcessResult,
-    run_verification_stage,
+    VerificationStageResult,
+)
+from ticket_automation.verification import (
+    run_verification_stage as execute_verification_stage,
 )
 from ticket_automation.workflow import (
     format_lifecycle_result,
@@ -32,6 +46,92 @@ from ticket_automation.workflow import (
 
 def fixed_clock() -> datetime:
     return datetime(2026, 9, 11, 13, 5, 17, tzinfo=UTC)
+
+
+def run_implementation_stage(
+    config: AppConfig,
+    run_dir: Path,
+    *,
+    codex_runner=None,
+    clock=None,
+) -> ImplementationStageResult:
+    record_path = run_dir / "run.json"
+    record = load_run_record(record_path).transition_to(
+        WorkflowState.IMPLEMENTING,
+        updated_timestamp="2026-09-11T13:05:17Z",
+    )
+    save_run_record(record, record_path)
+    result = execute_implementation_stage(
+        config,
+        run_dir,
+        codex_runner=codex_runner,
+        clock=clock,
+    )
+    return persist_stage_result(result)
+
+
+def run_verification_stage(
+    config: AppConfig,
+    run_dir: Path,
+    *,
+    process_runner=None,
+    clock=None,
+) -> VerificationStageResult:
+    result = execute_verification_stage(
+        config,
+        run_dir,
+        process_runner=process_runner,
+        clock=clock,
+    )
+    return persist_stage_result(result)
+
+
+def run_review_stage(
+    config: AppConfig,
+    run_dir: Path,
+    *,
+    codex_runner=None,
+    clock=None,
+) -> ReviewStageResult:
+    result = execute_review_stage(
+        config,
+        run_dir,
+        codex_runner=codex_runner,
+        clock=clock,
+    )
+    return persist_stage_result(result)
+
+
+def persist_stage_result(result):
+    run_record = result.run_record
+    if result.outcome == StageOutcome.HUMAN_REQUIRED:
+        state = WorkflowState.HUMAN_REQUIRED
+    elif result.outcome == StageOutcome.FAILED:
+        state = WorkflowState.FAILED
+    elif result.outcome == StageOutcome.CORRECTION_REQUIRED:
+        state = WorkflowState.CORRECTION_PENDING
+    else:
+        state = {
+            WorkflowState.IMPLEMENTING: WorkflowState.VERIFYING,
+            WorkflowState.VERIFYING: WorkflowState.REVIEWING,
+            WorkflowState.REVIEWING: WorkflowState.REPORTING,
+        }[run_record.state]
+    updated_record = run_record.transition_to(
+        state,
+        updated_timestamp="2026-09-11T13:05:17Z",
+        current_review_round=(
+            run_record.current_review_round + 1
+            if run_record.state == WorkflowState.REVIEWING
+            else None
+        ),
+        terminal_reason=(
+            result.controller_message
+            if state in {WorkflowState.HUMAN_REQUIRED, WorkflowState.FAILED}
+            else None
+        ),
+    )
+    save_run_record(updated_record, Path(result.run_dir) / "run.json")
+    return replace(result, run_record=updated_record)
 
 
 @dataclass(frozen=True)
@@ -134,7 +234,7 @@ def test_lifecycle_first_pass_success_reaches_ready_for_human(tmp_path):
 
     assert result.successful
     assert result.run_record.state == WorkflowState.READY_FOR_HUMAN
-    assert result.run_record.last_completed_state == WorkflowState.REPORT
+    assert not hasattr(result.run_record, "last_completed_state")
     assert result.run_record.current_correction_round == 0
     assert result.run_record.current_review_round == 1
     assert [sandbox_value(command.argv) for command, _stdin in codex.calls] == [
@@ -552,7 +652,7 @@ def test_lifecycle_correction_environment_pollution_stops_before_reverification(
     assert run_git(repo, "diff", "--cached", "--name-only") == ""
     guard_path = result.run_dir / "workspace-guard" / "correction-round-1.json"
     guard = json.loads(guard_path.read_text(encoding="utf-8"))
-    assert guard["phase"] == "CORRECT"
+    assert guard["phase"] == "CORRECTING"
     assert guard["new_environments"][0]["markers"] == [".venv-correction/pyvenv.cfg"]
     report = result.run_dir.joinpath("final-report.md").read_text(encoding="utf-8")
     assert "correction-round-1.json" in report
@@ -684,7 +784,7 @@ def test_lifecycle_broken_verification_environment_is_human_required(tmp_path):
     )
 
     assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
-    assert result.run_record.last_completed_state == WorkflowState.VERIFY
+    assert not hasattr(result.run_record, "last_completed_state")
     assert result.correction_results == ()
     assert result.review_results == ()
 
@@ -823,6 +923,40 @@ def test_final_patch_is_complete_baseline_relative_diff_after_correction(tmp_pat
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_resume_from_prepared_starts_implementation(tmp_path):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+    runs_dir = tmp_path / "runs"
+    snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
+    codex = SequencedCodexRunner(
+        steps=[
+            CodexStep(
+                result=implementation_result(),
+                mutation=write_file("implemented\n"),
+            ),
+            CodexStep(result=review_result()),
+        ],
+        calls=[],
+    )
+    verification = SequencedVerificationRunner(steps=[VerificationStep()], calls=[])
+
+    result = resume_ticket_lifecycle(
+        config,
+        snapshot.run_record.run_id,
+        runs_dir=runs_dir,
+        codex_runner=codex,
+        verification_runner=verification,
+        clock=fixed_clock,
+    )
+
+    assert result.successful
+    assert [sandbox_value(command.argv) for command, _stdin in codex.calls] == [
+        Sandbox.WORKSPACE_WRITE.value,
+        Sandbox.READ_ONLY.value,
+    ]
+    assert len(verification.calls) == 1
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
 def test_resume_from_completed_implementation_runs_verification_review_and_report(
     tmp_path,
 ):
@@ -861,6 +995,65 @@ def test_resume_from_completed_implementation_runs_verification_review_and_repor
         Sandbox.READ_ONLY.value
     ]
     assert result.run_dir.joinpath("final-report.md").is_file()
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_resume_from_reporting_regenerates_report_without_rerunning_stages(tmp_path):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+    runs_dir = tmp_path / "runs"
+    snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
+    run_implementation_stage(
+        config,
+        snapshot.run_dir,
+        codex_runner=SequencedCodexRunner(
+            steps=[
+                CodexStep(
+                    result=implementation_result(),
+                    mutation=write_file("implemented\n"),
+                )
+            ],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    run_verification_stage(
+        config,
+        snapshot.run_dir,
+        process_runner=SequencedVerificationRunner(
+            steps=[VerificationStep()],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    run_review_stage(
+        config,
+        snapshot.run_dir,
+        codex_runner=SequencedCodexRunner(
+            steps=[CodexStep(result=review_result())],
+            calls=[],
+        ),
+        clock=fixed_clock,
+    )
+    assert load_run_record(snapshot.run_dir / "run.json").state == (
+        WorkflowState.REPORTING
+    )
+    codex = SequencedCodexRunner(steps=[], calls=[])
+    verification = SequencedVerificationRunner(steps=[], calls=[])
+
+    result = resume_ticket_lifecycle(
+        config,
+        snapshot.run_record.run_id,
+        runs_dir=runs_dir,
+        codex_runner=codex,
+        verification_runner=verification,
+        clock=fixed_clock,
+    )
+
+    assert result.successful
+    assert result.report_result is not None
+    assert result.run_dir.joinpath("final-report.md").is_file()
+    assert codex.calls == []
+    assert verification.calls == []
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
@@ -1332,30 +1525,47 @@ def test_resume_does_not_reuse_verification_artifact_after_repository_changed(
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
-def test_resume_terminal_run_does_not_regenerate_report_artifacts(tmp_path):
+@pytest.mark.parametrize(
+    "terminal_state",
+    [
+        WorkflowState.READY_FOR_HUMAN,
+        WorkflowState.HUMAN_REQUIRED,
+        WorkflowState.FAILED,
+    ],
+)
+def test_resume_terminal_run_does_not_regenerate_report_artifacts(
+    tmp_path,
+    terminal_state,
+):
     _repo, ticket, config = workflow_inputs(tmp_path)
-    result = run_ticket_lifecycle(
-        config,
-        ticket,
-        runs_dir=tmp_path / "runs",
-        codex_runner=SequencedCodexRunner(
-            steps=[
-                CodexStep(
-                    result=implementation_result(),
-                    mutation=write_file("implemented\n"),
-                ),
-                CodexStep(result=review_result()),
-            ],
-            calls=[],
+    runs_dir = tmp_path / "runs"
+    snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
+    transition_path = {
+        WorkflowState.READY_FOR_HUMAN: (
+            WorkflowState.IMPLEMENTING,
+            WorkflowState.VERIFYING,
+            WorkflowState.REVIEWING,
+            WorkflowState.REPORTING,
+            WorkflowState.READY_FOR_HUMAN,
         ),
-        verification_runner=SequencedVerificationRunner(
-            steps=[VerificationStep()],
-            calls=[],
-        ),
-        clock=fixed_clock,
-    )
-    final_patch = result.run_dir / "diffs" / "final.patch"
-    final_report = result.run_dir / "final-report.md"
+        WorkflowState.HUMAN_REQUIRED: (WorkflowState.HUMAN_REQUIRED,),
+        WorkflowState.FAILED: (WorkflowState.FAILED,),
+    }[terminal_state]
+    run_record = snapshot.run_record
+    for state in transition_path:
+        run_record = run_record.transition_to(
+            state,
+            updated_timestamp="2026-09-11T13:05:17Z",
+            terminal_reason=(
+                "synthetic terminal reason"
+                if state in {WorkflowState.HUMAN_REQUIRED, WorkflowState.FAILED}
+                else None
+            ),
+        )
+    save_run_record(run_record, snapshot.run_dir / "run.json")
+    final_patch = snapshot.run_dir / "diffs" / "final.patch"
+    final_patch.parent.mkdir(parents=True)
+    final_report = snapshot.run_dir / "final-report.md"
     final_patch.write_text("preserved patch\n", encoding="utf-8")
     final_report.write_text("preserved report\n", encoding="utf-8")
     codex = SequencedCodexRunner(steps=[CodexStep(result=review_result())], calls=[])
@@ -1363,14 +1573,14 @@ def test_resume_terminal_run_does_not_regenerate_report_artifacts(tmp_path):
 
     resumed = resume_ticket_lifecycle(
         config,
-        result.run_record.run_id,
-        runs_dir=tmp_path / "runs",
+        snapshot.run_record.run_id,
+        runs_dir=runs_dir,
         codex_runner=codex,
         verification_runner=verification,
         clock=fixed_clock,
     )
 
-    assert resumed.run_record.state == WorkflowState.READY_FOR_HUMAN
+    assert resumed.run_record.state == terminal_state
     assert final_patch.read_text(encoding="utf-8") == "preserved patch\n"
     assert final_report.read_text(encoding="utf-8") == "preserved report\n"
     assert codex.calls == []
@@ -1507,7 +1717,7 @@ def test_resume_missing_review_correction_source_becomes_human_required(tmp_path
     )
 
     assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
-    assert "Review correction source" in result.run_record.terminal_reason
+    assert "Correction source" in result.run_record.terminal_reason
     assert codex.calls == []
 
 
@@ -1561,7 +1771,7 @@ def test_resume_missing_verification_correction_source_becomes_human_required(tm
     )
 
     assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
-    assert "Verification correction source" in result.run_record.terminal_reason
+    assert "Correction source" in result.run_record.terminal_reason
     assert codex.calls == []
 
 
@@ -1635,10 +1845,9 @@ def test_resume_interrupted_implementation_becomes_human_required(tmp_path):
     repo.joinpath("file.txt").write_text("partial implementation\n", encoding="utf-8")
     record_path = snapshot.run_dir / "run.json"
     save_run_record(
-        load_run_record(record_path).with_state(
-            WorkflowState.IMPLEMENT,
+        load_run_record(record_path).transition_to(
+            WorkflowState.IMPLEMENTING,
             updated_timestamp="2026-09-11T13:05:18Z",
-            last_completed_state=WorkflowState.SNAPSHOT,
         ),
         record_path,
     )
@@ -1660,7 +1869,7 @@ def test_resume_interrupted_implementation_becomes_human_required(tmp_path):
     assert codex.calls == []
     assert result.run_dir.joinpath("final-report.md").is_file()
     report = result.run_dir.joinpath("final-report.md").read_text(encoding="utf-8")
-    assert "Last completed state: SNAPSHOT" in report
+    assert "Workflow state: HUMAN_REQUIRED" in report
     assert "Source changes may be incomplete" in report
     assert "What requires human inspection: Writable implementation" in report
     assert "### Relevant artifact/log paths" in report
@@ -1674,14 +1883,26 @@ def test_resume_interrupted_correction_becomes_human_required(tmp_path):
     snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
     repo.joinpath("file.txt").write_text("partial correction\n", encoding="utf-8")
     record_path = snapshot.run_dir / "run.json"
-    save_run_record(
-        load_run_record(record_path).with_state(
-            WorkflowState.CORRECT,
+    interrupted_record = (
+        load_run_record(record_path)
+        .transition_to(
+            WorkflowState.IMPLEMENTING,
             updated_timestamp="2026-09-11T13:05:18Z",
-            last_completed_state=WorkflowState.CORRECT,
-        ),
-        record_path,
+        )
+        .transition_to(
+            WorkflowState.VERIFYING,
+            updated_timestamp="2026-09-11T13:05:18Z",
+        )
+        .transition_to(
+            WorkflowState.CORRECTION_PENDING,
+            updated_timestamp="2026-09-11T13:05:18Z",
+        )
+        .transition_to(
+            WorkflowState.CORRECTING,
+            updated_timestamp="2026-09-11T13:05:18Z",
+        )
     )
+    save_run_record(interrupted_record, record_path)
 
     result = resume_ticket_lifecycle(
         config,
@@ -1710,14 +1931,26 @@ def test_best_effort_report_preserves_primary_failure_when_final_patch_fails(
     snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
     repo.joinpath("file.txt").write_text("partial correction\n", encoding="utf-8")
     record_path = snapshot.run_dir / "run.json"
-    save_run_record(
-        load_run_record(record_path).with_state(
-            WorkflowState.CORRECT,
+    interrupted_record = (
+        load_run_record(record_path)
+        .transition_to(
+            WorkflowState.IMPLEMENTING,
             updated_timestamp="2026-09-11T13:05:18Z",
-            last_completed_state=WorkflowState.CORRECT,
-        ),
-        record_path,
+        )
+        .transition_to(
+            WorkflowState.VERIFYING,
+            updated_timestamp="2026-09-11T13:05:18Z",
+        )
+        .transition_to(
+            WorkflowState.CORRECTION_PENDING,
+            updated_timestamp="2026-09-11T13:05:18Z",
+        )
+        .transition_to(
+            WorkflowState.CORRECTING,
+            updated_timestamp="2026-09-11T13:05:18Z",
+        )
     )
+    save_run_record(interrupted_record, record_path)
 
     def fail_diff(repository, baseline_sha):
         del repository, baseline_sha

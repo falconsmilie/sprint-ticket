@@ -68,7 +68,7 @@ Create a persistent run record from a local Markdown ticket and run the complete
 python -m ticket_automation run tickets/example.md
 ```
 
-The `run` command performs preflight, copies the ticket verbatim into `runs/<run-id>/ticket.md`, records the starting branch and baseline HEAD SHA, invokes Codex with a `workspace-write` sandbox for implementation, runs all configured deterministic verification commands, and invokes a fresh Codex reviewer with a `read-only` sandbox when verification passes. A passing review transitions through `REPORT`, writes `diffs/final.patch` and `final-report.md`, then reaches `READY_FOR_HUMAN` only if final verification, review, and Git safety evidence still hold.
+The `run` command performs preflight, copies the ticket verbatim into `runs/<run-id>/ticket.md`, records the starting branch and baseline HEAD SHA, invokes Codex with a `workspace-write` sandbox for implementation, runs all configured deterministic verification commands, and invokes a fresh Codex reviewer with a `read-only` sandbox when verification passes. A passing review transitions through `REPORTING`, writes `diffs/final.patch` and `final-report.md`, then reaches `READY_FOR_HUMAN` only if final verification, review, and Git safety evidence still hold.
 
 List known run records:
 
@@ -103,7 +103,7 @@ The target repository must start clean. TicketAutomation deliberately does not s
 
 Run snapshots are stored under `runs/`. A run ID uses a timestamp plus a sanitized ticket identifier, such as `20260911-130512_QDEB-003`. Existing run directories are not overwritten; a numeric suffix is added if a timestamp collision occurs.
 
-Each run directory contains `run.json`, `ticket.md`, and `baseline.json`. These records are enough to reconstruct the original ticket boundary for later workflow stages: the original ticket path, the copied ticket path, the target repository path, the starting branch, the baseline HEAD SHA, the current state, the last completed state, correction and review round counters, the effective Codex model and reasoning effort, timestamps, and a terminal reason when the run reaches `HUMAN_REQUIRED` or `FAILED`.
+Each run directory contains `run.json`, `ticket.md`, and `baseline.json`. These records are enough to reconstruct the original ticket boundary for later workflow stages: the original ticket path, the copied ticket path, the target repository path, the starting branch, the baseline HEAD SHA, one explicit current state, correction and review round counters, the effective Codex model and reasoning effort, timestamps, and a terminal reason when the run reaches `HUMAN_REQUIRED` or `FAILED`.
 
 A successful run also contains `diffs/final.patch` and `final-report.md`. The final patch is always relative to the original baseline SHA and the complete current working tree. The final report separates controller-observed facts from implementation-agent claims, so runner verification and Git evidence are not confused with agent-reported targeted tests.
 
@@ -112,14 +112,16 @@ A successful run also contains `diffs/final.patch` and `final-report.md`. The fi
 `python -m ticket_automation run tickets/example.md` advances the ticket without manual stage commands:
 
 ```text
-PREFLIGHT
-  -> SNAPSHOT
-  -> IMPLEMENT
-  -> VERIFY
-  -> REVIEW
-  -> REPORT
+PREPARING
+  -> PREPARED
+  -> IMPLEMENTING
+  -> VERIFYING
+  -> REVIEWING
+  -> REPORTING
   -> READY_FOR_HUMAN
 ```
+
+Failed verification or a review that requires corrections advances through `CORRECTION_PENDING -> CORRECTING -> VERIFYING`.
 
 If deterministic verification fails, TicketAutomation skips review and generates a corrective ticket directly from typed `VerificationFailure` records. If review returns `CORRECTIONS_REQUIRED`, TicketAutomation generates a corrective ticket from the reviewer's `REQUIRED` findings. Every correction is followed by deterministic verification. If verification passes, the next review is a completely fresh review of the original ticket against the original baseline and the complete current working tree.
 
@@ -129,7 +131,7 @@ Python owns all orchestration decisions. Codex may edit source files during writ
 
 ## Final Reporting And Resume
 
-`REPORT` is a read-only target-repository phase. It gathers already persisted evidence, captures the final Git state, writes `runs/<run-id>/diffs/final.patch`, writes `runs/<run-id>/final-report.md`, and prints a concise terminal handoff. It does not stage files, commit, switch branches, or alter target source code.
+`REPORTING` is a read-only target-repository phase. It gathers already persisted evidence, captures the final Git state, writes `runs/<run-id>/diffs/final.patch`, writes `runs/<run-id>/final-report.md`, and prints a concise terminal handoff. It does not stage files, commit, switch branches, or alter target source code.
 
 `READY_FOR_HUMAN` is entered only when deterministic verification currently passes, the final independent review verdict is `PASS`, the current source diff still matches the last verified writable checkpoint, Git safety invariants still hold, and both final report artifacts were persisted. `HUMAN_REQUIRED` and `FAILED` runs get a best-effort report where enough state exists.
 
@@ -153,7 +155,7 @@ TicketAutomation has two validation levels. Implementation-agent targeted valida
 
 Runner deterministic acceptance gates are the configured `[[verification.commands]]` records. TicketAutomation runs those commands itself from the target repository directory, preserves stdout and stderr, and treats those results as authoritative for workflow acceptance. Commands are executed from argument arrays without a shell.
 
-The first verification attempt writes `runs/<run-id>/verification/round-0.json` and `runs/<run-id>/verification/round-0.log`. Later correction rounds use `round-1`, `round-2`, and so on. A complete verification round includes checkpoint metadata tying it to the run, round, baseline, branch, source state, and configured verification gates that were used. Passing gates move the run to review. Failing gates move the run to `CORRECT` and produce typed `VerificationFailure` correction reasons. Environment or process execution problems, such as a missing executable or timeout, move the run to `HUMAN_REQUIRED` instead of asking a correction agent to rewrite source code for a broken local environment.
+The first verification attempt writes `runs/<run-id>/verification/round-0.json` and `runs/<run-id>/verification/round-0.log`. Later correction rounds use `round-1`, `round-2`, and so on. A complete verification round includes checkpoint metadata tying it to the run, round, baseline, branch, source state, and configured verification gates that were used. Passing gates move the run to review. Failing gates move the run to `CORRECTION_PENDING` and produce typed `VerificationFailure` correction reasons. Environment or process execution problems, such as a missing executable or timeout, move the run to `HUMAN_REQUIRED` instead of asking a correction agent to rewrite source code for a broken local environment.
 
 ## Review
 

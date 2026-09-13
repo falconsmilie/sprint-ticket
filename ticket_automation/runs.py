@@ -19,10 +19,10 @@ from .config import (
     CodexExecutionSettings,
 )
 from .git import GitCommandError, GitRepository
-from .models import WorkflowState
+from .models import WorkflowState, _validate_workflow_transition
 from .preflight import PreflightResult, run_preflight
 
-RUN_SCHEMA_VERSION = 1
+RUN_SCHEMA_VERSION = 2
 BASELINE_SCHEMA_VERSION = 1
 RUN_RECORD_FORMAT = "ticket_automation.run"
 BASELINE_RECORD_FORMAT = "ticket_automation.baseline"
@@ -125,7 +125,6 @@ class RunRecord:
     run_ticket_copy_path: str
     target_repository_path: str
     state: WorkflowState
-    last_completed_state: WorkflowState
     starting_branch: str
     baseline_sha: str
     current_correction_round: int
@@ -138,22 +137,19 @@ class RunRecord:
     schema_version: int = RUN_SCHEMA_VERSION
     format: str = RUN_RECORD_FORMAT
 
-    def with_state(
+    def transition_to(
         self,
         state: WorkflowState,
         *,
         updated_timestamp: str,
-        last_completed_state: WorkflowState | None = None,
         current_correction_round: int | None = None,
         current_review_round: int | None = None,
         terminal_reason: str | None = None,
     ) -> RunRecord:
+        _validate_workflow_transition(self.state, state)
         return replace(
             self,
             state=state,
-            last_completed_state=(
-                state if last_completed_state is None else last_completed_state
-            ),
             current_correction_round=(
                 self.current_correction_round
                 if current_correction_round is None
@@ -178,7 +174,6 @@ class RunRecord:
             "run_ticket_copy_path": self.run_ticket_copy_path,
             "target_repository_path": self.target_repository_path,
             "state": self.state.value,
-            "last_completed_state": self.last_completed_state.value,
             "starting_branch": self.starting_branch,
             "baseline_sha": self.baseline_sha,
             "current_correction_round": self.current_correction_round,
@@ -195,21 +190,11 @@ class RunRecord:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> RunRecord:
-        schema_version = _require_exact_int(
-            data,
-            "schema_version",
-            expected=RUN_SCHEMA_VERSION,
-        )
+        schema_version = _require_run_schema_version(data)
         format_value = _require_exact_string(
             data,
             "format",
             expected=RUN_RECORD_FORMAT,
-        )
-        state = _require_workflow_state(data, "state")
-        last_completed_state = _optional_workflow_state(
-            data,
-            "last_completed_state",
-            default=state,
         )
         return cls(
             schema_version=schema_version,
@@ -219,8 +204,7 @@ class RunRecord:
             original_ticket_path=_require_string(data, "original_ticket_path"),
             run_ticket_copy_path=_require_string(data, "run_ticket_copy_path"),
             target_repository_path=_require_string(data, "target_repository_path"),
-            state=state,
-            last_completed_state=last_completed_state,
+            state=_require_workflow_state(data, "state"),
             starting_branch=_require_string(data, "starting_branch"),
             baseline_sha=_require_string(data, "baseline_sha"),
             current_correction_round=_require_non_negative_int(
@@ -276,8 +260,7 @@ def create_run_snapshot(
             original_ticket_path=str(source_ticket.path.resolve()),
             run_ticket_copy_path=str(run_ticket_path.resolve()),
             target_repository_path=baseline_record.repository_path,
-            state=WorkflowState.PREFLIGHT,
-            last_completed_state=WorkflowState.PREFLIGHT,
+            state=WorkflowState.PREPARING,
             starting_branch=baseline_record.branch,
             baseline_sha=baseline_record.head_sha,
             current_correction_round=0,
@@ -294,10 +277,9 @@ def create_run_snapshot(
         save_baseline_record(baseline_record, baseline_record_path)
 
         snapshot_timestamp = _timestamp(clock)
-        run_record = run_record.with_state(
-            WorkflowState.SNAPSHOT,
+        run_record = run_record.transition_to(
+            WorkflowState.PREPARED,
             updated_timestamp=snapshot_timestamp,
-            last_completed_state=WorkflowState.SNAPSHOT,
         )
         save_run_record(run_record, run_record_path)
     except Exception:
@@ -387,7 +369,9 @@ def format_status(
         for ownership in active_ownerships:
             run_id = _ownership_value(ownership, "run_id") or "<unknown>"
             state = _ownership_value(ownership, "current_state") or "<unknown>"
-            target = _ownership_value(ownership, "target_repository_path") or "<unknown>"
+            target = (
+                _ownership_value(ownership, "target_repository_path") or "<unknown>"
+            )
             owner_pid = _ownership_value(ownership, "owner_pid") or "<unknown>"
             owner_host = _ownership_value(ownership, "owner_hostname") or "<unknown>"
             acquired = _ownership_value(ownership, "acquired_timestamp") or "<unknown>"
@@ -555,20 +539,6 @@ def _optional_non_negative_int(data: dict[str, Any], key: str, *, default: int) 
     return value
 
 
-def _optional_string(
-    data: dict[str, Any],
-    key: str,
-    *,
-    default: str,
-) -> str:
-    if key not in data:
-        return default
-    value = data[key]
-    if not isinstance(value, str) or not value:
-        raise RunError(f"Run record field must be a non-empty string: {key}")
-    return value
-
-
 def _optional_nullable_string(data: dict[str, Any], key: str) -> str | None:
     value = data.get(key)
     if value is None:
@@ -613,17 +583,6 @@ def _require_workflow_state(data: dict[str, Any], key: str) -> WorkflowState:
     return _workflow_state(_require_string(data, key), key=key)
 
 
-def _optional_workflow_state(
-    data: dict[str, Any],
-    key: str,
-    *,
-    default: WorkflowState,
-) -> WorkflowState:
-    if key not in data:
-        return default
-    return _workflow_state(_optional_string(data, key, default=default.value), key=key)
-
-
 def _workflow_state(value: str, *, key: str) -> WorkflowState:
     try:
         return WorkflowState(value)
@@ -631,6 +590,16 @@ def _workflow_state(value: str, *, key: str) -> WorkflowState:
         raise RunError(
             f"Run record field has unsupported workflow state: {key}"
         ) from error
+
+
+def _require_run_schema_version(data: dict[str, Any]) -> int:
+    value = _require_int(data, "schema_version")
+    if value != RUN_SCHEMA_VERSION:
+        raise RunError(
+            "Unsupported run record schema version: "
+            f"{value}; expected {RUN_SCHEMA_VERSION}. Start a new run."
+        )
+    return value
 
 
 def _require_exact_int(data: dict[str, Any], key: str, *, expected: int) -> int:

@@ -21,14 +21,13 @@ from .corrections import (
     correction_reason_from_dict,
 )
 from .git import GitCommandError, GitRepository
-from .models import WorkflowState
+from .models import StageOutcome, WorkflowState
 from .process_output import decode_human_output
 from .runs import (
     RUN_RECORD_FILE,
     RunError,
     RunRecord,
     load_run_record,
-    save_run_record,
 )
 
 VERIFICATION_SCHEMA_VERSION = 1
@@ -38,13 +37,6 @@ VERIFICATION_CHECKPOINT_FORMAT = "ticket_automation.verification_checkpoint"
 VERIFICATION_DIR_NAME = "verification"
 _INCOMPLETE_ARTIFACT_DIR_NAME = "_incomplete"
 CORRECTION_EXCERPT_CHARS = 4000
-_TERMINAL_STATES = frozenset(
-    {
-        WorkflowState.READY_FOR_HUMAN,
-        WorkflowState.HUMAN_REQUIRED,
-        WorkflowState.FAILED,
-    }
-)
 
 
 class VerificationError(RunError):
@@ -253,13 +245,14 @@ class VerificationRound:
 class VerificationStageResult:
     run_dir: Path
     run_record: RunRecord
+    outcome: StageOutcome
     artifact_directory: Path
     round_result: VerificationRound
     controller_message: str
 
     @property
     def successful(self) -> bool:
-        return self.run_record.state == WorkflowState.VERIFY
+        return self.outcome == StageOutcome.COMPLETED
 
 
 def run_verification_stage(
@@ -273,9 +266,9 @@ def run_verification_stage(
     run_path = Path(run_dir)
     run_record_path = run_path / RUN_RECORD_FILE
     run_record = load_run_record(run_record_path)
-    if run_record.state not in (WorkflowState.IMPLEMENT, WorkflowState.VERIFY):
+    if run_record.state != WorkflowState.VERIFYING:
         raise VerificationError(
-            "Verification requires run state IMPLEMENT or VERIFY; "
+            "Verification requires run state VERIFYING; "
             f"found {run_record.state.value}."
         )
 
@@ -300,7 +293,6 @@ def run_verification_stage(
         if starting_violations:
             return _finish_unadoptable_verification_checkpoint(
                 run_record=run_record,
-                run_record_path=run_record_path,
                 run_dir=run_path,
                 artifact_directory=artifact_directory,
                 json_path=json_path,
@@ -324,15 +316,12 @@ def run_verification_stage(
         if checkpoint_problem is None and existing_round is not None:
             return _finish_verification_round(
                 run_record=run_record,
-                run_record_path=run_record_path,
                 run_dir=run_path,
                 artifact_directory=artifact_directory,
                 round_result=existing_round,
-                clock=clock,
             )
         return _finish_unadoptable_verification_checkpoint(
             run_record=run_record,
-            run_record_path=run_record_path,
             run_dir=run_path,
             artifact_directory=artifact_directory,
             json_path=json_path,
@@ -346,7 +335,6 @@ def run_verification_stage(
         if starting_violations:
             return _finish_unadoptable_verification_checkpoint(
                 run_record=run_record,
-                run_record_path=run_record_path,
                 run_dir=run_path,
                 artifact_directory=artifact_directory,
                 json_path=json_path,
@@ -376,18 +364,10 @@ def run_verification_stage(
             safety_violations=starting_violations,
             clock=clock,
         )
-        updated_record = run_record.with_state(
-            WorkflowState.HUMAN_REQUIRED,
-            updated_timestamp=_timestamp(clock),
-            last_completed_state=WorkflowState.VERIFY,
-            terminal_reason=(
-                "Verification could not start from the recorded implementation state."
-            ),
-        )
-        save_run_record(updated_record, run_record_path)
         return VerificationStageResult(
             run_dir=run_path,
-            run_record=updated_record,
+            run_record=run_record,
+            outcome=StageOutcome.HUMAN_REQUIRED,
             artifact_directory=artifact_directory,
             round_result=round_result,
             controller_message=(
@@ -413,50 +393,40 @@ def run_verification_stage(
 
     return _finish_verification_round(
         run_record=run_record,
-        run_record_path=run_record_path,
         run_dir=run_path,
         artifact_directory=artifact_directory,
         round_result=round_result,
-        clock=clock,
     )
 
 
 def _finish_verification_round(
     *,
     run_record: RunRecord,
-    run_record_path: Path,
     run_dir: Path,
     artifact_directory: Path,
     round_result: VerificationRound,
-    clock: Callable[[], datetime] | None,
 ) -> VerificationStageResult:
     if round_result.safety_violations:
-        state = WorkflowState.HUMAN_REQUIRED
+        outcome = StageOutcome.HUMAN_REQUIRED
         controller_message = (
             "Verification changed repository state; human intervention is required."
         )
     elif round_result.errored_commands:
-        state = WorkflowState.HUMAN_REQUIRED
+        outcome = StageOutcome.HUMAN_REQUIRED
         controller_message = (
             "Verification could not execute completely; human intervention is required."
         )
     elif round_result.failed_commands:
-        state = WorkflowState.CORRECT
+        outcome = StageOutcome.CORRECTION_REQUIRED
         controller_message = "Verification failed; corrective work is required."
     else:
-        state = WorkflowState.VERIFY
+        outcome = StageOutcome.COMPLETED
         controller_message = "Verification passed; review can start."
 
-    updated_record = run_record.with_state(
-        state,
-        updated_timestamp=_timestamp(clock),
-        last_completed_state=WorkflowState.VERIFY,
-        terminal_reason=controller_message if state in _TERMINAL_STATES else None,
-    )
-    save_run_record(updated_record, run_record_path)
     return VerificationStageResult(
         run_dir=run_dir,
-        run_record=updated_record,
+        run_record=run_record,
+        outcome=outcome,
         artifact_directory=artifact_directory,
         round_result=round_result,
         controller_message=controller_message,
@@ -466,7 +436,6 @@ def _finish_verification_round(
 def _finish_unadoptable_verification_checkpoint(
     *,
     run_record: RunRecord,
-    run_record_path: Path,
     run_dir: Path,
     artifact_directory: Path,
     json_path: Path,
@@ -494,16 +463,10 @@ def _finish_unadoptable_verification_checkpoint(
         json_path=json_path,
         log_path=log_path,
     )
-    updated_record = run_record.with_state(
-        WorkflowState.HUMAN_REQUIRED,
-        updated_timestamp=timestamp,
-        last_completed_state=run_record.last_completed_state,
-        terminal_reason=reason,
-    )
-    save_run_record(updated_record, run_record_path)
     return VerificationStageResult(
         run_dir=run_dir,
-        run_record=updated_record,
+        run_record=run_record,
+        outcome=StageOutcome.HUMAN_REQUIRED,
         artifact_directory=artifact_directory,
         round_result=round_result,
         controller_message=reason,
@@ -1086,7 +1049,7 @@ def _verification_checkpoint(
     checkpoint: dict[str, Any] = {
         "schema_version": VERIFICATION_CHECKPOINT_SCHEMA_VERSION,
         "format": VERIFICATION_CHECKPOINT_FORMAT,
-        "stage": WorkflowState.VERIFY.value,
+        "stage": WorkflowState.VERIFYING.value,
         "status": "COMPLETE",
         "run_id": run_record.run_id,
         "round_index": round_index,

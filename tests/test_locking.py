@@ -70,7 +70,7 @@ try:
     with acquire_repository_run_lock(
         target,
         run_id=sys.argv[3],
-        current_state="IMPLEMENT",
+        current_state="IMPLEMENTING",
     ):
         print("ACQUIRED", flush=True)
         time.sleep(1.5)
@@ -139,7 +139,7 @@ class PassingVerificationRunner:
 def test_second_run_against_same_repository_is_blocked(tmp_path):
     repo, ticket, config = workflow_inputs(tmp_path)
     runs_dir = tmp_path / "runs"
-    holder = start_lock_holder(repo, run_id="owner-run", state="IMPLEMENT")
+    holder = start_lock_holder(repo, run_id="owner-run", state="IMPLEMENTING")
     try:
         with pytest.raises(RepositoryLockError) as raised:
             run_ticket_lifecycle(
@@ -156,7 +156,7 @@ def test_second_run_against_same_repository_is_blocked(tmp_path):
     message = str(raised.value)
     assert "Target repository is already owned" in message
     assert "Owning run ID: owner-run" in message
-    assert "Owning state: IMPLEMENT" in message
+    assert "Owning state: IMPLEMENTING" in message
     assert str(repo.resolve()) in message
 
 
@@ -165,7 +165,7 @@ def test_second_resume_against_same_repository_is_blocked(tmp_path):
     repo, ticket, config = workflow_inputs(tmp_path)
     runs_dir = tmp_path / "runs"
     snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
-    holder = start_lock_holder(repo, run_id="owner-run", state="VERIFY")
+    holder = start_lock_holder(repo, run_id="owner-run", state="VERIFYING")
     try:
         with pytest.raises(RepositoryLockError) as raised:
             resume_ticket_lifecycle(
@@ -181,7 +181,7 @@ def test_second_resume_against_same_repository_is_blocked(tmp_path):
 
     message = str(raised.value)
     assert "Owning run ID: owner-run" in message
-    assert "Owning state: VERIFY" in message
+    assert "Owning state: VERIFYING" in message
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for locking tests")
@@ -189,13 +189,13 @@ def test_same_repository_identity_uses_git_root_for_subdirectories(tmp_path):
     repo = create_git_repo(tmp_path / "repo")
     nested = repo / "nested"
     nested.mkdir()
-    holder = start_lock_holder(repo, run_id="owner-run", state="IMPLEMENT")
+    holder = start_lock_holder(repo, run_id="owner-run", state="IMPLEMENTING")
     try:
         with pytest.raises(RepositoryLockError) as raised:
             acquire_repository_run_lock(
                 nested,
                 run_id="competing-run",
-                current_state="PREFLIGHT",
+                current_state="PREPARING",
                 clock=fixed_clock,
             )
     finally:
@@ -211,7 +211,7 @@ def test_same_repository_is_blocked_across_distinct_run_roots(tmp_path):
     holder = start_lock_holder(
         repo,
         run_id="first-config-owner",
-        state="IMPLEMENT",
+        state="IMPLEMENTING",
     )
     try:
         with pytest.raises(RepositoryLockError) as raised:
@@ -228,7 +228,7 @@ def test_same_repository_is_blocked_across_distinct_run_roots(tmp_path):
 
     message = str(raised.value)
     assert "Owning run ID: first-config-owner" in message
-    assert "Owning state: IMPLEMENT" in message
+    assert "Owning state: IMPLEMENTING" in message
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for locking tests")
@@ -236,7 +236,7 @@ def test_different_repositories_can_run_independently(tmp_path):
     repo_a = create_git_repo(tmp_path / "repo-a")
     repo_b, ticket_b, config_b = workflow_inputs(tmp_path, repo_name="repo-b")
     runs_dir = tmp_path / "runs"
-    holder = start_lock_holder(repo_a, run_id="owner-run", state="IMPLEMENT")
+    holder = start_lock_holder(repo_a, run_id="owner-run", state="IMPLEMENTING")
     try:
         result = run_ticket_lifecycle(
             config_b,
@@ -298,9 +298,7 @@ def test_lock_releases_after_human_required(tmp_path):
         config,
         ticket,
         runs_dir=runs_dir,
-        codex_runner=SequencedCodexRunner(
-            [CodexStep(result=implementation_result())]
-        ),
+        codex_runner=SequencedCodexRunner([CodexStep(result=implementation_result())]),
         verification_runner=PassingVerificationRunner(),
         clock=fixed_clock,
     )
@@ -366,7 +364,7 @@ def test_concurrent_acquisition_allows_only_one_owner(tmp_path):
 @pytest.mark.skipif(GIT is None, reason="git executable is required for locking tests")
 def test_process_death_does_not_permanently_strand_repository(tmp_path):
     repo = create_git_repo(tmp_path / "repo")
-    holder = start_lock_holder(repo, run_id="dead-owner", state="IMPLEMENT")
+    holder = start_lock_holder(repo, run_id="dead-owner", state="IMPLEMENTING")
     assert active_repository_locks()[0].run_id == "dead-owner"
 
     holder.terminate()
@@ -375,7 +373,7 @@ def test_process_death_does_not_permanently_strand_repository(tmp_path):
     with acquire_repository_run_lock(
         repo,
         run_id="new-owner",
-        current_state="PREFLIGHT",
+        current_state="PREPARING",
         clock=fixed_clock,
     ) as repository_lock:
         assert repository_lock.metadata.run_id == "new-owner"
@@ -482,7 +480,7 @@ def assert_can_acquire(repo: Path) -> None:
     with acquire_repository_run_lock(
         repo,
         run_id="probe-run",
-        current_state="PREFLIGHT",
+        current_state="PREPARING",
         clock=fixed_clock,
     ):
         pass

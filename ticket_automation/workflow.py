@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -21,7 +21,7 @@ from .implementation import (
     run_implementation_stage,
 )
 from .locking import RepositoryRunLock, acquire_repository_run_lock
-from .models import WorkflowState
+from .models import StageOutcome, WorkflowState
 from .preflight import PreflightResult
 from .reporting import (
     ReportStageResult,
@@ -107,7 +107,7 @@ def run_ticket_lifecycle(
     with acquire_repository_run_lock(
         config.project.repo,
         run_id=None,
-        current_state=WorkflowState.PREFLIGHT.value,
+        current_state=WorkflowState.PREPARING.value,
         clock=clock,
     ) as repository_lock:
         return _run_ticket_lifecycle_locked(
@@ -144,12 +144,29 @@ def _run_ticket_lifecycle_locked(
     correction_results: list[CorrectionStageResult] = []
 
     try:
-        repository_lock.update(current_state=WorkflowState.IMPLEMENT.value)
+        active_record = _persist_requested_transition(
+            snapshot.run_dir,
+            snapshot.run_record,
+            WorkflowState.IMPLEMENTING,
+            clock=clock,
+        )
+        _update_repository_lock(repository_lock, active_record)
         implementation_result = run_implementation_stage(
             config,
             snapshot.run_dir,
             codex_runner=codex_runner,
             clock=clock,
+        )
+        completed_record = _persist_stage_outcome(
+            snapshot.run_dir,
+            implementation_result.run_record,
+            implementation_result.outcome,
+            terminal_reason=implementation_result.controller_message,
+            clock=clock,
+        )
+        implementation_result = replace(
+            implementation_result,
+            run_record=completed_record,
         )
         _update_repository_lock(repository_lock, implementation_result.run_record)
         return _drive_lifecycle(
@@ -307,16 +324,32 @@ def _resume_ticket_lifecycle_locked(
     correction_results: list[CorrectionStageResult] = []
 
     try:
-        if run_record.state == WorkflowState.SNAPSHOT:
-            repository_lock.update(current_state=WorkflowState.IMPLEMENT.value)
+        if run_record.state == WorkflowState.PREPARED:
+            run_record = _persist_requested_transition(
+                run_dir,
+                run_record,
+                WorkflowState.IMPLEMENTING,
+                clock=clock,
+            )
+            _update_repository_lock(repository_lock, run_record)
             implementation_result = run_implementation_stage(
                 config,
                 run_dir,
                 codex_runner=codex_runner,
                 clock=clock,
             )
+            run_record = _persist_stage_outcome(
+                run_dir,
+                implementation_result.run_record,
+                implementation_result.outcome,
+                terminal_reason=implementation_result.controller_message,
+                clock=clock,
+            )
+            implementation_result = replace(
+                implementation_result,
+                run_record=run_record,
+            )
             _update_repository_lock(repository_lock, implementation_result.run_record)
-            run_record = implementation_result.run_record
 
         return _drive_lifecycle(
             config,
@@ -448,61 +481,74 @@ def _drive_lifecycle(
 
     while run_record.state not in TERMINAL_STATES:
         _update_repository_lock(repository_lock, run_record)
-        if run_record.state == WorkflowState.IMPLEMENT:
-            if run_record.last_completed_state != WorkflowState.IMPLEMENT:
-                raise RunError(
-                    "Implementation was interrupted before a completed writable "
-                    "checkpoint was persisted."
-                )
+        if run_record.state == WorkflowState.PREPARED:
+            run_record = _persist_requested_transition(
+                run_dir,
+                run_record,
+                WorkflowState.IMPLEMENTING,
+                clock=clock,
+            )
+            _update_repository_lock(repository_lock, run_record)
+            implementation_result = run_implementation_stage(
+                config,
+                run_dir,
+                codex_runner=codex_runner,
+                clock=clock,
+            )
+            run_record = _persist_stage_outcome(
+                run_dir,
+                implementation_result.run_record,
+                implementation_result.outcome,
+                terminal_reason=implementation_result.controller_message,
+                clock=clock,
+            )
+            implementation_result = replace(
+                implementation_result,
+                run_record=run_record,
+            )
+            _update_repository_lock(repository_lock, run_record)
+            continue
+
+        if run_record.state == WorkflowState.VERIFYING:
             verification = run_verification_stage(
                 config,
                 run_dir,
                 process_runner=verification_runner,
                 clock=clock,
             )
+            run_record = _persist_stage_outcome(
+                run_dir,
+                verification.run_record,
+                verification.outcome,
+                terminal_reason=verification.controller_message,
+                clock=clock,
+            )
+            verification = replace(verification, run_record=run_record)
             verification_results.append(verification)
-            run_record = verification.run_record
             _update_repository_lock(repository_lock, run_record)
             continue
 
-        if run_record.state == WorkflowState.VERIFY:
-            if run_record.last_completed_state == WorkflowState.CORRECT:
-                verification = run_verification_stage(
-                    config,
-                    run_dir,
-                    process_runner=verification_runner,
-                    clock=clock,
-                )
-                verification_results.append(verification)
-                run_record = verification.run_record
-                _update_repository_lock(repository_lock, run_record)
-                continue
+        if run_record.state == WorkflowState.REVIEWING:
+            review = run_review_stage(
+                config,
+                run_dir,
+                codex_runner=codex_runner,
+                clock=clock,
+            )
+            run_record = _persist_stage_outcome(
+                run_dir,
+                review.run_record,
+                review.outcome,
+                terminal_reason=review.controller_message,
+                current_review_round=review.run_record.current_review_round + 1,
+                clock=clock,
+            )
+            review = replace(review, run_record=run_record)
+            review_results.append(review)
+            _update_repository_lock(repository_lock, run_record)
+            continue
 
-            if run_record.last_completed_state == WorkflowState.VERIFY:
-                review = run_review_stage(
-                    config,
-                    run_dir,
-                    codex_runner=codex_runner,
-                    clock=clock,
-                )
-                review_results.append(review)
-                run_record = review.run_record
-                _update_repository_lock(repository_lock, run_record)
-                continue
-
-        if run_record.state == WorkflowState.CORRECT:
-            if run_record.last_completed_state == WorkflowState.CORRECT:
-                run_record = _mark_human_required(
-                    run_dir,
-                    terminal_reason=(
-                        "Writable correction was interrupted before completion; "
-                        "the working tree may contain partial source modifications."
-                    ),
-                    clock=clock,
-                )
-                _update_repository_lock(repository_lock, run_record)
-                continue
-
+        if run_record.state == WorkflowState.CORRECTION_PENDING:
             if run_record.current_correction_round >= run_record.max_correction_rounds:
                 run_record = _mark_human_required(
                     run_dir,
@@ -515,27 +561,56 @@ def _drive_lifecycle(
                 _update_repository_lock(repository_lock, run_record)
                 continue
 
+            run_record = _persist_requested_transition(
+                run_dir,
+                run_record,
+                WorkflowState.CORRECTING,
+                clock=clock,
+            )
+            _update_repository_lock(repository_lock, run_record)
             correction = run_correction_stage(
                 config,
                 run_dir,
                 codex_runner=codex_runner,
                 clock=clock,
             )
+            run_record = _persist_stage_outcome(
+                run_dir,
+                correction.run_record,
+                correction.outcome,
+                terminal_reason=correction.controller_message,
+                current_correction_round=(
+                    correction.correction_round
+                    if correction.advance_correction_round
+                    else correction.run_record.current_correction_round
+                ),
+                clock=clock,
+            )
+            correction = replace(correction, run_record=run_record)
             correction_results.append(correction)
-            run_record = correction.run_record
             _update_repository_lock(repository_lock, run_record)
             continue
 
-        if run_record.state == WorkflowState.REPORT:
-            report_result = run_report_stage(run_dir, clock=clock)
+        if run_record.state == WorkflowState.REPORTING:
+            report_result = run_report_stage(
+                run_dir,
+                transition_record=lambda record, outcome, reason: (
+                    _record_after_stage_outcome(
+                        record,
+                        outcome,
+                        terminal_reason=reason,
+                        clock=clock,
+                    )
+                ),
+            )
             run_record = report_result.run_record
+            save_run_record(run_record, run_dir / RUN_RECORD_FILE)
             _update_repository_lock(repository_lock, run_record)
             continue
 
         raise RunError(
             "Lifecycle reached an unsupported non-terminal state: "
-            f"{run_record.state.value} after "
-            f"{run_record.last_completed_state.value}."
+            f"{run_record.state.value}."
         )
 
     if run_record.state != WorkflowState.READY_FOR_HUMAN:
@@ -551,6 +626,90 @@ def _drive_lifecycle(
         review_results=tuple(review_results),
         correction_results=tuple(correction_results),
         report_result=report_result,
+    )
+
+
+def _persist_requested_transition(
+    run_dir: Path,
+    run_record: RunRecord,
+    state: WorkflowState,
+    *,
+    clock: Callable[[], datetime] | None,
+) -> RunRecord:
+    updated_record = run_record.transition_to(
+        state,
+        updated_timestamp=_timestamp(clock),
+    )
+    save_run_record(updated_record, run_dir / RUN_RECORD_FILE)
+    return updated_record
+
+
+def _persist_stage_outcome(
+    run_dir: Path,
+    run_record: RunRecord,
+    outcome: StageOutcome,
+    *,
+    terminal_reason: str,
+    clock: Callable[[], datetime] | None,
+    current_correction_round: int | None = None,
+    current_review_round: int | None = None,
+) -> RunRecord:
+    updated_record = _record_after_stage_outcome(
+        run_record,
+        outcome,
+        terminal_reason=terminal_reason,
+        clock=clock,
+        current_correction_round=current_correction_round,
+        current_review_round=current_review_round,
+    )
+    save_run_record(updated_record, run_dir / RUN_RECORD_FILE)
+    return updated_record
+
+
+def _record_after_stage_outcome(
+    run_record: RunRecord,
+    outcome: StageOutcome,
+    *,
+    terminal_reason: str | None,
+    clock: Callable[[], datetime] | None,
+    current_correction_round: int | None = None,
+    current_review_round: int | None = None,
+) -> RunRecord:
+    if outcome == StageOutcome.HUMAN_REQUIRED:
+        state = WorkflowState.HUMAN_REQUIRED
+    elif outcome == StageOutcome.FAILED:
+        state = WorkflowState.FAILED
+    elif outcome == StageOutcome.CORRECTION_REQUIRED and run_record.state in {
+        WorkflowState.VERIFYING,
+        WorkflowState.REVIEWING,
+    }:
+        state = WorkflowState.CORRECTION_PENDING
+    elif outcome == StageOutcome.COMPLETED:
+        try:
+            state = {
+                WorkflowState.IMPLEMENTING: WorkflowState.VERIFYING,
+                WorkflowState.VERIFYING: WorkflowState.REVIEWING,
+                WorkflowState.REVIEWING: WorkflowState.REPORTING,
+                WorkflowState.CORRECTING: WorkflowState.VERIFYING,
+                WorkflowState.REPORTING: WorkflowState.READY_FOR_HUMAN,
+            }[run_record.state]
+        except KeyError as error:
+            raise RunError(
+                "Stage completion is not valid from workflow state "
+                f"{run_record.state.value}."
+            ) from error
+    else:
+        raise RunError(
+            f"Stage outcome {outcome.value} is not valid from workflow state "
+            f"{run_record.state.value}."
+        )
+
+    return run_record.transition_to(
+        state,
+        updated_timestamp=_timestamp(clock),
+        current_correction_round=current_correction_round,
+        current_review_round=current_review_round,
+        terminal_reason=(terminal_reason if state in TERMINAL_STATES else None),
     )
 
 
@@ -598,45 +757,30 @@ def _update_repository_lock(
 
 
 def _resume_checkpoint_problem(run_dir: Path, run_record: RunRecord) -> str | None:
-    if run_record.state == WorkflowState.SNAPSHOT:
+    if run_record.state == WorkflowState.PREPARED:
         return None
 
-    if run_record.state == WorkflowState.IMPLEMENT:
-        if run_record.last_completed_state == WorkflowState.SNAPSHOT:
-            return (
-                "Writable implementation was interrupted before completion; the "
-                "working tree may contain partial source modifications."
-            )
-        if run_record.last_completed_state != WorkflowState.IMPLEMENT:
-            return "Run record does not describe a safe implementation checkpoint."
-        return _require_completed_implementation_checkpoint(run_dir, run_record)
+    if run_record.state == WorkflowState.PREPARING:
+        return (
+            "Run preparation was interrupted before a complete snapshot was persisted."
+        )
 
-    if run_record.state == WorkflowState.VERIFY:
-        if run_record.last_completed_state == WorkflowState.CORRECT:
-            return _require_completed_correction_checkpoint(run_dir, run_record)
-        if run_record.last_completed_state == WorkflowState.VERIFY:
-            verification = latest_verification_round(run_dir)
-            if (
-                not isinstance(verification, dict)
-                or verification.get("status") != "PASS"
-            ):
-                return (
-                    "Review cannot resume because the latest verification did not pass."
-                )
-            return _require_current_diff_matches_checkpoint(run_dir, run_record)
-        return "Run record does not describe a safe verification checkpoint."
+    if run_record.state == WorkflowState.IMPLEMENTING:
+        return (
+            "Writable implementation was interrupted before completion; the "
+            "working tree may contain partial source modifications."
+        )
 
-    if run_record.state == WorkflowState.CORRECT:
-        if run_record.last_completed_state == WorkflowState.CORRECT:
-            return (
-                "Writable correction was interrupted before completion; the "
-                "working tree may contain partial source modifications."
-            )
-        if run_record.last_completed_state not in (
-            WorkflowState.REVIEW,
-            WorkflowState.VERIFY,
-        ):
-            return "Run record does not describe a safe correction checkpoint."
+    if run_record.state == WorkflowState.VERIFYING:
+        return _require_completed_writable_checkpoint(run_dir, run_record)
+
+    if run_record.state == WorkflowState.REVIEWING:
+        verification = latest_verification_round(run_dir)
+        if not isinstance(verification, dict) or verification.get("status") != "PASS":
+            return "Review cannot resume because the latest verification did not pass."
+        return _require_current_diff_matches_checkpoint(run_dir, run_record)
+
+    if run_record.state == WorkflowState.CORRECTION_PENDING:
         checkpoint_problem = _require_current_diff_matches_checkpoint(
             run_dir,
             run_record,
@@ -645,9 +789,13 @@ def _resume_checkpoint_problem(run_dir: Path, run_record: RunRecord) -> str | No
             return checkpoint_problem
         return _require_correction_source_checkpoint(run_dir, run_record)
 
-    if run_record.state == WorkflowState.REPORT:
-        if run_record.last_completed_state != WorkflowState.REVIEW:
-            return "Run record does not describe a safe report checkpoint."
+    if run_record.state == WorkflowState.CORRECTING:
+        return (
+            "Writable correction was interrupted before completion; the "
+            "working tree may contain partial source modifications."
+        )
+
+    if run_record.state == WorkflowState.REPORTING:
         review = latest_review_result(run_dir)
         if not isinstance(review, dict) or review.get("verdict") != "PASS":
             return "Report cannot resume because the final review did not pass."
@@ -659,6 +807,15 @@ def _resume_checkpoint_problem(run_dir: Path, run_record: RunRecord) -> str | No
         return _require_current_diff_matches_checkpoint(run_dir, run_record)
 
     return f"Run state is not resumable in V1: {run_record.state.value}"
+
+
+def _require_completed_writable_checkpoint(
+    run_dir: Path,
+    run_record: RunRecord,
+) -> str | None:
+    if run_record.current_correction_round > 0:
+        return _require_completed_correction_checkpoint(run_dir, run_record)
+    return _require_completed_implementation_checkpoint(run_dir, run_record)
 
 
 def _require_completed_implementation_checkpoint(
@@ -692,13 +849,8 @@ def _require_correction_source_checkpoint(
     run_dir: Path,
     run_record: RunRecord,
 ) -> str | None:
-    if run_record.last_completed_state == WorkflowState.VERIFY:
-        verification = latest_verification_round(run_dir)
-        if not isinstance(verification, dict) or verification.get("status") != "FAIL":
-            return (
-                "Verification correction source is not internally consistent: "
-                "latest verification did not fail."
-            )
+    verification = latest_verification_round(run_dir)
+    if isinstance(verification, dict) and verification.get("status") == "FAIL":
         if "correction_reasons" in verification:
             reasons = verification["correction_reasons"]
             if not isinstance(reasons, list):
@@ -722,7 +874,9 @@ def _require_correction_source_checkpoint(
                     "Verification correction source is not internally consistent: "
                     "correction reasons must be objects."
                 )
-            if not all(isinstance(reason, VerificationFailure) for reason in parsed_reasons):
+            if not all(
+                isinstance(reason, VerificationFailure) for reason in parsed_reasons
+            ):
                 return (
                     "Verification correction source is not internally consistent: "
                     "verification correction reasons must describe verification failures."
@@ -740,23 +894,15 @@ def _require_correction_source_checkpoint(
             "no failed verification command was persisted."
         )
 
-    if run_record.last_completed_state == WorkflowState.REVIEW:
-        review = latest_review_result(run_dir)
-        if (
-            not isinstance(review, dict)
-            or review.get("verdict") != ReviewVerdict.CORRECTIONS_REQUIRED.value
-        ):
-            return (
-                "Review correction source is not internally consistent: "
-                "latest review did not require corrections."
-            )
+    review = latest_review_result(run_dir)
+    if (
+        isinstance(review, dict)
+        and review.get("verdict") == ReviewVerdict.CORRECTIONS_REQUIRED.value
+    ):
         try:
             findings = review_findings_from_result(review)
         except CorrectionError as error:
-            return (
-                "Review correction source is not internally consistent: "
-                f"{error}"
-            )
+            return f"Review correction source is not internally consistent: {error}"
         if not findings:
             return (
                 "Review correction source is not internally consistent: "
@@ -764,7 +910,10 @@ def _require_correction_source_checkpoint(
             )
         return None
 
-    return "Run record does not describe a known correction source checkpoint."
+    return (
+        "Correction source is not internally consistent: the latest verification "
+        "did not fail and the latest review did not require corrections."
+    )
 
 
 def _require_current_diff_matches_checkpoint(
@@ -806,10 +955,9 @@ def _mark_failed(
 ) -> RunRecord:
     record_path = run_dir / RUN_RECORD_FILE
     run_record = load_run_record(record_path)
-    updated_record = run_record.with_state(
+    updated_record = run_record.transition_to(
         WorkflowState.FAILED,
         updated_timestamp=_timestamp(clock),
-        last_completed_state=run_record.last_completed_state,
         terminal_reason=terminal_reason,
     )
     save_run_record(updated_record, record_path)
@@ -824,10 +972,9 @@ def _mark_human_required(
 ) -> RunRecord:
     record_path = run_dir / RUN_RECORD_FILE
     run_record = load_run_record(record_path)
-    updated_record = run_record.with_state(
+    updated_record = run_record.transition_to(
         WorkflowState.HUMAN_REQUIRED,
         updated_timestamp=_timestamp(clock),
-        last_completed_state=run_record.last_completed_state,
         terminal_reason=terminal_reason,
     )
     save_run_record(updated_record, record_path)

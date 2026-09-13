@@ -7,7 +7,7 @@ import shutil
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -26,7 +26,7 @@ from .codex import (
 )
 from .config import AppConfig
 from .git import GitCommandError, GitRepository
-from .models import WorkflowState
+from .models import StageOutcome, WorkflowState
 from .runs import (
     BASELINE_RECORD_FILE,
     RUN_RECORD_FILE,
@@ -35,7 +35,6 @@ from .runs import (
     RunRecord,
     load_baseline_record,
     load_run_record,
-    save_run_record,
 )
 from .verification import VERIFICATION_DIR_NAME
 
@@ -50,13 +49,6 @@ _REVIEW_PROMPT_TEMPLATE = _PROJECT_ROOT / "prompts" / "review.md"
 _REVIEW_RESULT_SCHEMA = _PROJECT_ROOT / "schemas" / "review-result.schema.json"
 _IMPLEMENTATION_DIR_NAME = "implementation"
 _IMPLEMENTATION_RESULT_FILE = "result.json"
-_TERMINAL_STATES = frozenset(
-    {
-        WorkflowState.READY_FOR_HUMAN,
-        WorkflowState.HUMAN_REQUIRED,
-        WorkflowState.FAILED,
-    }
-)
 
 
 class ReviewError(RunError):
@@ -97,6 +89,7 @@ class ReviewSafetyViolation:
 class ReviewStageResult:
     run_dir: Path
     run_record: RunRecord
+    outcome: StageOutcome
     artifact_directory: Path
     codex_execution: CodexExecution | None
     review_result: dict[str, Any] | None
@@ -106,7 +99,7 @@ class ReviewStageResult:
 
     @property
     def successful(self) -> bool:
-        return self.run_record.state == WorkflowState.REPORT
+        return self.outcome == StageOutcome.COMPLETED
 
     @property
     def required_findings(self) -> tuple[dict[str, Any], ...]:
@@ -122,12 +115,13 @@ def run_review_stage(
     codex_runner: CodexProcessRunner | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> ReviewStageResult:
+    del clock
     run_path = Path(run_dir)
     run_record_path = run_path / RUN_RECORD_FILE
     run_record = load_run_record(run_record_path)
-    if run_record.state != WorkflowState.VERIFY:
+    if run_record.state != WorkflowState.REVIEWING:
         raise ReviewError(
-            f"Review requires run state VERIFY; found {run_record.state.value}."
+            f"Review requires run state REVIEWING; found {run_record.state.value}."
         )
 
     baseline_record = load_baseline_record(run_path / BASELINE_RECORD_FILE)
@@ -149,16 +143,14 @@ def run_review_stage(
     if starting_violations:
         return _finish(
             run_record=run_record,
-            run_record_path=run_record_path,
             run_dir=run_path,
             artifact_directory=artifact_directory,
             execution=None,
             review_result=None,
             safety_violations=starting_violations,
             processing_error=None,
-            state=WorkflowState.HUMAN_REQUIRED,
+            outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message="Repository no longer matches the recorded review baseline.",
-            clock=clock,
         )
 
     prompt = _render_review_prompt(
@@ -182,28 +174,24 @@ def run_review_stage(
             if safety_violations:
                 return _finish(
                     run_record=run_record,
-                    run_record_path=run_record_path,
                     run_dir=run_path,
                     artifact_directory=artifact_directory,
                     execution=None,
                     review_result=review_result,
                     safety_violations=safety_violations,
                     processing_error=None,
-                    state=WorkflowState.HUMAN_REQUIRED,
+                    outcome=StageOutcome.HUMAN_REQUIRED,
                     controller_message=(
                         "Repository safety invariants were violated before "
                         "review checkpoint adoption."
                     ),
-                    clock=clock,
                 )
             return _finish_valid_review_result(
                 run_record=run_record,
-                run_record_path=run_record_path,
                 run_dir=run_path,
                 artifact_directory=artifact_directory,
                 execution=None,
                 review_result=review_result,
-                clock=clock,
             )
         _archive_review_artifacts(artifact_directory)
     elif artifact_state == _ReviewArtifactState.PARTIAL:
@@ -231,8 +219,8 @@ def run_review_stage(
         )
     except CodexExecutionFailure as error:
         safety_violations = _inspect_review_invariants(repository, run_record)
-        state = (
-            WorkflowState.HUMAN_REQUIRED if safety_violations else WorkflowState.FAILED
+        outcome = (
+            StageOutcome.HUMAN_REQUIRED if safety_violations else StageOutcome.FAILED
         )
         message = (
             "Codex review failed and repository safety invariants were violated."
@@ -241,16 +229,14 @@ def run_review_stage(
         )
         return _finish(
             run_record=run_record,
-            run_record_path=run_record_path,
             run_dir=run_path,
             artifact_directory=artifact_directory,
             execution=error.execution,
             review_result=None,
             safety_violations=safety_violations,
             processing_error=None,
-            state=state,
+            outcome=outcome,
             controller_message=message,
-            clock=clock,
         )
 
     review_result = _require_review_result(execution.structured_result)
@@ -258,26 +244,22 @@ def run_review_stage(
     if safety_violations:
         return _finish(
             run_record=run_record,
-            run_record_path=run_record_path,
             run_dir=run_path,
             artifact_directory=artifact_directory,
             execution=execution,
             review_result=review_result,
             safety_violations=safety_violations,
             processing_error=None,
-            state=WorkflowState.HUMAN_REQUIRED,
+            outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message="Repository safety invariants were violated during review.",
-            clock=clock,
         )
 
     return _finish_valid_review_result(
         run_record=run_record,
-        run_record_path=run_record_path,
         run_dir=run_path,
         artifact_directory=artifact_directory,
         execution=execution,
         review_result=review_result,
-        clock=clock,
     )
 
 
@@ -318,81 +300,66 @@ def format_review_result(result: ReviewStageResult) -> str:
 def _finish_valid_review_result(
     *,
     run_record: RunRecord,
-    run_record_path: Path,
     run_dir: Path,
     artifact_directory: Path,
     execution: CodexExecution | None,
     review_result: dict[str, Any],
-    clock: Callable[[], datetime] | None,
 ) -> ReviewStageResult:
     try:
         validate_review_result_semantics(review_result)
     except ReviewResultConsistencyError as error:
         return _finish(
             run_record=run_record,
-            run_record_path=run_record_path,
             run_dir=run_dir,
             artifact_directory=artifact_directory,
             execution=execution,
             review_result=review_result,
             safety_violations=(),
             processing_error=str(error),
-            state=WorkflowState.HUMAN_REQUIRED,
+            outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=f"Review result is logically contradictory: {error}",
-            clock=clock,
         )
 
     verdict = ReviewVerdict(review_result["verdict"])
     if verdict == ReviewVerdict.PASS:
-        state = WorkflowState.REPORT
+        outcome = StageOutcome.COMPLETED
         controller_message = "Review passed; final report can start."
     elif verdict == ReviewVerdict.CORRECTIONS_REQUIRED:
-        state = WorkflowState.CORRECT
+        outcome = StageOutcome.CORRECTION_REQUIRED
         controller_message = "Review found required corrections."
     else:
-        state = WorkflowState.HUMAN_REQUIRED
+        outcome = StageOutcome.HUMAN_REQUIRED
         controller_message = "Review requires human attention."
 
     return _finish(
         run_record=run_record,
-        run_record_path=run_record_path,
         run_dir=run_dir,
         artifact_directory=artifact_directory,
         execution=execution,
         review_result=review_result,
         safety_violations=(),
         processing_error=None,
-        state=state,
+        outcome=outcome,
         controller_message=controller_message,
-        clock=clock,
     )
 
 
 def _finish(
     *,
     run_record: RunRecord,
-    run_record_path: Path,
     run_dir: Path,
     artifact_directory: Path,
     execution: CodexExecution | None,
     review_result: dict[str, Any] | None,
     safety_violations: tuple[ReviewSafetyViolation, ...],
     processing_error: str | None,
-    state: WorkflowState,
+    outcome: StageOutcome,
     controller_message: str,
-    clock: Callable[[], datetime] | None,
 ) -> ReviewStageResult:
-    updated_record = run_record.with_state(
-        state,
-        updated_timestamp=_timestamp(clock),
-        last_completed_state=WorkflowState.REVIEW,
-        current_review_round=run_record.current_review_round + REVIEW_ROUND_OFFSET,
-        terminal_reason=controller_message if state in _TERMINAL_STATES else None,
-    )
-    save_run_record(updated_record, run_record_path)
     return ReviewStageResult(
         run_dir=run_dir,
-        run_record=updated_record,
+        run_record=run_record,
+        outcome=outcome,
         artifact_directory=artifact_directory,
         codex_execution=execution,
         review_result=review_result,
@@ -579,7 +546,7 @@ def _review_checkpoint(
     return {
         "schema_version": _REVIEW_CHECKPOINT_SCHEMA_VERSION,
         "format": _REVIEW_CHECKPOINT_FORMAT,
-        "stage": WorkflowState.REVIEW.value,
+        "stage": WorkflowState.REVIEWING.value,
         "status": "STARTED",
         "run_id": run_record.run_id,
         "review_round": review_round,
@@ -801,13 +768,6 @@ def _format_files(files: tuple[str, ...]) -> str:
     if hidden_count > 0:
         shown = f"{shown}, and {hidden_count} more"
     return shown
-
-
-def _timestamp(clock: Callable[[], datetime] | None) -> str:
-    now = datetime.now(UTC) if clock is None else clock()
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=UTC)
-    return now.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 __all__ = [

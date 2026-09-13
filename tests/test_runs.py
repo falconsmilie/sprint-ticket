@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -13,8 +12,10 @@ from ticket_automation.models import WorkflowState
 from ticket_automation.runs import (
     BASELINE_RECORD_FORMAT,
     RUN_RECORD_FORMAT,
+    RUN_SCHEMA_VERSION,
     RunError,
     RunPreflightError,
+    RunRecord,
     TicketInputError,
     create_run_snapshot,
     list_run_records,
@@ -27,6 +28,35 @@ from ticket_automation.runs import (
 
 def fixed_clock() -> datetime:
     return datetime(2026, 9, 11, 13, 5, 12, tzinfo=UTC)
+
+
+_ACTIVE_STATES = (
+    WorkflowState.PREPARING,
+    WorkflowState.PREPARED,
+    WorkflowState.IMPLEMENTING,
+    WorkflowState.VERIFYING,
+    WorkflowState.REVIEWING,
+    WorkflowState.CORRECTION_PENDING,
+    WorkflowState.CORRECTING,
+    WorkflowState.REPORTING,
+)
+_NORMAL_AND_CORRECTION_TRANSITIONS = (
+    (WorkflowState.PREPARING, WorkflowState.PREPARED),
+    (WorkflowState.PREPARED, WorkflowState.IMPLEMENTING),
+    (WorkflowState.IMPLEMENTING, WorkflowState.VERIFYING),
+    (WorkflowState.VERIFYING, WorkflowState.REVIEWING),
+    (WorkflowState.VERIFYING, WorkflowState.CORRECTION_PENDING),
+    (WorkflowState.REVIEWING, WorkflowState.REPORTING),
+    (WorkflowState.REVIEWING, WorkflowState.CORRECTION_PENDING),
+    (WorkflowState.CORRECTION_PENDING, WorkflowState.CORRECTING),
+    (WorkflowState.CORRECTING, WorkflowState.VERIFYING),
+    (WorkflowState.REPORTING, WorkflowState.READY_FOR_HUMAN),
+)
+_VALID_TRANSITIONS = (
+    *_NORMAL_AND_CORRECTION_TRANSITIONS,
+    *((state, WorkflowState.HUMAN_REQUIRED) for state in _ACTIVE_STATES),
+    *((state, WorkflowState.FAILED) for state in _ACTIVE_STATES),
+)
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
@@ -46,8 +76,10 @@ def test_valid_run_directory_creation(tmp_path):
     assert result.run_dir.joinpath("run.json").is_file()
     assert result.run_dir.joinpath("ticket.md").is_file()
     assert result.run_dir.joinpath("baseline.json").is_file()
-    assert result.run_record.state == WorkflowState.SNAPSHOT
-    assert result.run_record.last_completed_state == WorkflowState.SNAPSHOT
+    assert result.run_record.state == WorkflowState.PREPARED
+    assert "last_completed_state" not in json.loads(
+        result.run_dir.joinpath("run.json").read_text(encoding="utf-8")
+    )
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
@@ -113,11 +145,71 @@ def test_run_json_survives_load_save_round_trip(tmp_path):
     assert load_run_record(round_trip_path) == result.run_record
 
 
+@pytest.mark.parametrize(("source", "target"), _VALID_TRANSITIONS)
+def test_run_record_accepts_every_legal_transition(source, target):
+    run_record = trusted_run_record(source)
+
+    transitioned = run_record.transition_to(
+        target,
+        updated_timestamp="2026-09-11T13:05:13Z",
+    )
+
+    assert transitioned.state == target
+    assert run_record.state == source
+
+
+@pytest.mark.parametrize(
+    ("source", "target"),
+    [
+        (WorkflowState.PREPARING, WorkflowState.IMPLEMENTING),
+        (WorkflowState.PREPARED, WorkflowState.VERIFYING),
+        (WorkflowState.VERIFYING, WorkflowState.REPORTING),
+        (WorkflowState.CORRECTION_PENDING, WorkflowState.VERIFYING),
+        (WorkflowState.READY_FOR_HUMAN, WorkflowState.PREPARING),
+        (WorkflowState.HUMAN_REQUIRED, WorkflowState.FAILED),
+        (WorkflowState.FAILED, WorkflowState.HUMAN_REQUIRED),
+    ],
+)
+def test_run_record_rejects_representative_invalid_transitions(source, target):
+    with pytest.raises(ValueError, match=rf"{source.value} -> {target.value}"):
+        trusted_run_record(source).transition_to(
+            target,
+            updated_timestamp="2026-09-11T13:05:13Z",
+        )
+
+
+@pytest.mark.parametrize("state", list(WorkflowState))
+def test_run_record_accepts_each_state_at_trusted_deserialization_boundary(state):
+    assert trusted_run_record(state).state == state
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
+def test_old_run_schema_instructs_operator_to_start_a_new_run(tmp_path):
+    repo = create_git_repo(tmp_path / "repo")
+    ticket = tmp_path / "QDEB-003.md"
+    ticket.write_text("# Ticket\n", encoding="utf-8")
+    result = create_run_snapshot(
+        make_config(repo),
+        ticket,
+        runs_dir=tmp_path / "runs",
+        clock=fixed_clock,
+    )
+    record_path = result.run_dir / "run.json"
+    data = json.loads(record_path.read_text(encoding="utf-8"))
+    data["schema_version"] = 1
+    data["state"] = "SNAPSHOT"
+    data["last_completed_state"] = "SNAPSHOT"
+    record_path.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(RunError, match="Start a new run"):
+        load_run_record(record_path)
+
+
 @pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("schema_version", 999, "Unsupported schema_version"),
+        ("schema_version", 999, "Unsupported run record schema version"),
         ("format", "ticket_automation.future_run", "Unsupported format"),
     ],
 )
@@ -196,7 +288,7 @@ def test_record_schema_metadata_uses_current_supported_formats(tmp_path):
         result.run_dir.joinpath("baseline.json").read_text(encoding="utf-8")
     )
 
-    assert run_data["schema_version"] == 1
+    assert run_data["schema_version"] == 2
     assert run_data["format"] == RUN_RECORD_FORMAT
     assert baseline_data["schema_version"] == 1
     assert baseline_data["format"] == BASELINE_RECORD_FORMAT
@@ -219,7 +311,7 @@ def test_correction_round_and_maximum_are_persisted(tmp_path):
     assert data["current_correction_round"] == 0
     assert data["max_correction_rounds"] == 7
     assert data["current_review_round"] == 0
-    assert data["last_completed_state"] == "SNAPSHOT"
+    assert "last_completed_state" not in data
     assert data["terminal_reason"] is None
 
 
@@ -254,7 +346,7 @@ def test_codex_execution_config_is_persisted_in_run_record(tmp_path):
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
-def test_run_record_loads_pre_review_round_records(tmp_path):
+def test_run_record_loads_optional_lifecycle_fields(tmp_path):
     repo = create_git_repo(tmp_path / "repo")
     ticket = tmp_path / "QDEB-003.md"
     ticket.write_text("# Ticket\n", encoding="utf-8")
@@ -266,14 +358,13 @@ def test_run_record_loads_pre_review_round_records(tmp_path):
     )
     record_path = result.run_dir / "run.json"
     data = json.loads(record_path.read_text(encoding="utf-8"))
-    del data["last_completed_state"]
     del data["current_review_round"]
     del data["terminal_reason"]
     record_path.write_text(json.dumps(data), encoding="utf-8")
 
     record = load_run_record(record_path)
 
-    assert record.last_completed_state == record.state
+    assert not hasattr(record, "last_completed_state")
     assert record.current_review_round == 0
     assert record.terminal_reason is None
 
@@ -283,9 +374,9 @@ def test_run_record_loads_pre_review_round_records(tmp_path):
     ("field", "value", "message"),
     [
         (
-            "last_completed_state",
+            "state",
             "UNSUPPORTED",
-            "unsupported workflow state: last_completed_state",
+            "unsupported workflow state: state",
         ),
         (
             "current_correction_round",
@@ -443,9 +534,8 @@ def test_atomic_run_persistence_keeps_previous_record_when_replace_fails(
     )
     record_path = result.run_dir / "run.json"
     original_record = result.run_record
-    changed_record = replace(
-        original_record,
-        state=WorkflowState.PREFLIGHT,
+    changed_record = original_record.transition_to(
+        WorkflowState.IMPLEMENTING,
         updated_timestamp="2026-09-11T13:05:13Z",
     )
 
@@ -480,9 +570,33 @@ def test_status_can_read_multiple_run_records(tmp_path):
     records = list_run_records(runs_dir)
 
     assert {record.ticket_id for record in records} == {"QDEB-003", "QDEB-004"}
-    assert {record.state for record in records} == {WorkflowState.SNAPSHOT}
+    assert {record.state for record in records} == {WorkflowState.PREPARED}
 
 
 def test_ticket_id_is_sanitized_for_paths():
     assert sanitize_ticket_id(" QDEB 003: first pass ") == "QDEB-003-first-pass"
     assert sanitize_ticket_id("...") == "ticket"
+
+
+def trusted_run_record(state: WorkflowState) -> RunRecord:
+    return RunRecord.from_dict(
+        {
+            "schema_version": RUN_SCHEMA_VERSION,
+            "format": RUN_RECORD_FORMAT,
+            "run_id": "trusted-run",
+            "ticket_id": "TA-ARCH-001",
+            "original_ticket_path": "ticket.md",
+            "run_ticket_copy_path": "runs/trusted-run/ticket.md",
+            "target_repository_path": ".",
+            "state": state.value,
+            "starting_branch": "feature/state-machine",
+            "baseline_sha": "abc123",
+            "current_correction_round": 0,
+            "max_correction_rounds": 3,
+            "current_review_round": 0,
+            "codex": {"model": "test-model", "reasoning_effort": "high"},
+            "terminal_reason": None,
+            "created_timestamp": "2026-09-11T13:05:12Z",
+            "updated_timestamp": "2026-09-11T13:05:12Z",
+        }
+    )

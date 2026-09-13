@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -28,7 +28,7 @@ from .codex import (
 )
 from .config import AppConfig
 from .git import GitCommandError, GitRepository
-from .models import WorkflowState
+from .models import StageOutcome, WorkflowState
 from .runs import (
     BASELINE_RECORD_FILE,
     RUN_RECORD_FILE,
@@ -37,7 +37,6 @@ from .runs import (
     RunRecord,
     load_baseline_record,
     load_run_record,
-    save_run_record,
 )
 from .workspace_guard import (
     WorkspaceGuardInspection,
@@ -69,13 +68,6 @@ _CORRECTION_RESULT_SCHEMA = (
 )
 _REVIEW_RESULT_FILE = "result.json"
 _REVIEW_FINDING_DISPOSITIONS = frozenset({"REQUIRED", "ADVISORY", "FOLLOW_UP"})
-_TERMINAL_STATES = frozenset(
-    {
-        WorkflowState.READY_FOR_HUMAN,
-        WorkflowState.HUMAN_REQUIRED,
-        WorkflowState.FAILED,
-    }
-)
 
 
 class CorrectionError(RunError):
@@ -155,6 +147,8 @@ class CorrectionSafetyViolation:
 class CorrectionStageResult:
     run_dir: Path
     run_record: RunRecord
+    outcome: StageOutcome
+    advance_correction_round: bool
     correction_round: int
     ticket_path: Path | None
     artifact_directory: Path
@@ -168,7 +162,7 @@ class CorrectionStageResult:
 
     @property
     def successful(self) -> bool:
-        return self.run_record.state == WorkflowState.VERIFY
+        return self.outcome == StageOutcome.COMPLETED
 
 
 @dataclass(frozen=True)
@@ -189,11 +183,10 @@ def run_correction_stage(
     clock: Callable[[], datetime] | None = None,
 ) -> CorrectionStageResult:
     run_path = Path(run_dir)
-    run_record_path = run_path / RUN_RECORD_FILE
-    run_record = load_run_record(run_record_path)
-    if run_record.state != WorkflowState.CORRECT:
+    run_record = load_run_record(run_path / RUN_RECORD_FILE)
+    if run_record.state != WorkflowState.CORRECTING:
         raise CorrectionError(
-            f"Correction requires run state CORRECT; found {run_record.state.value}."
+            f"Correction requires run state CORRECTING; found {run_record.state.value}."
         )
 
     baseline_record = load_baseline_record(run_path / BASELINE_RECORD_FILE)
@@ -210,7 +203,6 @@ def run_correction_stage(
     if run_record.current_correction_round >= run_record.max_correction_rounds:
         return _finish(
             run_record=run_record,
-            run_record_path=run_record_path,
             run_dir=run_path,
             correction_round=correction_round,
             ticket_path=None,
@@ -220,13 +212,11 @@ def run_correction_stage(
             safety_violations=(),
             correction_reasons=(),
             patch_path=None,
-            state=WorkflowState.HUMAN_REQUIRED,
+            outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=(
                 "Maximum corrective rounds exhausted; human intervention is required."
             ),
-            clock=clock,
             advance_correction_round=False,
-            last_completed_state=run_record.last_completed_state,
         )
 
     starting_violations = _inspect_correction_invariants(
@@ -237,7 +227,6 @@ def run_correction_stage(
     if starting_violations:
         return _finish(
             run_record=run_record,
-            run_record_path=run_record_path,
             run_dir=run_path,
             correction_round=correction_round,
             ticket_path=None,
@@ -247,11 +236,10 @@ def run_correction_stage(
             safety_violations=starting_violations,
             correction_reasons=(),
             patch_path=None,
-            state=WorkflowState.HUMAN_REQUIRED,
+            outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=(
                 "Repository no longer matches the recorded correction baseline."
             ),
-            clock=clock,
             advance_correction_round=False,
         )
 
@@ -266,12 +254,7 @@ def run_correction_stage(
         reasons=reasons,
         run_dir=run_path,
     )
-    active_record = run_record.with_state(
-        WorkflowState.CORRECT,
-        updated_timestamp=_timestamp(clock),
-        last_completed_state=WorkflowState.CORRECT,
-    )
-    save_run_record(active_record, run_record_path)
+    active_record = run_record
     ticket_path = _write_correction_ticket(
         run_path=run_path,
         ticket_id=active_record.ticket_id,
@@ -304,7 +287,7 @@ def run_correction_stage(
     except CodexExecutionFailure as error:
         workspace_guard = inspect_workspace_environment_change(
             before=environment_snapshot,
-            phase=WorkflowState.CORRECT.value,
+            phase=WorkflowState.CORRECTING.value,
             artifact_path=correction_guard_artifact_path(
                 run_path,
                 round_number=correction_round,
@@ -319,10 +302,10 @@ def run_correction_stage(
             execution=error.execution,
             workspace_guard=workspace_guard,
         )
-        state = (
-            WorkflowState.HUMAN_REQUIRED
+        outcome = (
+            StageOutcome.HUMAN_REQUIRED
             if failed_audit.human_required
-            else WorkflowState.FAILED
+            else StageOutcome.FAILED
         )
         message = (
             _failed_writable_message(
@@ -336,7 +319,6 @@ def run_correction_stage(
         )
         return _finish(
             run_record=active_record,
-            run_record_path=run_record_path,
             run_dir=run_path,
             correction_round=correction_round,
             ticket_path=ticket_path,
@@ -347,17 +329,15 @@ def run_correction_stage(
             correction_reasons=reasons,
             patch_path=failed_audit.patch_path,
             workspace_guard=workspace_guard,
-            state=state,
+            outcome=outcome,
             controller_message=message,
-            clock=clock,
             advance_correction_round=False,
-            last_completed_state=run_record.last_completed_state,
         )
 
     agent_result = _require_agent_result(execution.structured_result)
     workspace_guard = inspect_workspace_environment_change(
         before=environment_snapshot,
-        phase=WorkflowState.CORRECT.value,
+        phase=WorkflowState.CORRECTING.value,
         artifact_path=correction_guard_artifact_path(
             run_path,
             round_number=correction_round,
@@ -386,7 +366,6 @@ def run_correction_stage(
             message = f"{message} Correction patch capture error: {patch_error}"
         return _finish(
             run_record=active_record,
-            run_record_path=run_record_path,
             run_dir=run_path,
             correction_round=correction_round,
             ticket_path=ticket_path,
@@ -397,14 +376,12 @@ def run_correction_stage(
             correction_reasons=reasons,
             patch_path=patch_path,
             workspace_guard=workspace_guard,
-            state=WorkflowState.HUMAN_REQUIRED,
+            outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=message,
-            clock=clock,
         )
     if safety_violations:
         return _finish(
             run_record=active_record,
-            run_record_path=run_record_path,
             run_dir=run_path,
             correction_round=correction_round,
             ticket_path=ticket_path,
@@ -415,15 +392,13 @@ def run_correction_stage(
             correction_reasons=reasons,
             patch_path=patch_path,
             workspace_guard=workspace_guard,
-            state=WorkflowState.HUMAN_REQUIRED,
+            outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message="Repository safety invariants were violated.",
-            clock=clock,
         )
 
     if agent_result["status"] == "BLOCKED":
         return _finish(
             run_record=active_record,
-            run_record_path=run_record_path,
             run_dir=run_path,
             correction_round=correction_round,
             ticket_path=ticket_path,
@@ -434,15 +409,13 @@ def run_correction_stage(
             correction_reasons=reasons,
             patch_path=patch_path,
             workspace_guard=workspace_guard,
-            state=WorkflowState.HUMAN_REQUIRED,
+            outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message="Correction agent returned BLOCKED.",
-            clock=clock,
         )
 
     if patch_error is not None:
         return _finish(
             run_record=active_record,
-            run_record_path=run_record_path,
             run_dir=run_path,
             correction_round=correction_round,
             ticket_path=ticket_path,
@@ -453,14 +426,12 @@ def run_correction_stage(
             correction_reasons=reasons,
             patch_path=None,
             workspace_guard=workspace_guard,
-            state=WorkflowState.HUMAN_REQUIRED,
+            outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=patch_error,
-            clock=clock,
         )
 
     return _finish(
         run_record=active_record,
-        run_record_path=run_record_path,
         run_dir=run_path,
         correction_round=correction_round,
         ticket_path=ticket_path,
@@ -471,11 +442,10 @@ def run_correction_stage(
         correction_reasons=reasons,
         patch_path=patch_path,
         workspace_guard=workspace_guard,
-        state=WorkflowState.VERIFY,
+        outcome=StageOutcome.COMPLETED,
         controller_message=(
             "Correction completed; deterministic verification must run next."
         ),
-        clock=clock,
     )
 
 
@@ -647,7 +617,6 @@ def format_correction_result(result: CorrectionStageResult) -> str:
 def _finish(
     *,
     run_record: RunRecord,
-    run_record_path: Path,
     run_dir: Path,
     correction_round: int,
     ticket_path: Path | None,
@@ -658,27 +627,15 @@ def _finish(
     correction_reasons: tuple[CorrectionReason, ...],
     patch_path: Path | None,
     workspace_guard: WorkspaceGuardInspection | None = None,
-    state: WorkflowState,
+    outcome: StageOutcome,
     controller_message: str,
-    clock: Callable[[], datetime] | None,
     advance_correction_round: bool = True,
-    last_completed_state: WorkflowState = WorkflowState.CORRECT,
 ) -> CorrectionStageResult:
-    updated_record = run_record.with_state(
-        state,
-        updated_timestamp=_timestamp(clock),
-        last_completed_state=last_completed_state,
-        current_correction_round=(
-            correction_round
-            if advance_correction_round
-            else run_record.current_correction_round
-        ),
-        terminal_reason=controller_message if state in _TERMINAL_STATES else None,
-    )
-    save_run_record(updated_record, run_record_path)
     return CorrectionStageResult(
         run_dir=run_dir,
-        run_record=updated_record,
+        run_record=run_record,
+        outcome=outcome,
+        advance_correction_round=advance_correction_round,
         correction_round=correction_round,
         ticket_path=ticket_path,
         artifact_directory=artifact_directory,
@@ -705,7 +662,8 @@ def _load_correction_reasons(
         return review_findings
 
     raise CorrectionError(
-        "Run is in CORRECT state but no verification failures or REQUIRED review "
+        "Run is in CORRECTING state but no verification failures or "
+        "REQUIRED review "
         "findings were found."
     )
 
@@ -1442,13 +1400,6 @@ def _format_files(files: tuple[str, ...]) -> str:
 
 def _yes_no(value: bool) -> str:
     return "yes" if value else "no"
-
-
-def _timestamp(clock: Callable[[], datetime] | None) -> str:
-    now = datetime.now(UTC) if clock is None else clock()
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=UTC)
-    return now.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 __all__ = [

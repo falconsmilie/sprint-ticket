@@ -21,7 +21,7 @@ from ticket_automation.implementation import (
     ImplementationError,
     run_implementation_stage,
 )
-from ticket_automation.models import WorkflowState
+from ticket_automation.models import StageOutcome, WorkflowState
 from ticket_automation.runs import create_run_snapshot, load_run_record, save_run_record
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -104,6 +104,7 @@ def test_prompt_contains_full_original_ticket_verbatim(tmp_path):
         runs_dir=tmp_path / "runs",
         clock=fixed_clock,
     )
+    mark_implementing(snapshot_result.run_dir)
     runner = MutatingRunner(
         result=implementation_result(),
         mutation=lambda cwd: cwd.joinpath("file.txt").write_text(
@@ -173,8 +174,8 @@ def test_completed_implementation_is_accepted_and_artifacts_are_stored(tmp_path)
     )
 
     assert result.successful
-    assert result.run_record.state == WorkflowState.IMPLEMENT
-    assert load_run_record(run_dir / "run.json").state == WorkflowState.IMPLEMENT
+    assert result.outcome == StageOutcome.COMPLETED
+    assert load_run_record(run_dir / "run.json").state == WorkflowState.IMPLEMENTING
     assert runner.command is not None
     assert runner.command.cwd == repo
     assert sandbox_value(runner.command.argv) == Sandbox.WORKSPACE_WRITE.value
@@ -213,6 +214,7 @@ def test_snapshotted_ticket_bytes_are_preserved_in_prompt_artifact(tmp_path):
         runs_dir=tmp_path / "runs",
         clock=fixed_clock,
     )
+    mark_implementing(snapshot_result.run_dir)
 
     run_implementation_stage(
         config,
@@ -243,7 +245,7 @@ def test_dirty_worktree_before_implementation_blocks_without_invoking_codex(tmp_
 
     result = run_implementation_stage(config, run_dir, codex_runner=runner)
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert runner.calls == 0
     assert result.codex_execution is None
     assert "worktree" in {violation.name for violation in result.safety_violations}
@@ -261,7 +263,7 @@ def test_changed_branch_before_implementation_blocks_without_invoking_codex(tmp_
 
     result = run_implementation_stage(config, run_dir, codex_runner=runner)
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert runner.calls == 0
     assert result.codex_execution is None
     assert "branch" in {violation.name for violation in result.safety_violations}
@@ -274,13 +276,13 @@ def test_changed_branch_before_implementation_blocks_without_invoking_codex(tmp_
 def test_wrong_run_state_is_rejected_before_invocation(tmp_path):
     _repo, run_dir, config = snapshot(tmp_path)
     run_record_path = run_dir / "run.json"
-    run_record = load_run_record(run_record_path).with_state(
-        WorkflowState.PREFLIGHT,
+    run_record = load_run_record(run_record_path).transition_to(
+        WorkflowState.HUMAN_REQUIRED,
         updated_timestamp="2026-09-11T13:05:14Z",
     )
     save_run_record(run_record, run_record_path)
 
-    with pytest.raises(ImplementationError, match="requires run state SNAPSHOT"):
+    with pytest.raises(ImplementationError, match="requires run state IMPLEMENTING"):
         run_implementation_stage(
             config,
             run_dir,
@@ -315,7 +317,7 @@ def test_blocked_result_becomes_human_required_and_preserves_explanation(tmp_pat
 
     result = run_implementation_stage(config, run_dir, codex_runner=runner)
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     saved_result = json.loads(
         run_dir.joinpath(IMPLEMENTATION_DIR, "result.json").read_text()
     )
@@ -343,7 +345,7 @@ def test_changed_head_is_human_required(tmp_path):
         ),
     )
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert "HEAD" in {violation.name for violation in result.safety_violations}
     assert run_git(
         Path(result.run_record.target_repository_path), "rev-parse", "HEAD"
@@ -365,7 +367,7 @@ def test_changed_branch_is_human_required(tmp_path):
         ),
     )
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert "branch" in {violation.name for violation in result.safety_violations}
     assert run_git(
         Path(result.run_record.target_repository_path),
@@ -393,7 +395,7 @@ def test_staged_files_are_human_required(tmp_path):
         ),
     )
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert "staging" in {violation.name for violation in result.safety_violations}
 
 
@@ -415,7 +417,7 @@ def test_unstaged_source_changes_are_accepted(tmp_path):
         ),
     )
 
-    assert result.run_record.state == WorkflowState.IMPLEMENT
+    assert result.outcome == StageOutcome.COMPLETED
     assert result.safety_violations == ()
 
 
@@ -431,7 +433,7 @@ def test_no_change_completed_implementation_is_human_required(tmp_path):
         codex_runner=MutatingRunner(result=implementation_result()),
     )
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert result.patch_path is None
     assert "without repository changes" in result.controller_message
 
@@ -479,7 +481,7 @@ def test_untracked_files_are_accepted_and_included_in_patch(tmp_path):
         ),
     )
 
-    assert result.run_record.state == WorkflowState.IMPLEMENT
+    assert result.outcome == StageOutcome.COMPLETED
     assert result.changed_files == ("added.txt",)
     assert result.patch_path is not None
     assert "diff --git a/added.txt b/added.txt" in result.patch_path.read_text()
@@ -508,7 +510,7 @@ def test_new_environment_after_completed_implementation_is_human_required(tmp_pa
         clock=fixed_clock,
     )
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert result.workspace_guard is not None
     assert result.workspace_guard.has_violation
     assert result.patch_path is None
@@ -527,7 +529,7 @@ def test_new_environment_after_completed_implementation_is_human_required(tmp_pa
     assert run_git(repo, "diff", "--cached", "--name-only") == ""
     guard_path = run_dir / "workspace-guard" / "implementation.json"
     guard = json.loads(guard_path.read_text(encoding="utf-8"))
-    assert guard["phase"] == "IMPLEMENT"
+    assert guard["phase"] == "IMPLEMENTING"
     assert guard["environments_before"] == []
     assert guard["new_environments"][0]["root"] == ".venv-correction"
     assert guard["new_environments"][0]["markers"] == [".venv-correction/pyvenv.cfg"]
@@ -551,6 +553,7 @@ def test_preexisting_ignored_environment_does_not_block_implementation(tmp_path)
         runs_dir=tmp_path / "runs",
         clock=fixed_clock,
     )
+    mark_implementing(snapshot_result.run_dir)
 
     result = run_implementation_stage(
         config,
@@ -565,7 +568,7 @@ def test_preexisting_ignored_environment_does_not_block_implementation(tmp_path)
         clock=fixed_clock,
     )
 
-    assert result.run_record.state == WorkflowState.IMPLEMENT
+    assert result.outcome == StageOutcome.COMPLETED
     assert result.workspace_guard is not None
     assert not result.workspace_guard.has_violation
     guard = json.loads(
@@ -588,14 +591,14 @@ def test_started_process_failure_becomes_human_required(tmp_path):
 
     result = run_implementation_stage(config, run_dir, codex_runner=runner)
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert result.codex_execution.failure_message == "Codex exited with code 2."
     assert result.codex_execution.process_started is True
     assert (
         result.codex_execution.stderr_log_path.read_text(encoding="utf-8") == "boom\n"
     )
-    assert "Process started: yes" in result.run_record.terminal_reason
-    assert "may have left partial source changes" in result.run_record.terminal_reason
+    assert "Process started: yes" in result.controller_message
+    assert "may have left partial source changes" in result.controller_message
     assert result.patch_path == run_dir / DIFFS_DIR / "failed-implementation.patch"
     assert result.patch_path.is_file()
     execution_record = json.loads(
@@ -627,7 +630,7 @@ def test_failed_writable_implementation_with_partial_changes_is_human_required(
     result = run_implementation_stage(config, run_dir, codex_runner=runner)
 
     assert runner.calls == 1
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert result.changed_files == ("file.txt",)
     assert "worktree" in {violation.name for violation in result.safety_violations}
     assert run_git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "feature/example"
@@ -643,8 +646,8 @@ def test_failed_writable_implementation_with_partial_changes_is_human_required(
     assert result.codex_execution.execution_json_path.is_file()
     assert result.codex_execution.events_jsonl_path.is_file()
     assert result.codex_execution.stderr_log_path.is_file()
-    assert "Execution metadata:" in result.run_record.terminal_reason
-    assert "Baseline-relative failure patch:" in result.run_record.terminal_reason
+    assert "Execution metadata:" in result.controller_message
+    assert "Baseline-relative failure patch:" in result.controller_message
     assert not run_dir.joinpath(DIFFS_DIR, AFTER_IMPLEMENTATION_PATCH).exists()
 
 
@@ -657,7 +660,7 @@ def test_started_untrusted_completion_without_changes_is_human_required(tmp_path
 
     result = run_implementation_stage(config, run_dir, codex_runner=runner)
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert result.changed_files == ()
     assert result.safety_violations == ()
     assert result.patch_path == run_dir / DIFFS_DIR / "failed-implementation.patch"
@@ -667,7 +670,7 @@ def test_started_untrusted_completion_without_changes_is_human_required(tmp_path
         result.codex_execution.failure_kind
         == CodexFailureKind.MISSING_STRUCTURED_RESULT
     )
-    assert "Process started: yes" in result.run_record.terminal_reason
+    assert "Process started: yes" in result.controller_message
 
 
 @pytest.mark.skipif(
@@ -679,7 +682,7 @@ def test_proven_process_start_failure_without_changes_remains_failed(tmp_path):
 
     result = run_implementation_stage(config, run_dir, codex_runner=runner)
 
-    assert result.run_record.state == WorkflowState.FAILED
+    assert result.outcome == StageOutcome.FAILED
     assert result.changed_files == ()
     assert result.patch_path is None
     assert result.diff_stats_path is None
@@ -707,7 +710,7 @@ def test_failed_implementation_with_observed_changes_overrides_nonstart_metadata
 
     result = run_implementation_stage(config, run_dir, codex_runner=runner)
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert result.changed_files == ("file.txt",)
     assert result.codex_execution.process_started is False
     assert "worktree" in {violation.name for violation in result.safety_violations}
@@ -717,7 +720,7 @@ def test_failed_implementation_with_observed_changes_overrides_nonstart_metadata
     )
     assert run_git(repo, "rev-parse", "HEAD") == result.run_record.baseline_sha
     assert run_git(repo, "diff", "--cached", "--name-only") == ""
-    assert "Process started: no" in result.run_record.terminal_reason
+    assert "Process started: no" in result.controller_message
 
 
 @pytest.mark.skipif(
@@ -744,11 +747,11 @@ def test_failed_writable_implementation_records_environment_guard_finding(tmp_pa
         clock=fixed_clock,
     )
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
-    assert result.run_record.last_completed_state == WorkflowState.SNAPSHOT
-    assert "Codex exited with code 2" in result.run_record.terminal_reason
-    assert "Workspace hygiene violation" in result.run_record.terminal_reason
-    assert ".venv-correction/pyvenv.cfg" in result.run_record.terminal_reason
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
+    assert not hasattr(result.run_record, "last_completed_state")
+    assert "Codex exited with code 2" in result.controller_message
+    assert "Workspace hygiene violation" in result.controller_message
+    assert ".venv-correction/pyvenv.cfg" in result.controller_message
     assert result.workspace_guard is not None
     assert result.workspace_guard.has_violation
     assert repo.joinpath(".venv-correction", "pyvenv.cfg").is_file()
@@ -783,10 +786,10 @@ def test_failed_implementation_patch_capture_error_stays_human_required(tmp_path
         ),
     )
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert result.patch_path is None
-    assert "Failure patch capture error:" in result.run_record.terminal_reason
-    assert "may have left partial source changes" in result.run_record.terminal_reason
+    assert "Failure patch capture error:" in result.controller_message
+    assert "may have left partial source changes" in result.controller_message
 
 
 def test_implementation_result_schema_accepts_trusted_statuses():
@@ -835,7 +838,17 @@ def snapshot(tmp_path, ticket_text: str = "# TA-005\n\nImplement the ticket.\n")
         runs_dir=tmp_path / "runs",
         clock=fixed_clock,
     )
+    mark_implementing(result.run_dir)
     return repo, result.run_dir, config
+
+
+def mark_implementing(run_dir: Path) -> None:
+    record_path = run_dir / "run.json"
+    record = load_run_record(record_path).transition_to(
+        WorkflowState.IMPLEMENTING,
+        updated_timestamp="2026-09-11T13:05:13Z",
+    )
+    save_run_record(record, record_path)
 
 
 def implementation_result(status: str = "COMPLETED") -> dict[str, object]:

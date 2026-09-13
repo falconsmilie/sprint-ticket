@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -17,7 +17,7 @@ from ticket_automation.codex import (
     validate_json_schema,
 )
 from ticket_automation.config import AppConfig
-from ticket_automation.models import WorkflowState
+from ticket_automation.models import StageOutcome, WorkflowState
 from ticket_automation.review import (
     REVIEW_DIR_NAME,
     ReviewError,
@@ -101,7 +101,7 @@ def test_review_uses_read_only_sandbox_and_writes_round_one_artifacts(tmp_path):
     result = run_review_stage(config, run_dir, codex_runner=runner, clock=fixed_clock)
 
     assert result.successful
-    assert result.run_record.state == WorkflowState.REPORT
+    assert result.outcome == StageOutcome.COMPLETED
     assert runner.command is not None
     assert sandbox_value(runner.command.argv) == Sandbox.READ_ONLY.value
     review_dir = run_dir / REVIEW_DIR_NAME / ROUND_1
@@ -126,14 +126,15 @@ def test_review_rejects_non_verify_starting_state(tmp_path):
     _repo, run_dir, config = verified_run(tmp_path)
     record_path = run_dir / "run.json"
     save_run_record(
-        load_run_record(record_path).with_state(
-            WorkflowState.IMPLEMENT,
+        replace(
+            load_run_record(record_path),
+            state=WorkflowState.VERIFYING,
             updated_timestamp="2026-09-11T13:05:15Z",
         ),
         record_path,
     )
 
-    with pytest.raises(ReviewError, match="requires run state VERIFY"):
+    with pytest.raises(ReviewError, match="requires run state REVIEWING"):
         run_review_stage(config, run_dir, codex_runner=ReviewRunner(review_result()))
 
 
@@ -153,7 +154,7 @@ def test_review_rejects_non_passing_verification_results_without_invoking_codex(
         run_review_stage(config, run_dir, codex_runner=runner)
 
     assert runner.calls == 0
-    assert load_run_record(run_dir / "run.json").state == WorkflowState.VERIFY
+    assert load_run_record(run_dir / "run.json").state == WorkflowState.REVIEWING
     assert not run_dir.joinpath(REVIEW_DIR_NAME, ROUND_1, "prompt.md").exists()
 
 
@@ -173,7 +174,7 @@ def test_pass_review_accepts_advisory_and_follow_up_observations(tmp_path):
         codex_runner=ReviewRunner(result=result_payload),
     )
 
-    assert result.run_record.state == WorkflowState.REPORT
+    assert result.outcome == StageOutcome.COMPLETED
     assert result.required_findings == ()
     assert [item["disposition"] for item in result.review_result["findings"]] == [
         "ADVISORY",
@@ -197,7 +198,7 @@ def test_corrections_required_moves_to_correct_and_exposes_required_findings(tmp
         ),
     )
 
-    assert result.run_record.state == WorkflowState.CORRECT
+    assert result.outcome == StageOutcome.CORRECTION_REQUIRED
     assert result.required_findings == (required,)
     assert "required corrections" in result.controller_message
 
@@ -218,7 +219,7 @@ def test_human_review_required_moves_to_human_required(tmp_path):
         ),
     )
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert result.review_result["verdict"] == "HUMAN_REVIEW_REQUIRED"
 
 
@@ -234,7 +235,7 @@ def test_pass_with_required_finding_is_rejected_without_changing_verdict(tmp_pat
         ),
     )
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert result.processing_error == "PASS results must not contain REQUIRED findings."
     assert result.review_result["verdict"] == "PASS"
     saved = json.loads(
@@ -258,7 +259,7 @@ def test_corrections_required_without_required_findings_is_rejected(tmp_path):
         ),
     )
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert (
         result.processing_error
         == "CORRECTIONS_REQUIRED results must contain at least one REQUIRED finding."
@@ -278,7 +279,7 @@ def test_branch_invariant_is_rechecked_after_review(tmp_path):
         ),
     )
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert [violation.name for violation in result.safety_violations] == ["branch"]
     assert run_git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "review-branch"
 
@@ -298,7 +299,7 @@ def test_head_invariant_is_rechecked_after_review(tmp_path):
         codex_runner=ReviewRunner(result=review_result(), mutation=commit_change),
     )
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert [violation.name for violation in result.safety_violations] == ["HEAD"]
     assert run_git(repo, "rev-parse", "HEAD") != result.run_record.baseline_sha
 
@@ -317,7 +318,7 @@ def test_staging_invariant_is_rechecked_after_review(tmp_path):
         codex_runner=ReviewRunner(result=review_result(), mutation=stage_change),
     )
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert [violation.name for violation in result.safety_violations] == ["staging"]
 
 
@@ -334,7 +335,7 @@ def test_disposable_repository_does_not_require_earlier_ticket_history(tmp_path)
         codex_runner=ReviewRunner(result=review_result()),
     )
 
-    assert result.run_record.state == WorkflowState.REPORT
+    assert result.outcome == StageOutcome.COMPLETED
     assert run_git(repo, "log", "--oneline").count("initial") == 1
 
 
@@ -450,8 +451,17 @@ def verified_run(
     )
     run_record_path = snapshot.run_dir / "run.json"
     save_run_record(
-        load_run_record(run_record_path).with_state(
-            WorkflowState.VERIFY,
+        load_run_record(run_record_path)
+        .transition_to(
+            WorkflowState.IMPLEMENTING,
+            updated_timestamp="2026-09-11T13:05:14Z",
+        )
+        .transition_to(
+            WorkflowState.VERIFYING,
+            updated_timestamp="2026-09-11T13:05:15Z",
+        )
+        .transition_to(
+            WorkflowState.REVIEWING,
             updated_timestamp="2026-09-11T13:05:15Z",
         ),
         run_record_path,

@@ -27,7 +27,7 @@ from ticket_automation.corrections import (
     run_correction_stage,
 )
 from ticket_automation.git import GitCommandError
-from ticket_automation.models import WorkflowState
+from ticket_automation.models import StageOutcome, WorkflowState
 from ticket_automation.reporting import generate_terminal_report_best_effort
 from ticket_automation.review import ReviewVerdict, run_review_stage
 from ticket_automation.runs import create_run_snapshot, load_run_record, save_run_record
@@ -282,9 +282,12 @@ def test_completed_correction_is_accepted_and_returns_to_verify(tmp_path):
     result = run_correction_stage(config, run_dir, codex_runner=completed_runner())
 
     assert result.successful
-    assert result.run_record.state == WorkflowState.VERIFY
-    assert result.run_record.current_correction_round == 1
-    assert load_run_record(run_dir / "run.json").current_correction_round == 1
+    assert result.outcome == StageOutcome.COMPLETED
+    assert result.advance_correction_round
+    assert result.correction_round == 1
+    assert result.run_record.current_correction_round == 0
+    assert load_run_record(run_dir / "run.json").state == WorkflowState.CORRECTING
+    assert load_run_record(run_dir / "run.json").current_correction_round == 0
     assert "verification must run next" in result.controller_message
     assert result.patch_path == run_dir / "diffs" / "after-correction-1.patch"
 
@@ -298,7 +301,7 @@ def test_blocked_correction_becomes_human_required_and_preserves_explanation(tmp
 
     result = run_correction_stage(config, run_dir, codex_runner=runner)
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert result.agent_result["status"] == "BLOCKED"
     assert result.agent_result["known_issues"] == ["blocked by synthetic ambiguity"]
     assert "BLOCKED" in result.controller_message
@@ -325,7 +328,7 @@ def test_branch_mutation_is_human_required(tmp_path):
         ),
     )
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert [violation.name for violation in result.safety_violations] == ["branch"]
     assert run_git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "correction-branch"
 
@@ -347,7 +350,7 @@ def test_head_mutation_is_human_required(tmp_path):
         codex_runner=CodexRunner(result=correction_result(), mutation=commit_change),
     )
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert [violation.name for violation in result.safety_violations] == ["HEAD"]
     assert run_git(repo, "rev-parse", "HEAD") != result.run_record.baseline_sha
 
@@ -368,7 +371,7 @@ def test_staged_files_are_human_required(tmp_path):
         codex_runner=CodexRunner(result=correction_result(), mutation=stage_change),
     )
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert [violation.name for violation in result.safety_violations] == ["staging"]
 
 
@@ -383,7 +386,7 @@ def test_starting_staged_files_do_not_invoke_or_consume_round(tmp_path):
     result = run_correction_stage(config, run_dir, codex_runner=runner)
 
     assert runner.calls == 0
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert result.run_record.current_correction_round == 0
     assert load_run_record(run_dir / "run.json").current_correction_round == 0
     assert result.ticket_path is None
@@ -427,8 +430,9 @@ def test_new_environment_after_completed_correction_is_human_required(tmp_path):
         clock=fixed_clock,
     )
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
-    assert result.run_record.current_correction_round == 1
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
+    assert result.advance_correction_round
+    assert result.correction_round == 1
     assert result.workspace_guard is not None
     assert result.workspace_guard.has_violation
     assert "Workspace hygiene violation" in result.controller_message
@@ -446,7 +450,7 @@ def test_new_environment_after_completed_correction_is_human_required(tmp_path):
     assert run_git(repo, "diff", "--cached", "--name-only") == ""
     guard_path = run_dir / "workspace-guard" / "correction-round-1.json"
     guard = json.loads(guard_path.read_text(encoding="utf-8"))
-    assert guard["phase"] == "CORRECT"
+    assert guard["phase"] == "CORRECTING"
     assert guard["new_environments"][0]["root"] == ".venv-correction"
     assert guard["new_environments"][0]["markers"] == [".venv-correction/pyvenv.cfg"]
 
@@ -483,7 +487,7 @@ def test_codex_boundary_failure_requires_human_with_canonical_execution_artifact
         artifact_dir.joinpath("execution.json").read_text(encoding="utf-8")
     )
     assert runner.calls == 1
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert artifact_dir.joinpath("prompt.md").is_file()
     assert artifact_dir.joinpath("events.jsonl").is_file()
     assert artifact_dir.joinpath("stderr.log").is_file()
@@ -491,8 +495,8 @@ def test_codex_boundary_failure_requires_human_with_canonical_execution_artifact
     assert result.patch_path == run_dir / "diffs" / "failed-correction-1.patch"
     assert result.patch_path.is_file()
     assert "worktree" in {violation.name for violation in result.safety_violations}
-    assert "Process started: yes" in result.run_record.terminal_reason
-    assert "Execution metadata:" in result.run_record.terminal_reason
+    assert "Process started: yes" in result.controller_message
+    assert "Execution metadata:" in result.controller_message
     assert execution_record["status"] == "FAILED"
     assert execution_record["failure_kind"] == CodexFailureKind.NON_ZERO_EXIT.value
     assert execution_record["process_exit_code"] == 2
@@ -515,7 +519,7 @@ def test_failed_writable_correction_with_partial_changes_is_human_required(tmp_p
     result = run_correction_stage(config, run_dir, codex_runner=runner)
 
     assert runner.calls == 1
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert result.run_record.current_correction_round == 0
     assert run_git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "feature/example"
     assert run_git(repo, "rev-parse", "HEAD") == result.run_record.baseline_sha
@@ -530,7 +534,7 @@ def test_failed_writable_correction_with_partial_changes_is_human_required(tmp_p
     assert result.codex_execution.events_jsonl_path.is_file()
     assert result.codex_execution.stderr_log_path.is_file()
     assert "worktree" in {violation.name for violation in result.safety_violations}
-    assert "Baseline-relative failure patch:" in result.run_record.terminal_reason
+    assert "Baseline-relative failure patch:" in result.controller_message
     assert not run_dir.joinpath("diffs", "after-correction-1.patch").exists()
 
 
@@ -549,7 +553,7 @@ def test_failed_correction_with_observed_changes_overrides_nonstart_metadata(tmp
 
     result = run_correction_stage(config, run_dir, codex_runner=runner)
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert result.run_record.current_correction_round == 0
     assert result.codex_execution.process_started is False
     assert "worktree" in {violation.name for violation in result.safety_violations}
@@ -559,7 +563,7 @@ def test_failed_correction_with_observed_changes_overrides_nonstart_metadata(tmp
     )
     assert run_git(repo, "rev-parse", "HEAD") == result.run_record.baseline_sha
     assert run_git(repo, "diff", "--cached", "--name-only") == ""
-    assert "Process started: no" in result.run_record.terminal_reason
+    assert "Process started: no" in result.controller_message
 
 
 @pytest.mark.skipif(
@@ -581,11 +585,11 @@ def test_failed_writable_correction_records_environment_guard_finding(tmp_path):
         clock=fixed_clock,
     )
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert result.run_record.current_correction_round == 0
-    assert "Codex exited with code 2" in result.run_record.terminal_reason
-    assert "Workspace hygiene violation" in result.run_record.terminal_reason
-    assert ".venv-correction/pyvenv.cfg" in result.run_record.terminal_reason
+    assert "Codex exited with code 2" in result.controller_message
+    assert "Workspace hygiene violation" in result.controller_message
+    assert ".venv-correction/pyvenv.cfg" in result.controller_message
     assert result.workspace_guard is not None
     assert result.workspace_guard.has_violation
     assert repo.joinpath(".venv-correction", "pyvenv.cfg").is_file()
@@ -619,11 +623,11 @@ def test_failed_correction_patch_capture_error_stays_human_required(tmp_path):
         ),
     )
 
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert result.run_record.current_correction_round == 0
     assert result.patch_path is None
-    assert "Failure patch capture error:" in result.run_record.terminal_reason
-    assert "may have left partial source changes" in result.run_record.terminal_reason
+    assert "Failure patch capture error:" in result.controller_message
+    assert "may have left partial source changes" in result.controller_message
 
 
 @pytest.mark.skipif(
@@ -645,7 +649,7 @@ def test_correction_diff_capture_failure_after_mutation_is_human_required(
     result = run_correction_stage(config, run_dir, codex_runner=runner)
 
     assert runner.calls == 1
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert result.patch_path is None
     assert "Could not capture correction diff" in result.controller_message
     assert "synthetic diff decode failure" in result.controller_message
@@ -677,7 +681,7 @@ def test_untracked_unicode_file_is_handled_by_correction_and_reporting(tmp_path)
         ),
     )
 
-    assert result.run_record.state == WorkflowState.VERIFY
+    assert result.outcome == StageOutcome.COMPLETED
     assert result.patch_path is not None
     correction_patch = result.patch_path.read_text(encoding="utf-8")
     assert "diff --git a/unicode.txt b/unicode.txt" in correction_patch
@@ -759,7 +763,7 @@ def test_no_real_outstanding_ta_ticket_is_required_for_correction_behavior(tmp_p
 
     result = run_correction_stage(config, run_dir, codex_runner=completed_runner())
 
-    assert result.run_record.state == WorkflowState.VERIFY
+    assert result.outcome == StageOutcome.COMPLETED
     assert "Synthetic Correction" in result.codex_execution.prompt_path.read_text(
         encoding="utf-8"
     )
@@ -773,11 +777,21 @@ def test_verification_can_run_after_completed_correction(tmp_path):
         tmp_path,
         verification_commands=(passing_gate("tests"),),
     )
-    run_correction_stage(config, run_dir, codex_runner=completed_runner())
+    correction = run_correction_stage(config, run_dir, codex_runner=completed_runner())
+    assert correction.outcome == StageOutcome.COMPLETED
+    record_path = run_dir / "run.json"
+    save_run_record(
+        load_run_record(record_path).transition_to(
+            WorkflowState.VERIFYING,
+            updated_timestamp="2026-09-11T13:05:17Z",
+            current_correction_round=correction.correction_round,
+        ),
+        record_path,
+    )
 
     result = run_verification_stage(config, run_dir)
 
-    assert result.run_record.state == WorkflowState.VERIFY
+    assert result.outcome == StageOutcome.COMPLETED
     assert result.round_result.round_index == 1
     assert result.round_result.json_path == run_dir / "verification" / "round-1.json"
 
@@ -832,9 +846,13 @@ def prepared_verification_run(
         clock=fixed_clock,
     )
     repo.joinpath("file.txt").write_text("implemented\n", encoding="utf-8")
-    mark_run_state(snapshot.run_dir, WorkflowState.IMPLEMENT)
-    run_verification_stage(config, snapshot.run_dir)
-    assert load_run_record(snapshot.run_dir / "run.json").state == WorkflowState.CORRECT
+    mark_run_state(snapshot.run_dir, WorkflowState.VERIFYING)
+    verification_result = run_verification_stage(config, snapshot.run_dir)
+    assert verification_result.outcome == StageOutcome.CORRECTION_REQUIRED
+    mark_run_state(
+        snapshot.run_dir,
+        WorkflowState.CORRECTING,
+    )
     return repo, snapshot.run_dir, config
 
 
@@ -867,8 +885,8 @@ def review_correct_run(
         )
     write_implementation_result(snapshot.run_dir)
     write_passing_verification(snapshot.run_dir, repo)
-    mark_run_state(snapshot.run_dir, WorkflowState.VERIFY)
-    run_review_stage(
+    mark_run_state(snapshot.run_dir, WorkflowState.REVIEWING)
+    review_stage_result = run_review_stage(
         config,
         snapshot.run_dir,
         codex_runner=CodexRunner(
@@ -878,7 +896,12 @@ def review_correct_run(
             )
         ),
     )
-    assert load_run_record(snapshot.run_dir / "run.json").state == WorkflowState.CORRECT
+    assert review_stage_result.outcome == StageOutcome.CORRECTION_REQUIRED
+    mark_run_state(
+        snapshot.run_dir,
+        WorkflowState.CORRECTING,
+        current_review_round=1,
+    )
     return repo, snapshot.run_dir, config
 
 
@@ -937,16 +960,44 @@ def mark_run_state(
     state: WorkflowState,
     *,
     current_correction_round: int | None = None,
+    current_review_round: int | None = None,
 ) -> None:
     run_record_path = run_dir / "run.json"
-    save_run_record(
-        load_run_record(run_record_path).with_state(
-            state,
+    run_record = load_run_record(run_record_path)
+    if state == WorkflowState.CORRECTING and run_record.state in {
+        WorkflowState.VERIFYING,
+        WorkflowState.REVIEWING,
+    }:
+        transition_path = (
+            WorkflowState.CORRECTION_PENDING,
+            WorkflowState.CORRECTING,
+        )
+    else:
+        transition_path = {
+            WorkflowState.VERIFYING: (
+                WorkflowState.IMPLEMENTING,
+                WorkflowState.VERIFYING,
+            ),
+            WorkflowState.REVIEWING: (
+                WorkflowState.IMPLEMENTING,
+                WorkflowState.VERIFYING,
+                WorkflowState.REVIEWING,
+            ),
+            WorkflowState.CORRECTING: (
+                WorkflowState.IMPLEMENTING,
+                WorkflowState.VERIFYING,
+                WorkflowState.CORRECTION_PENDING,
+                WorkflowState.CORRECTING,
+            ),
+        }[state]
+    for next_state in transition_path:
+        run_record = run_record.transition_to(
+            next_state,
             updated_timestamp="2026-09-11T13:05:16Z",
             current_correction_round=current_correction_round,
-        ),
-        run_record_path,
-    )
+            current_review_round=current_review_round,
+        )
+    save_run_record(run_record, run_record_path)
 
 
 def review_result(

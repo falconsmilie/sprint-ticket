@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 import sys
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -15,7 +15,7 @@ from ticket_automation.corrections import (
     ReviewFinding,
     VerificationFailure,
 )
-from ticket_automation.models import WorkflowState
+from ticket_automation.models import StageOutcome, WorkflowState
 from ticket_automation.runs import create_run_snapshot, load_run_record, save_run_record
 from ticket_automation.verification import (
     SubprocessVerificationRunner,
@@ -31,7 +31,7 @@ from ticket_automation.verification import (
 
 
 def fixed_clock() -> datetime:
-    return datetime(2026, 9, 11, 13, 5, 14, tzinfo=timezone.utc)
+    return datetime(2026, 9, 11, 13, 5, 14, tzinfo=UTC)
 
 
 def test_subprocess_output_decoding_does_not_depend_on_locale(tmp_path):
@@ -86,8 +86,8 @@ def test_one_passing_command_moves_run_to_verify_and_writes_round_zero(tmp_path)
     result = run_verification_stage(config, run_dir, clock=fixed_clock)
 
     assert result.successful
-    assert result.run_record.state == WorkflowState.VERIFY
-    assert load_run_record(run_dir / "run.json").state == WorkflowState.VERIFY
+    assert result.outcome == StageOutcome.COMPLETED
+    assert load_run_record(run_dir / "run.json").state == WorkflowState.VERIFYING
     assert result.round_result.status == VerificationStatus.PASS
     assert result.round_result.json_path == run_dir / "verification" / "round-0.json"
     assert result.round_result.log_path == run_dir / "verification" / "round-0.log"
@@ -104,21 +104,22 @@ def test_one_passing_command_moves_run_to_verify_and_writes_round_zero(tmp_path)
 @pytest.mark.parametrize(
     "state",
     [
-        WorkflowState.SNAPSHOT,
-        WorkflowState.CORRECT,
+        WorkflowState.PREPARED,
+        WorkflowState.CORRECTION_PENDING,
         WorkflowState.HUMAN_REQUIRED,
     ],
 )
 def test_verification_rejects_untrusted_starting_states(tmp_path, state):
     repo, run_dir = implementation_ready_run(tmp_path)
     run_record_path = run_dir / "run.json"
-    run_record = load_run_record(run_record_path).with_state(
-        state,
+    run_record = replace(
+        load_run_record(run_record_path),
+        state=state,
         updated_timestamp="2026-09-11T13:05:15Z",
     )
     save_run_record(run_record, run_record_path)
 
-    with pytest.raises(VerificationError, match="requires run state IMPLEMENT"):
+    with pytest.raises(VerificationError, match="requires run state VERIFYING"):
         run_verification_stage(make_config(repo), run_dir)
 
 
@@ -137,7 +138,7 @@ def test_multiple_passing_commands_all_run(tmp_path):
 
     result = run_verification_stage(config, run_dir)
 
-    assert result.run_record.state == WorkflowState.VERIFY
+    assert result.outcome == StageOutcome.COMPLETED
     assert [command.status for command in result.round_result.commands] == [
         VerificationStatus.PASS,
         VerificationStatus.PASS,
@@ -175,7 +176,7 @@ def test_failing_gates_move_run_to_correct_and_preserve_all_failures(
 
     result = run_verification_stage(config, run_dir)
 
-    assert result.run_record.state == WorkflowState.CORRECT
+    assert result.outcome == StageOutcome.CORRECTION_REQUIRED
     assert result.round_result.status == VerificationStatus.FAIL
     assert [
         command.name for command in result.round_result.failed_commands
@@ -211,7 +212,7 @@ def test_command_timeout_is_an_error_and_preserves_partial_output(tmp_path):
     result = run_verification_stage(config, run_dir, process_runner=runner)
 
     command = result.round_result.commands[0]
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert result.round_result.status == VerificationStatus.ERROR
     assert command.status == VerificationStatus.ERROR
     assert command.error_kind == VerificationErrorKind.TIMEOUT
@@ -239,7 +240,7 @@ def test_passing_command_that_mutates_worktree_becomes_human_required(tmp_path):
     result = run_verification_stage(config, run_dir)
 
     command = result.round_result.commands[0]
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert result.round_result.status == VerificationStatus.ERROR
     assert command.status == VerificationStatus.PASS
     assert result.round_result.correction_reasons == ()
@@ -273,7 +274,7 @@ def test_executable_unavailable_is_an_error_not_a_correction_reason(tmp_path):
     result = run_verification_stage(config, run_dir)
 
     command = result.round_result.commands[0]
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
     assert command.status == VerificationStatus.ERROR
     assert command.error_kind == VerificationErrorKind.EXECUTABLE_UNAVAILABLE
     assert command.exit_code is None
@@ -389,7 +390,7 @@ def test_correction_reason_contains_gate_command_summary_output_and_exit_code(tm
 
     result = run_verification_stage(config, run_dir)
 
-    assert result.run_record.state == WorkflowState.CORRECT
+    assert result.outcome == StageOutcome.CORRECTION_REQUIRED
     reason = result.round_result.correction_reasons[0]
     assert isinstance(reason, VerificationFailure)
     assert reason.kind == CorrectionReasonKind.VERIFICATION_FAILURE
@@ -439,8 +440,12 @@ def implementation_ready_run(tmp_path):
         clock=fixed_clock,
     )
     run_record_path = snapshot.run_dir / "run.json"
-    run_record = load_run_record(run_record_path).with_state(
-        WorkflowState.IMPLEMENT,
+    run_record = load_run_record(run_record_path).transition_to(
+        WorkflowState.IMPLEMENTING,
+        updated_timestamp="2026-09-11T13:05:14Z",
+    )
+    run_record = run_record.transition_to(
+        WorkflowState.VERIFYING,
         updated_timestamp="2026-09-11T13:05:14Z",
     )
     save_run_record(run_record, run_record_path)

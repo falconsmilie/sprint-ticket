@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +26,7 @@ from .codex import (
 )
 from .config import AppConfig
 from .git import GitCommandError, GitRepository
-from .models import WorkflowState
+from .models import StageOutcome, WorkflowState
 from .runs import (
     BASELINE_RECORD_FILE,
     RUN_RECORD_FILE,
@@ -35,7 +35,6 @@ from .runs import (
     RunRecord,
     load_baseline_record,
     load_run_record,
-    save_run_record,
 )
 from .workspace_guard import (
     WorkspaceGuardInspection,
@@ -63,13 +62,6 @@ _IMPLEMENTATION_PROMPT_TEMPLATE = _PROJECT_ROOT / "prompts" / "implement.md"
 _IMPLEMENTATION_RESULT_SCHEMA = (
     _PROJECT_ROOT / "schemas" / "implementation-result.schema.json"
 )
-_TERMINAL_STATES = frozenset(
-    {
-        WorkflowState.READY_FOR_HUMAN,
-        WorkflowState.HUMAN_REQUIRED,
-        WorkflowState.FAILED,
-    }
-)
 
 
 class ImplementationError(RunError):
@@ -88,6 +80,7 @@ class _ImplementationSafetyViolation:
 class ImplementationStageResult:
     run_dir: Path
     run_record: RunRecord
+    outcome: StageOutcome
     artifact_directory: Path
     codex_execution: CodexExecution | None
     agent_result: dict[str, Any] | None
@@ -100,7 +93,7 @@ class ImplementationStageResult:
 
     @property
     def successful(self) -> bool:
-        return self.run_record.state == WorkflowState.IMPLEMENT
+        return self.outcome == StageOutcome.COMPLETED
 
 
 @dataclass(frozen=True)
@@ -122,11 +115,11 @@ def run_implementation_stage(
     clock: Callable[[], datetime] | None = None,
 ) -> ImplementationStageResult:
     run_path = Path(run_dir)
-    run_record_path = run_path / RUN_RECORD_FILE
-    run_record = load_run_record(run_record_path)
-    if run_record.state != WorkflowState.SNAPSHOT:
+    run_record = load_run_record(run_path / RUN_RECORD_FILE)
+    if run_record.state != WorkflowState.IMPLEMENTING:
         raise ImplementationError(
-            f"Implementation requires run state SNAPSHOT; found {run_record.state.value}."
+            "Implementation requires run state IMPLEMENTING; "
+            f"found {run_record.state.value}."
         )
 
     baseline_record = load_baseline_record(run_path / BASELINE_RECORD_FILE)
@@ -143,7 +136,6 @@ def run_implementation_stage(
     if starting_violations:
         return _finish(
             run_record=run_record,
-            run_record_path=run_record_path,
             run_dir=run_path,
             artifact_directory=implementation_dir,
             execution=None,
@@ -152,17 +144,11 @@ def run_implementation_stage(
             changed_files=(),
             patch_path=None,
             diff_stats_path=None,
-            state=WorkflowState.HUMAN_REQUIRED,
+            outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message="Repository no longer matches the clean implementation baseline.",
-            clock=clock,
         )
 
-    active_record = run_record.with_state(
-        WorkflowState.IMPLEMENT,
-        updated_timestamp=_timestamp(clock),
-        last_completed_state=WorkflowState.SNAPSHOT,
-    )
-    save_run_record(active_record, run_record_path)
+    active_record = run_record
     prompt = _render_implementation_prompt(ticket_text)
     environment_snapshot = capture_workspace_environment_snapshot(repository.path)
 
@@ -180,7 +166,7 @@ def run_implementation_stage(
     except CodexExecutionFailure as error:
         workspace_guard = inspect_workspace_environment_change(
             before=environment_snapshot,
-            phase=WorkflowState.IMPLEMENT.value,
+            phase=WorkflowState.IMPLEMENTING.value,
             artifact_path=implementation_guard_artifact_path(run_path),
             clock=clock,
         )
@@ -191,10 +177,10 @@ def run_implementation_stage(
             execution=error.execution,
             workspace_guard=workspace_guard,
         )
-        state = (
-            WorkflowState.HUMAN_REQUIRED
+        outcome = (
+            StageOutcome.HUMAN_REQUIRED
             if failed_audit.human_required
-            else WorkflowState.FAILED
+            else StageOutcome.FAILED
         )
         message = (
             _failed_writable_message(
@@ -208,7 +194,6 @@ def run_implementation_stage(
         )
         return _finish(
             run_record=active_record,
-            run_record_path=run_record_path,
             run_dir=run_path,
             artifact_directory=implementation_dir,
             execution=error.execution,
@@ -218,16 +203,14 @@ def run_implementation_stage(
             patch_path=failed_audit.patch_path,
             diff_stats_path=failed_audit.diff_stats_path,
             workspace_guard=workspace_guard,
-            state=state,
+            outcome=outcome,
             controller_message=message,
-            clock=clock,
-            last_completed_state=active_record.last_completed_state,
         )
 
     agent_result = _require_agent_result(execution.structured_result)
     workspace_guard = inspect_workspace_environment_change(
         before=environment_snapshot,
-        phase=WorkflowState.IMPLEMENT.value,
+        phase=WorkflowState.IMPLEMENTING.value,
         artifact_path=implementation_guard_artifact_path(run_path),
         clock=clock,
     )
@@ -239,7 +222,6 @@ def run_implementation_stage(
     if workspace_guard.has_violation:
         return _finish(
             run_record=active_record,
-            run_record_path=run_record_path,
             run_dir=run_path,
             artifact_directory=implementation_dir,
             execution=execution,
@@ -249,19 +231,17 @@ def run_implementation_stage(
             patch_path=None,
             diff_stats_path=None,
             workspace_guard=workspace_guard,
-            state=WorkflowState.HUMAN_REQUIRED,
+            outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=format_workspace_hygiene_violation(
                 workspace_guard,
                 operation="implementation",
                 run_dir=run_path,
                 git_safety=_format_failure_safety(safety_violations),
             ),
-            clock=clock,
         )
     if safety_violations:
         return _finish(
             run_record=active_record,
-            run_record_path=run_record_path,
             run_dir=run_path,
             artifact_directory=implementation_dir,
             execution=execution,
@@ -271,9 +251,8 @@ def run_implementation_stage(
             patch_path=None,
             diff_stats_path=None,
             workspace_guard=workspace_guard,
-            state=WorkflowState.HUMAN_REQUIRED,
+            outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message="Repository safety invariants were violated.",
-            clock=clock,
         )
 
     try:
@@ -281,7 +260,6 @@ def run_implementation_stage(
     except ImplementationError as error:
         return _finish(
             run_record=active_record,
-            run_record_path=run_record_path,
             run_dir=run_path,
             artifact_directory=implementation_dir,
             execution=execution,
@@ -291,15 +269,13 @@ def run_implementation_stage(
             patch_path=None,
             diff_stats_path=None,
             workspace_guard=workspace_guard,
-            state=WorkflowState.HUMAN_REQUIRED,
+            outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=str(error),
-            clock=clock,
         )
     agent_status = agent_result["status"]
     if agent_status == "BLOCKED":
         return _finish(
             run_record=active_record,
-            run_record_path=run_record_path,
             run_dir=run_path,
             artifact_directory=implementation_dir,
             execution=execution,
@@ -309,15 +285,13 @@ def run_implementation_stage(
             patch_path=None,
             diff_stats_path=None,
             workspace_guard=workspace_guard,
-            state=WorkflowState.HUMAN_REQUIRED,
+            outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message="Implementation agent returned BLOCKED.",
-            clock=clock,
         )
 
     if not changed_files:
         return _finish(
             run_record=active_record,
-            run_record_path=run_record_path,
             run_dir=run_path,
             artifact_directory=implementation_dir,
             execution=execution,
@@ -327,9 +301,8 @@ def run_implementation_stage(
             patch_path=None,
             diff_stats_path=None,
             workspace_guard=workspace_guard,
-            state=WorkflowState.HUMAN_REQUIRED,
+            outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message="Implementation completed without repository changes.",
-            clock=clock,
         )
 
     try:
@@ -341,7 +314,6 @@ def run_implementation_stage(
     except ImplementationError as error:
         return _finish(
             run_record=active_record,
-            run_record_path=run_record_path,
             run_dir=run_path,
             artifact_directory=implementation_dir,
             execution=execution,
@@ -351,13 +323,11 @@ def run_implementation_stage(
             patch_path=None,
             diff_stats_path=None,
             workspace_guard=workspace_guard,
-            state=WorkflowState.HUMAN_REQUIRED,
+            outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=str(error),
-            clock=clock,
         )
     return _finish(
         run_record=active_record,
-        run_record_path=run_record_path,
         run_dir=run_path,
         artifact_directory=implementation_dir,
         execution=execution,
@@ -367,9 +337,8 @@ def run_implementation_stage(
         patch_path=patch_path,
         diff_stats_path=diff_stats_path,
         workspace_guard=workspace_guard,
-        state=WorkflowState.IMPLEMENT,
+        outcome=StageOutcome.COMPLETED,
         controller_message="Implementation completed and Git safety checks passed.",
-        clock=clock,
     )
 
 
@@ -417,7 +386,6 @@ def format_implementation_result(result: ImplementationStageResult) -> str:
 def _finish(
     *,
     run_record: RunRecord,
-    run_record_path: Path,
     run_dir: Path,
     artifact_directory: Path,
     execution: CodexExecution | None,
@@ -427,21 +395,13 @@ def _finish(
     patch_path: Path | None,
     diff_stats_path: Path | None,
     workspace_guard: WorkspaceGuardInspection | None = None,
-    state: WorkflowState,
+    outcome: StageOutcome,
     controller_message: str,
-    clock: Callable[[], datetime] | None,
-    last_completed_state: WorkflowState = WorkflowState.IMPLEMENT,
 ) -> ImplementationStageResult:
-    updated_record = run_record.with_state(
-        state,
-        updated_timestamp=_timestamp(clock),
-        last_completed_state=last_completed_state,
-        terminal_reason=controller_message if state in _TERMINAL_STATES else None,
-    )
-    save_run_record(updated_record, run_record_path)
     return ImplementationStageResult(
         run_dir=run_dir,
-        run_record=updated_record,
+        run_record=run_record,
+        outcome=outcome,
         artifact_directory=artifact_directory,
         codex_execution=execution,
         agent_result=agent_result,
@@ -762,13 +722,6 @@ def _format_files(files: tuple[str, ...]) -> str:
 
 def _yes_no(value: bool) -> str:
     return "yes" if value else "no"
-
-
-def _timestamp(clock: Callable[[], datetime] | None) -> str:
-    now = datetime.now(UTC) if clock is None else clock()
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=UTC)
-    return now.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 __all__ = [

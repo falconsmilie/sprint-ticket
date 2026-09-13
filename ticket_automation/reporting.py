@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -13,8 +12,8 @@ from .audit import (
     diff_stats_including_untracked,
 )
 from .git import GitCommandError, GitRepository
-from .models import WorkflowState
-from .runs import RUN_RECORD_FILE, RunError, RunRecord, load_run_record, save_run_record
+from .models import StageOutcome, WorkflowState
+from .runs import RUN_RECORD_FILE, RunError, RunRecord, load_run_record
 from .workspace_guard import WORKSPACE_GUARD_DIR_NAME
 
 DIFFS_DIR_NAME = "diffs"
@@ -64,6 +63,7 @@ class GitSafetyStatus:
 class ReportStageResult:
     run_dir: Path
     run_record: RunRecord
+    outcome: StageOutcome
     final_patch_path: Path
     final_report_path: Path
     changed_files: tuple[str, ...]
@@ -74,39 +74,39 @@ class ReportStageResult:
 
     @property
     def successful(self) -> bool:
-        return self.run_record.state == WorkflowState.READY_FOR_HUMAN
+        return self.outcome == StageOutcome.COMPLETED
 
 
 def run_report_stage(
     run_dir: Path | str,
     *,
-    clock: Callable[[], datetime] | None = None,
+    transition_record: Callable[[RunRecord, StageOutcome, str | None], RunRecord],
 ) -> ReportStageResult:
     run_path = Path(run_dir)
     record_path = run_path / RUN_RECORD_FILE
     run_record = load_run_record(record_path)
-    if run_record.state != WorkflowState.REPORT:
+    if run_record.state != WorkflowState.REPORTING:
         raise ReportError(
-            f"Report requires run state REPORT; found {run_record.state.value}."
+            f"Report requires run state REPORTING; found {run_record.state.value}."
         )
 
     final_patch_path, patch_text = capture_final_patch(run_path, run_record)
     context = collect_report_context(run_path, run_record, patch_text=patch_text)
     acceptance_problem = _acceptance_problem(context)
     if acceptance_problem is None:
-        updated_record = run_record.with_state(
-            WorkflowState.READY_FOR_HUMAN,
-            updated_timestamp=_timestamp(clock),
-            last_completed_state=WorkflowState.REPORT,
-            terminal_reason=None,
+        outcome = StageOutcome.COMPLETED
+        updated_record = transition_record(
+            run_record,
+            outcome,
+            None,
         )
         controller_message = "Final report generated; ready for human review."
     else:
-        updated_record = run_record.with_state(
-            WorkflowState.HUMAN_REQUIRED,
-            updated_timestamp=_timestamp(clock),
-            last_completed_state=WorkflowState.REPORT,
-            terminal_reason=acceptance_problem,
+        outcome = StageOutcome.HUMAN_REQUIRED
+        updated_record = transition_record(
+            run_record,
+            outcome,
+            acceptance_problem,
         )
         controller_message = acceptance_problem
 
@@ -116,16 +116,13 @@ def run_report_stage(
     _write_text(final_report_path, report_text)
 
     refreshed_safety = inspect_git_safety(run_record)
-    if (
-        not refreshed_safety.safe
-        and updated_record.state == WorkflowState.READY_FOR_HUMAN
-    ):
+    if not refreshed_safety.safe and outcome == StageOutcome.COMPLETED:
         acceptance_problem = "Repository safety invariants changed during reporting."
-        updated_record = run_record.with_state(
-            WorkflowState.HUMAN_REQUIRED,
-            updated_timestamp=_timestamp(clock),
-            last_completed_state=WorkflowState.REPORT,
-            terminal_reason=acceptance_problem,
+        outcome = StageOutcome.HUMAN_REQUIRED
+        updated_record = transition_record(
+            run_record,
+            outcome,
+            acceptance_problem,
         )
         context = collect_report_context(
             run_path, updated_record, patch_text=patch_text
@@ -137,10 +134,10 @@ def run_report_stage(
         )
         controller_message = acceptance_problem
 
-    save_run_record(updated_record, record_path)
     return ReportStageResult(
         run_dir=run_path,
         run_record=updated_record,
+        outcome=outcome,
         final_patch_path=final_patch_path,
         final_report_path=final_report_path,
         changed_files=tuple(context["controller"]["changed_files"]),
@@ -299,7 +296,7 @@ def render_final_report(
         f"- Target repository path: {record.target_repository_path}",
         f"- Starting branch: {record.starting_branch}",
         f"- Baseline SHA: {record.baseline_sha}",
-        f"- Last completed state: {record.last_completed_state.value}",
+        f"- Workflow state: {record.state.value}",
         f"- Terminal outcome: {record.state.value}",
     ]
     if terminal_reason:
@@ -804,7 +801,6 @@ def _write_minimal_terminal_report(
         f"- Run path: {run_path}",
         f"- Target repository path: {run_record.target_repository_path}",
         f"- State: {run_record.state.value}",
-        f"- Last completed state: {run_record.last_completed_state.value}",
         f"- Primary failure: {run_record.terminal_reason or 'unknown'}",
         f"- Reporting fallback: {type(reporting_error).__name__}: {reporting_error}",
         "- Manual inspection required.",
@@ -816,13 +812,6 @@ def _write_minimal_terminal_report(
     except Exception:  # noqa: BLE001 - outer boundary is best effort.
         return None
     return report_path
-
-
-def _timestamp(clock: Callable[[], datetime] | None) -> str:
-    now = datetime.now(UTC) if clock is None else clock()
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=UTC)
-    return now.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 __all__ = [
