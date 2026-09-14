@@ -12,5 +12,7 @@ dist/
 config.local.toml
 runs/*
 !runs/.gitkeep
+tickets/*
+!tickets/.gitkeep
 
 .idea/

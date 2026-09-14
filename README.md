@@ -1,12 +1,51 @@
-# TicketAutomation
+# SprintTicket
 
-TicketAutomation is a synchronous local controller for one implementation
-ticket at a time. It asks Codex to implement, verify, review, and, by default,
+SprintTicket is a synchronous local controller for implementation of one
+ticket at a time. It asks Codex (currently) to implement, verify, review, and, by default,
 make one corrective pass. The target repository remains under human Git
-control: TicketAutomation never stages, commits, switches branches, or cleans
+control: SprintTicket never stages, commits, switches branches, or cleans
 up target-worktree changes.
 
-## Run model
+## Configuration
+
+Copy `config.example.toml` to `config.local.toml` and set the target repository
+and exact verification commands. Verification is run in the target repository,
+so commands must explicitly select that project's intended environment and
+tooling. For example:
+
+```toml
+[runner]
+max_correction_rounds = 3
+
+[[verification.commands]]
+name = "tests"
+argv = ["C:/Projects/my-target/.venv/Scripts/python.exe", "-m", "pytest"]
+timeout_seconds = 1800
+```
+
+SprintTicket does not install or own pytest, ruff, pyright, or any other
+target-project verification tool. Its own development tools are in the `dev`
+dependency group.
+
+`runner.max_correction_rounds` defaults to `1`. The resolved configuration is
+persisted in `run.json`, so changing `config.local.toml` cannot change a run
+that already exists. Sandboxes are fixed by phase: implementation and
+correction use `workspace-write`; verification, review, and reporting are
+read-only with respect to the target project.
+
+## Commands
+
+```text
+ticket-automation preflight
+ticket-automation run tickets/TA-ARCH-009.md
+ticket-automation resume <run-id>
+ticket-automation status
+```
+
+The controller requires a clean target worktree and an empty staging area at
+run creation. Baseline verification runs before the first writable Codex call.
+
+## Run Model
 
 Each run has an immutable resolved configuration, a snapshotted ticket, and a
 clean Git baseline. The controller drives this explicit state machine:
@@ -32,31 +71,7 @@ captures `final.patch`, rechecks that the workspace did not change during that
 capture, then transitions to `READY_FOR_HUMAN` or `HUMAN_REQUIRED`.
 `report.md` only renders those records; it does not make acceptance decisions.
 
-## Configuration
-
-Copy `config.example.toml` to `config.local.toml` and set the target repository
-and exact verification commands. Verification is run in the target repository,
-so commands must explicitly select that project's intended environment and
-tooling. For example:
-
-```toml
-[[verification.commands]]
-name = "tests"
-argv = ["C:/Projects/my-target/.venv/Scripts/python.exe", "-m", "pytest"]
-timeout_seconds = 1800
-```
-
-TicketAutomation does not install or own pytest, ruff, pyright, or any other
-target-project verification tool. Its own development tools are in the `dev`
-dependency group.
-
-`runner.max_correction_rounds` defaults to `1`. The resolved configuration is
-persisted in `run.json`, so changing `config.local.toml` cannot change a run
-that already exists. Sandboxes are fixed by phase: implementation and
-correction use `workspace-write`; verification, review, and reporting are
-read-only with respect to the target project.
-
-## Artifacts and attempts
+## Artifacts and Attempts
 
 Runs are append-only evidence directories:
 
@@ -94,7 +109,7 @@ Workspace-guard evidence is recorded in the writable execution metadata.
 There are no per-round patch or `.stat` copies, duplicate Codex result files,
 or automatic Git cleanup.
 
-## Resume behavior
+## Resume Behaviour
 
 Resume never adopts a completed artifact whose controller state transition may
 have been interrupted. It allocates a new attempt for safe work.
@@ -109,14 +124,3 @@ Attempt records are trusted only when their sequence, phase, status, paths, and
 directory agree. Invalid attempt evidence stops resume for human inspection;
 the controller never follows an artifact path outside its own attempt.
 
-## Commands
-
-```text
-ticket-automation preflight
-ticket-automation run tickets/TA-ARCH-009.md
-ticket-automation resume <run-id>
-ticket-automation status
-```
-
-The controller requires a clean target worktree and an empty staging area at
-run creation. Baseline verification runs before the first writable Codex call.
