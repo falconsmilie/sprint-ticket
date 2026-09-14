@@ -15,10 +15,17 @@ reasoning_effort = "xhigh"
 
 [[verification.commands]]
 name = "tests"
-argv = ["C:/path/to/ProjectName/.venv/Scripts/python.exe", "-m", "pytest"]
+argv = [
+    "C:/path/to/ProjectName/.venv/Scripts/python.exe",
+    "-m",
+    "pytest"
+]
 timeout_seconds = 1800
 
 [[verification.commands]]
 name = "typing"
-argv = ["C:/path/to/ProjectName/.venv/Scripts/python.exe", "-m", "pyright"]
+argv = [
+    "C:/path/to/ProjectName/.venv/Scripts/python.exe",
+    "scripts/linter.py",
+]
 timeout_seconds = 1800
