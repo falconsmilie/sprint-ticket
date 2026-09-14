@@ -245,7 +245,6 @@ def run_implementation_stage(
             },
             untrusted_completion=error.kind
             in {
-                CodexFailureKind.MALFORMED_EVENT_STREAM,
                 CodexFailureKind.TIMEOUT,
             },
         )

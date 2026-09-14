@@ -109,7 +109,7 @@ class BlockingCodexRunner:
         stdin: str,
         timeout_seconds: float | None,
     ) -> CodexProcessResult:
-        del command, stdin, timeout_seconds
+        del stdin, timeout_seconds
         self.calls += 1
         result = {
             "status": "BLOCKED",
@@ -118,6 +118,9 @@ class BlockingCodexRunner:
             "assumptions": [],
             "known_issues": ["intentional test stop"],
         }
+        Path(command.argv[command.argv.index("--output-last-message") + 1]).write_text(
+            json.dumps(result), encoding="utf-8"
+        )
         return CodexProcessResult(
             returncode=0,
             stdout=codex_event_stream(result),

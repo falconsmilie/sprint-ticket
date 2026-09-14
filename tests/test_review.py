@@ -20,7 +20,7 @@ from ticket_automation.codex import (
     CodexProcessResult,
     CodexResultValidationError,
     Sandbox,
-    validate_json_schema,
+    _parse_review_result,
 )
 from ticket_automation.config import AppConfig
 from ticket_automation.models import StageOutcome, WorkflowState
@@ -69,6 +69,9 @@ class ReviewRunner:
         self.timeout_seconds = timeout_seconds
         if self.mutation is not None:
             self.mutation(command.cwd)
+        Path(command.argv[command.argv.index("--output-last-message") + 1]).write_text(
+            json.dumps(self.result), encoding="utf-8"
+        )
         return CodexProcessResult(
             returncode=0,
             stdout=event_stream(self.result),
@@ -466,21 +469,17 @@ def test_disposable_repository_does_not_require_earlier_ticket_history(tmp_path)
     assert run_git(repo, "log", "--oneline").count("initial") == 1
 
 
-def test_review_result_schema_accepts_supported_verdicts_and_finding_dispositions():
-    schema = review_schema()
-
-    validate_json_schema(review_result(), schema)
-    validate_json_schema(
+def test_review_result_parser_accepts_supported_verdicts_and_finding_dispositions():
+    _parse_review_result(review_result())
+    _parse_review_result(
         review_result(
             verdict="CORRECTIONS_REQUIRED",
             findings=[finding("R1-F1", disposition="REQUIRED")],
         ),
-        schema,
     )
-    validate_json_schema(review_result(verdict="HUMAN_REVIEW_REQUIRED"), schema)
-    validate_json_schema(
+    _parse_review_result(review_result(verdict="HUMAN_REVIEW_REQUIRED"))
+    _parse_review_result(
         review_result(findings=[finding("R1-F2", disposition="FOLLOW_UP")]),
-        schema,
     )
 
 
@@ -493,17 +492,15 @@ def test_review_result_schema_accepts_supported_verdicts_and_finding_disposition
         {"summary": ""},
     ],
 )
-def test_review_result_schema_rejects_unsupported_results(patch):
-    schema = review_schema()
+def test_review_result_parser_rejects_unsupported_results(patch):
     result = review_result()
     result.update(patch)
 
     with pytest.raises(CodexResultValidationError):
-        validate_json_schema(result, schema)
+        _parse_review_result(result)
 
 
-def test_review_result_schema_rejects_unknown_finding_fields():
-    schema = review_schema()
+def test_review_result_parser_rejects_unknown_finding_fields():
     result = review_result(
         findings=[
             {
@@ -514,7 +511,7 @@ def test_review_result_schema_rejects_unknown_finding_fields():
     )
 
     with pytest.raises(CodexResultValidationError):
-        validate_json_schema(result, schema)
+        _parse_review_result(result)
 
 
 def test_review_result_semantics_reject_contradictions():
@@ -643,8 +640,3 @@ def event_stream(result: dict[str, object]) -> str:
 def sandbox_value(argv: tuple[str, ...]) -> str:
     sandbox_index = argv.index("--sandbox")
     return argv[sandbox_index + 1]
-
-
-def review_schema() -> dict[str, object]:
-    schema_path = PROJECT_ROOT / "schemas" / "review-result.schema.json"
-    return json.loads(schema_path.read_text(encoding="utf-8"))

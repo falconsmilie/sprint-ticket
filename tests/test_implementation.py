@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 
-from ticket_automation import workspace_guard as workspace_guard_module
 from tests.helpers import (
     GIT,
     create_git_repo,
@@ -16,6 +15,7 @@ from tests.helpers import (
     run_git,
 )
 from tests.helpers import create_trusted_prepared_run as create_run_snapshot
+from ticket_automation import workspace_guard as workspace_guard_module
 from ticket_automation.codex import (
     CodexCommand,
     CodexFailureKind,
@@ -24,7 +24,7 @@ from ticket_automation.codex import (
     CodexProcessTimeout,
     CodexResultValidationError,
     Sandbox,
-    validate_json_schema,
+    _parse_implementation_result,
 )
 from ticket_automation.implementation import (
     ImplementationError,
@@ -90,6 +90,9 @@ class MutatingRunner:
                 stderr=self.stderr,
             )
         assert self.result is not None
+        Path(command.argv[command.argv.index("--output-last-message") + 1]).write_text(
+            json.dumps(self.result), encoding="utf-8"
+        )
         return CodexProcessResult(
             returncode=0,
             stdout=event_stream(self.result),
@@ -891,11 +894,9 @@ def test_failed_implementation_patch_capture_error_stays_human_required(tmp_path
     assert "may have left partial source changes" in result.controller_message
 
 
-def test_implementation_result_schema_accepts_trusted_statuses():
-    schema = implementation_schema()
-
-    validate_json_schema(implementation_result("COMPLETED"), schema)
-    validate_json_schema(implementation_result("BLOCKED"), schema)
+def test_implementation_result_parser_accepts_trusted_statuses():
+    _parse_implementation_result(implementation_result("COMPLETED"))
+    _parse_implementation_result(implementation_result("BLOCKED"))
 
 
 @pytest.mark.parametrize(
@@ -907,23 +908,21 @@ def test_implementation_result_schema_accepts_trusted_statuses():
         {"summary": ""},
     ],
 )
-def test_implementation_result_schema_rejects_unsupported_results(patch):
-    schema = implementation_schema()
+def test_implementation_result_parser_rejects_unsupported_results(patch):
     result = implementation_result()
     result.update(patch)
 
     with pytest.raises(CodexResultValidationError):
-        validate_json_schema(result, schema)
+        _parse_implementation_result(result)
 
 
 @pytest.mark.parametrize("missing_field", ["status", "summary", "tests_run"])
-def test_implementation_result_schema_rejects_missing_required_fields(missing_field):
-    schema = implementation_schema()
+def test_implementation_result_parser_rejects_missing_required_fields(missing_field):
     result = implementation_result()
     del result[missing_field]
 
     with pytest.raises(CodexResultValidationError):
-        validate_json_schema(result, schema)
+        _parse_implementation_result(result)
 
 
 def snapshot(tmp_path, ticket_text: str = "# TA-005\n\nImplement the ticket.\n"):
@@ -986,11 +985,6 @@ def event_stream(result: dict[str, object]) -> str:
 def sandbox_value(argv: tuple[str, ...]) -> str:
     sandbox_index = argv.index("--sandbox")
     return argv[sandbox_index + 1]
-
-
-def implementation_schema() -> dict[str, object]:
-    schema_path = PROJECT_ROOT / "schemas" / "implementation-result.schema.json"
-    return json.loads(schema_path.read_text(encoding="utf-8"))
 
 
 def create_pyvenv(path: Path) -> None:

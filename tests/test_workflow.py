@@ -188,6 +188,9 @@ class SequencedCodexRunner:
                 stderr=step.stderr,
             )
         assert step.result is not None
+        Path(command.argv[command.argv.index("--output-last-message") + 1]).write_text(
+            json.dumps(step.result), encoding="utf-8"
+        )
         return CodexProcessResult(
             returncode=0,
             stdout=event_stream(step.result),

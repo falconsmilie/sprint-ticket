@@ -7,14 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from tests.helpers import GIT, create_git_repo, make_config
 import ticket_automation.git_safety as git_safety_module
+from tests.helpers import GIT, create_git_repo, make_config
 from ticket_automation import workspace_guard as workspace_guard_module
 from ticket_automation.codex import CodexCommand, CodexProcessResult
 from ticket_automation.git import GitRepository
 from ticket_automation.writable_attempts import load_writable_attempt
 from ticket_automation.writable_worker import run_writable_codex
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 IMPLEMENTATION_SCHEMA = PROJECT_ROOT / "schemas" / "implementation-result.schema.json"
@@ -36,6 +35,9 @@ class WritableRunner:
         self.calls += 1
         if self.mutation is not None:
             self.mutation(command.cwd)
+        Path(command.argv[command.argv.index("--output-last-message") + 1]).write_text(
+            json.dumps(_implementation_result()), encoding="utf-8"
+        )
         return CodexProcessResult(
             returncode=0,
             stdout=_event_stream(_implementation_result()),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -109,6 +110,9 @@ class SequencedCodexRunner:
         if step.mutation is not None:
             step.mutation(command.cwd)
         assert step.result is not None
+        Path(command.argv[command.argv.index("--output-last-message") + 1]).write_text(
+            json.dumps(step.result), encoding="utf-8"
+        )
         return CodexProcessResult(
             returncode=0,
             stdout=_event_stream(step.result),

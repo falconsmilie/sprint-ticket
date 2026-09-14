@@ -75,6 +75,9 @@ class CodexRunner:
         self.timeout_seconds = timeout_seconds
         if self.mutation is not None:
             self.mutation(command.cwd)
+        Path(command.argv[command.argv.index("--output-last-message") + 1]).write_text(
+            json.dumps(self.result), encoding="utf-8"
+        )
         return CodexProcessResult(
             returncode=0,
             stdout=event_stream(self.result),

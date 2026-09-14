@@ -15,11 +15,6 @@ from .codex import (
 from .codex import execute as execute_codex
 from .git import GitRepository
 from .git_safety import WorkspaceSnapshot
-from .writable_attempts import (
-    WritableAttempt,
-    _capture_writable_attempt,
-    _track_writable_process_start,
-)
 from .workspace_guard import (
     WORKSPACE_GUARD_DIR_NAME,
     WorkspaceEnvironmentSnapshot,
@@ -29,6 +24,11 @@ from .workspace_guard import (
     capture_workspace_environment_snapshot,
     format_workspace_hygiene_violation,
     write_workspace_guard_inspection,
+)
+from .writable_attempts import (
+    WritableAttempt,
+    _capture_writable_attempt,
+    _track_writable_process_start,
 )
 
 

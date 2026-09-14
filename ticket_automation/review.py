@@ -23,10 +23,11 @@ from .codex import (
     CodexProcessRunner,
     CodexResultValidationError,
     Sandbox,
-    validate_json_schema,
+    _CodexResultKind,
+    _parse_review_result,
 )
 from .codex import (
-    execute as execute_codex,
+    _execute as _execute_codex,
 )
 from .config import AppConfig, VerificationCommand
 from .git import GitRepository
@@ -269,7 +270,7 @@ def run_review_stage(
     )
 
     try:
-        execution = execute_codex(
+        execution = _execute_codex(
             prompt=prompt,
             repo_path=repository.path,
             sandbox=Sandbox.READ_ONLY,
@@ -278,6 +279,7 @@ def run_review_stage(
             executable=config.codex.executable,
             execution_config=config.codex.execution,
             runner=codex_runner,
+            _result_kind=_CodexResultKind.REVIEW,
         )
     except CodexExecutionFailure as error:
         safety_violations = _inspect_review_invariants(
@@ -512,9 +514,9 @@ def _load_existing_review_result(
         return None, "Existing review result is not a JSON object."
 
     try:
-        validate_json_schema(result, _load_review_result_schema())
-    except (CodexResultValidationError, OSError, json.JSONDecodeError) as error:
-        return None, f"Existing review result is not schema-valid: {error}"
+        result = _parse_review_result(result)
+    except CodexResultValidationError as error:
+        return None, f"Existing review result is invalid: {error}"
 
     execution_problem = _existing_review_execution_problem(
         artifact_directory / "execution.json",
@@ -606,13 +608,6 @@ def _existing_review_execution_problem(
         ):
             return "Existing review execution metadata points at a different result."
     return None
-
-
-def _load_review_result_schema() -> dict[str, Any]:
-    schema = json.loads(_REVIEW_RESULT_SCHEMA.read_text(encoding="utf-8"))
-    if not isinstance(schema, dict):
-        raise ReviewError("Review result schema root must be a JSON object.")
-    return schema
 
 
 def _archive_review_artifacts(artifact_directory: Path) -> None:
