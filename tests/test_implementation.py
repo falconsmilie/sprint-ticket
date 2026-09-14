@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from ticket_automation import workspace_guard as workspace_guard_module
 from tests.helpers import (
     GIT,
     create_git_repo,
@@ -557,6 +558,48 @@ def test_new_environment_after_completed_implementation_is_human_required(tmp_pa
 @pytest.mark.skipif(
     GIT is None, reason="git executable is required for implementation tests"
 )
+def test_environment_scanner_failure_after_implementation_is_human_required(
+    monkeypatch,
+    tmp_path,
+):
+    _repo, run_dir, config = snapshot(tmp_path)
+    real_scandir = workspace_guard_module._scandir
+    scanner_failed = False
+
+    def guarded_scandir(path: Path):
+        if scanner_failed:
+            raise OSError("synthetic environment scanner failure")
+        return real_scandir(path)
+
+    def mutate_then_break_scanner(cwd: Path) -> None:
+        nonlocal scanner_failed
+        cwd.joinpath("file.txt").write_text("implemented\n", encoding="utf-8")
+        scanner_failed = True
+
+    monkeypatch.setattr(workspace_guard_module, "_scandir", guarded_scandir)
+    result = run_implementation_stage(
+        config,
+        run_dir,
+        codex_runner=MutatingRunner(
+            result=implementation_result(),
+            mutation=mutate_then_break_scanner,
+        ),
+        clock=fixed_clock,
+    )
+
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
+    assert result.workspace_guard is not None
+    assert result.workspace_guard.has_inspection_failure
+    assert (
+        "Workspace environment inspection could not complete"
+        in result.controller_message
+    )
+    assert run_dir.joinpath("workspace-guard", "implementation.json").is_file()
+
+
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for implementation tests"
+)
 def test_preexisting_ignored_environment_does_not_block_implementation(tmp_path):
     repo = create_git_repo(tmp_path / "repo")
     repo.joinpath(".gitignore").write_text(".venv/\n", encoding="utf-8")
@@ -590,15 +633,20 @@ def test_preexisting_ignored_environment_does_not_block_implementation(tmp_path)
     assert result.outcome == StageOutcome.COMPLETED
     assert result.workspace_guard is not None
     assert not result.workspace_guard.has_violation
-    guard = json.loads(
+    attempt = json.loads(
         snapshot_result.run_dir.joinpath(
-            "workspace-guard",
+            "writable-attempts",
             "implementation.json",
         ).read_text(encoding="utf-8")
     )
+    guard = attempt["environment_guard"]
     assert guard["environments_before"][0]["root"] == ".venv"
     assert guard["environments_after"][0]["root"] == ".venv"
     assert guard["new_environments"] == []
+    assert not snapshot_result.run_dir.joinpath(
+        "workspace-guard",
+        "implementation.json",
+    ).exists()
 
 
 @pytest.mark.skipif(

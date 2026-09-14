@@ -16,6 +16,7 @@ from tests.helpers import (
     run_git,
 )
 from tests.helpers import create_trusted_prepared_run as create_run_snapshot
+from ticket_automation import workspace_guard as workspace_guard_module
 from ticket_automation import corrections as corrections_module
 from ticket_automation.codex import (
     CodexCommand,
@@ -336,6 +337,56 @@ def test_blocked_correction_becomes_human_required_and_preserves_explanation(tmp
         ).read_text()
     )
     assert saved["status"] == "BLOCKED"
+
+
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for correction tests"
+)
+def test_environment_scanner_failure_after_correction_is_human_required(
+    monkeypatch,
+    tmp_path,
+):
+    repo, run_dir, config = review_correct_run(tmp_path)
+    real_scandir = workspace_guard_module._scandir
+    scanner_failed = False
+
+    def guarded_scandir(path: Path):
+        if scanner_failed:
+            raise OSError("synthetic correction scanner failure")
+        return real_scandir(path)
+
+    def mutate_then_break_scanner(cwd: Path) -> None:
+        nonlocal scanner_failed
+        cwd.joinpath("file.txt").write_text("corrected\n", encoding="utf-8")
+        scanner_failed = True
+
+    monkeypatch.setattr(workspace_guard_module, "_scandir", guarded_scandir)
+    result = run_correction_stage(
+        config,
+        run_dir,
+        codex_runner=CodexRunner(
+            result=correction_result(),
+            mutation=mutate_then_break_scanner,
+        ),
+        clock=fixed_clock,
+    )
+
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
+    assert result.workspace_guard is not None
+    assert result.workspace_guard.has_inspection_failure
+    assert (
+        "Workspace environment inspection could not complete"
+        in result.controller_message
+    )
+    assert repo.joinpath("file.txt").read_text(encoding="utf-8") == "corrected\n"
+    guard = json.loads(
+        run_dir.joinpath("workspace-guard", "correction-round-1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "synthetic correction scanner failure" in " ".join(
+        guard["inspection_errors_after"]
+    )
 
 
 @pytest.mark.skipif(

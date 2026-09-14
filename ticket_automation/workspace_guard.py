@@ -13,8 +13,6 @@ WORKSPACE_GUARD_DIR_NAME = "workspace-guard"
 WORKSPACE_GUARD_FORMAT = "ticket_automation.workspace_environment_guard"
 WORKSPACE_GUARD_SCHEMA_VERSION = 1
 
-_IMPLEMENTATION_ARTIFACT = "implementation.json"
-_CORRECTION_ARTIFACT_TEMPLATE = "correction-round-{round_number}.json"
 _SKIPPED_DIRECTORY_NAMES = frozenset(
     {
         ".git",
@@ -61,6 +59,12 @@ class WorkspaceEnvironmentSnapshot:
     environments: tuple[LocalEnvironment, ...]
     inspection_errors: tuple[str, ...] = ()
 
+    @property
+    def inspection_complete(self) -> bool:
+        """Whether Python/Conda root detection inspected the whole repository."""
+
+        return not self.inspection_errors
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "target_repository_path": str(self.repository_path),
@@ -76,7 +80,7 @@ class WorkspaceEnvironmentSnapshot:
 class WorkspaceGuardInspection:
     phase: str
     timestamp: str
-    artifact_path: Path
+    artifact_path: Path | None
     before: WorkspaceEnvironmentSnapshot
     after: WorkspaceEnvironmentSnapshot
     new_environments: tuple[LocalEnvironment, ...]
@@ -84,6 +88,16 @@ class WorkspaceGuardInspection:
     @property
     def has_violation(self) -> bool:
         return bool(self.new_environments)
+
+    @property
+    def has_inspection_failure(self) -> bool:
+        return not (self.before.inspection_complete and self.after.inspection_complete)
+
+    @property
+    def requires_human(self) -> bool:
+        """The deterministic V1 policy cannot safely permit this invocation."""
+
+        return self.has_violation or self.has_inspection_failure
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -109,28 +123,24 @@ class WorkspaceGuardInspection:
         }
 
 
-def implementation_guard_artifact_path(run_dir: Path | str) -> Path:
-    return Path(run_dir) / WORKSPACE_GUARD_DIR_NAME / _IMPLEMENTATION_ARTIFACT
-
-
-def correction_guard_artifact_path(
-    run_dir: Path | str,
-    *,
-    round_number: int,
-) -> Path:
-    return (
-        Path(run_dir)
-        / WORKSPACE_GUARD_DIR_NAME
-        / _CORRECTION_ARTIFACT_TEMPLATE.format(round_number=round_number)
-    )
-
-
 def capture_workspace_environment_snapshot(
     repository_path: Path | str,
 ) -> WorkspaceEnvironmentSnapshot:
-    root = Path(repository_path).resolve()
+    """Detect credible Python virtual-environment and Conda roots in a repository.
+
+    This is intentionally a narrow deterministic check.  It does not claim to
+    identify package caches, dependency trees, or environments outside the
+    target repository.
+    """
+
+    path = Path(repository_path)
     environments: list[LocalEnvironment] = []
     errors: list[str] = []
+    try:
+        root = path.resolve()
+    except OSError as error:
+        root = path.absolute()
+        errors.append(f"repository-path: {error}")
     _walk_repository(root, root, environments=environments, errors=errors)
     return WorkspaceEnvironmentSnapshot(
         repository_path=root,
@@ -139,24 +149,22 @@ def capture_workspace_environment_snapshot(
     )
 
 
-def inspect_workspace_environment_change(
+def _compare_workspace_environment_change(
     *,
     before: WorkspaceEnvironmentSnapshot,
+    after: WorkspaceEnvironmentSnapshot,
     phase: str,
-    artifact_path: Path | str,
     clock: Callable[[], datetime] | None = None,
 ) -> WorkspaceGuardInspection:
-    after = capture_workspace_environment_snapshot(before.repository_path)
-    inspection = WorkspaceGuardInspection(
+    """Build environment evidence from the shared boundary's two snapshots."""
+    return WorkspaceGuardInspection(
         phase=phase,
         timestamp=_timestamp(clock),
-        artifact_path=Path(artifact_path),
+        artifact_path=None,
         before=before,
         after=after,
         new_environments=new_environments(before, after),
     )
-    write_workspace_guard_inspection(inspection)
-    return inspection
 
 
 def new_environments(
@@ -176,6 +184,13 @@ def new_environments(
 def write_workspace_guard_inspection(
     inspection: WorkspaceGuardInspection,
 ) -> None:
+    if inspection.artifact_path is None:
+        raise ValueError("A workspace-guard artifact path is required for persistence.")
+    if not inspection.requires_human:
+        raise ValueError(
+            "A standalone workspace-guard artifact is only permitted for an "
+            "inspection failure or a prohibited environment."
+        )
     _atomic_write_json(inspection.artifact_path, inspection.to_dict())
 
 
@@ -190,7 +205,11 @@ def format_workspace_hygiene_violation(
         _format_environment(environment, inspection.after.repository_path)
         for environment in inspection.new_environments
     )
-    artifact = _relative_path(inspection.artifact_path, Path(run_dir))
+    artifact = (
+        "writable execution record"
+        if inspection.artifact_path is None
+        else _relative_path(inspection.artifact_path, Path(run_dir))
+    )
     return (
         "Workspace hygiene violation: "
         f"The writable Codex operation for {operation} created a new local "
@@ -198,6 +217,33 @@ def format_workspace_hygiene_violation(
         "The environment did not exist before that writable operation. "
         f"Git safety: {git_safety}. "
         "TicketAutomation has stopped for human inspection. "
+        "No files were deleted automatically. "
+        f"Workspace-guard artifact: {artifact}."
+    )
+
+
+def _format_workspace_environment_inspection_failure(
+    inspection: WorkspaceGuardInspection,
+    *,
+    operation: str,
+    run_dir: Path | str,
+) -> str:
+    """Describe a fail-closed scanner error without overstating its coverage."""
+
+    errors = tuple(
+        f"before: {error}" for error in inspection.before.inspection_errors
+    ) + tuple(f"after: {error}" for error in inspection.after.inspection_errors)
+    artifact = (
+        "writable execution record"
+        if inspection.artifact_path is None
+        else _relative_path(inspection.artifact_path, Path(run_dir))
+    )
+    details = "; ".join(errors) or "unknown scanner failure"
+    return (
+        "Workspace environment inspection could not complete for the writable "
+        f"Codex operation {operation}. TicketAutomation has stopped for human "
+        "inspection. The deterministic check covers Python and Conda "
+        f"environment roots inside the target repository. Details: {details}. "
         "No files were deleted automatically. "
         f"Workspace-guard artifact: {artifact}."
     )
@@ -404,10 +450,7 @@ __all__ = [
     "WorkspaceEnvironmentSnapshot",
     "WorkspaceGuardInspection",
     "capture_workspace_environment_snapshot",
-    "correction_guard_artifact_path",
     "format_workspace_hygiene_violation",
-    "implementation_guard_artifact_path",
-    "inspect_workspace_environment_change",
     "new_environments",
     "write_workspace_guard_inspection",
 ]

@@ -14,6 +14,14 @@ from .codex import (
 )
 from .git import GitRepository
 from .git_safety import WorkspaceSnapshot
+from .workspace_guard import (
+    WORKSPACE_GUARD_FORMAT,
+    WORKSPACE_GUARD_SCHEMA_VERSION,
+    LocalEnvironment,
+    WorkspaceEnvironmentSnapshot,
+    WorkspaceGuardInspection,
+    new_environments,
+)
 
 WRITABLE_ATTEMPTS_DIR_NAME = "writable-attempts"
 WRITABLE_ATTEMPT_FORMAT = "ticket_automation.writable_attempt"
@@ -31,6 +39,7 @@ class WritableAttempt:
     process_started: bool = False
     after_snapshot: WorkspaceSnapshot | None = None
     after_error: str | None = None
+    environment_guard: WorkspaceGuardInspection | None = None
 
     def mark_process_started(self) -> None:
         self.record_process_started(True)
@@ -47,6 +56,12 @@ class WritableAttempt:
     def record_after_error(self, error: BaseException) -> None:
         self.after_snapshot = None
         self.after_error = f"{type(error).__name__}: {error}"
+        self._persist()
+
+    def record_environment_guard(self, inspection: WorkspaceGuardInspection) -> None:
+        """Persist the Python/Conda root evidence with this writable execution."""
+
+        self.environment_guard = inspection
         self._persist()
 
     @property
@@ -85,6 +100,11 @@ class WritableAttempt:
                 None if self.after_snapshot is None else self.after_snapshot.fingerprint
             ),
             "after_error": self.after_error,
+            "environment_guard": (
+                None
+                if self.environment_guard is None
+                else self.environment_guard.to_dict()
+            ),
         }
 
 
@@ -146,6 +166,25 @@ def capture_writable_attempt(
         before_snapshot = WorkspaceSnapshot.capture(repository)
     except Exception as error:  # noqa: BLE001 - this is safety evidence collection.
         before_error = f"{type(error).__name__}: {error}"
+    return _capture_writable_attempt(
+        run_dir,
+        operation=operation,
+        before_snapshot=before_snapshot,
+        before_error=before_error,
+    )
+
+
+def _capture_writable_attempt(
+    run_dir: Path | str,
+    *,
+    operation: str,
+    before_snapshot: WorkspaceSnapshot | None,
+    before_error: str | None,
+) -> WritableAttempt:
+    """Persist a writable attempt from the shared boundary's canonical snapshot."""
+
+    if before_snapshot is not None and before_error is not None:
+        raise ValueError("A writable attempt cannot have both a snapshot and an error.")
     attempt = WritableAttempt(
         artifact_path=writable_attempt_path(run_dir, operation=operation),
         operation=operation,
@@ -166,6 +205,29 @@ def inspect_writable_attempt_after_failure(
             after_complete=False,
             workspace_identical=False,
             inspection_error="No persisted writable-attempt record is available.",
+        )
+    if attempt.after_error is not None:
+        return WritableInspection(
+            before_complete=attempt.before_complete,
+            after_complete=False,
+            workspace_identical=False,
+            inspection_error=attempt.after_error,
+        )
+    if attempt.after_snapshot is not None:
+        before_snapshot = attempt.before_snapshot
+        after_snapshot = attempt.after_snapshot
+        complete = bool(
+            before_snapshot is not None
+            and before_snapshot.inspection_complete
+            and after_snapshot.inspection_complete
+        )
+        return WritableInspection(
+            before_complete=attempt.before_complete,
+            after_complete=after_snapshot.inspection_complete,
+            workspace_identical=bool(
+                complete and before_snapshot.fingerprint == after_snapshot.fingerprint
+            ),
+            inspection_error=None,
         )
     try:
         after_snapshot = WorkspaceSnapshot.capture(repository)
@@ -233,14 +295,26 @@ def load_writable_attempt(path: Path | str) -> WritableAttempt | None:
     before_snapshot = _snapshot_from_data(data.get("before_snapshot"))
     if before_snapshot is None:
         return None
+    before_error = data.get("before_error")
+    if isinstance(before_error, str):
+        return None
+    environment_guard_data = data.get("environment_guard")
+    environment_guard = _workspace_guard_from_data(environment_guard_data)
+    if environment_guard_data is not None and environment_guard is None:
+        return None
+    after_snapshot = _snapshot_from_data(data.get("after_snapshot"))
+    after_error = data.get("after_error")
+    if after_snapshot is not None and isinstance(after_error, str):
+        return None
     return WritableAttempt(
         artifact_path=Path(path),
         operation=data["operation"],
         before_snapshot=before_snapshot,
-        before_error=data.get("before_error")
-        if isinstance(data.get("before_error"), str)
-        else None,
+        before_error=None,
         process_started=data["process_started"],
+        after_snapshot=after_snapshot,
+        after_error=after_error if isinstance(after_error, str) else None,
+        environment_guard=environment_guard,
     )
 
 
@@ -264,6 +338,94 @@ def _snapshot_from_data(value: object) -> WorkspaceSnapshot | None:
         )
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def _workspace_guard_from_data(value: object) -> WorkspaceGuardInspection | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return None
+    if (
+        value.get("schema_version") != WORKSPACE_GUARD_SCHEMA_VERSION
+        or value.get("format") != WORKSPACE_GUARD_FORMAT
+        or not isinstance(value.get("phase"), str)
+        or not isinstance(value.get("timestamp"), str)
+        or not isinstance(value.get("target_repository_path"), str)
+    ):
+        return None
+    repository_path = Path(value["target_repository_path"])
+    before = _environment_snapshot_from_data(
+        repository_path,
+        value.get("environments_before"),
+        value.get("inspection_errors_before"),
+    )
+    after = _environment_snapshot_from_data(
+        repository_path,
+        value.get("environments_after"),
+        value.get("inspection_errors_after"),
+    )
+    declared_new_environments = _environments_from_data(
+        repository_path,
+        value.get("new_environments"),
+    )
+    if before is None or after is None or declared_new_environments is None:
+        return None
+    if declared_new_environments != new_environments(before, after):
+        return None
+    return WorkspaceGuardInspection(
+        phase=value["phase"],
+        timestamp=value["timestamp"],
+        artifact_path=None,
+        before=before,
+        after=after,
+        new_environments=declared_new_environments,
+    )
+
+
+def _environment_snapshot_from_data(
+    repository_path: Path,
+    environments: object,
+    inspection_errors: object,
+) -> WorkspaceEnvironmentSnapshot | None:
+    parsed_environments = _environments_from_data(repository_path, environments)
+    if parsed_environments is None or not isinstance(inspection_errors, (list, tuple)):
+        return None
+    if not all(isinstance(error, str) for error in inspection_errors):
+        return None
+    return WorkspaceEnvironmentSnapshot(
+        repository_path=repository_path,
+        environments=parsed_environments,
+        inspection_errors=tuple(inspection_errors),
+    )
+
+
+def _environments_from_data(
+    repository_path: Path,
+    value: object,
+) -> tuple[LocalEnvironment, ...] | None:
+    if not isinstance(value, (list, tuple)):
+        return None
+    environments: list[LocalEnvironment] = []
+    for item in value:
+        if not isinstance(item, dict):
+            return None
+        kind = item.get("kind")
+        root_path = item.get("root_absolute_path")
+        marker_paths = item.get("markers")
+        if (
+            kind not in {"python_venv", "conda"}
+            or not isinstance(root_path, str)
+            or not isinstance(marker_paths, (list, tuple))
+            or not marker_paths
+            or not all(isinstance(marker, str) for marker in marker_paths)
+        ):
+            return None
+        root = Path(root_path)
+        markers = tuple(repository_path / Path(marker) for marker in marker_paths)
+        environments.append(
+            LocalEnvironment(kind=kind, root_path=root, marker_paths=markers)
+        )
+    return tuple(environments)
 
 
 def _atomic_write_json(path: Path, data: dict[str, object]) -> None:

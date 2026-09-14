@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,7 +11,6 @@ from ticket_automation.workspace_guard import (
     LocalEnvironment,
     WorkspaceEnvironmentSnapshot,
     capture_workspace_environment_snapshot,
-    inspect_workspace_environment_change,
     new_environments,
 )
 
@@ -104,31 +102,6 @@ def test_new_ignored_environment_is_detected_independently_of_git_status(tmp_pat
     assert [
         environment.root_path.name for environment in new_environments(before, after)
     ] == [".venv"]
-
-
-def test_inspection_persists_pre_post_and_new_environment_evidence(tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    before = capture_workspace_environment_snapshot(repo)
-    create_pyvenv(repo / ".venv-correction")
-    artifact_path = tmp_path / "run" / "workspace-guard" / "implementation.json"
-
-    inspection = inspect_workspace_environment_change(
-        before=before,
-        phase="IMPLEMENT",
-        artifact_path=artifact_path,
-        clock=fixed_clock,
-    )
-
-    assert inspection.has_violation
-    data = json.loads(artifact_path.read_text(encoding="utf-8"))
-    assert data["format"] == "ticket_automation.workspace_environment_guard"
-    assert data["phase"] == "IMPLEMENT"
-    assert data["timestamp"] == "2026-09-12T10:15:30Z"
-    assert data["environments_before"] == []
-    assert data["environments_after"][0]["root"] == ".venv-correction"
-    assert data["new_environments"][0]["markers"] == [".venv-correction/pyvenv.cfg"]
-    assert data["new_environments"][0]["existed_before"] is False
 
 
 def test_external_runner_environment_is_not_considered_part_of_target_repo(tmp_path):

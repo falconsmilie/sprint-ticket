@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-import ticket_automation.implementation as implementation_module
 import ticket_automation.writable_attempts as writable_attempts_module
+import ticket_automation.writable_worker as writable_worker_module
 from tests.helpers import (
     GIT,
     create_git_repo,
@@ -291,8 +291,23 @@ def test_lifecycle_first_pass_success_reaches_ready_for_human(tmp_path):
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
-def test_lifecycle_review_correction_is_verified_and_rereviewed(tmp_path):
+def test_implementation_and_correction_use_the_shared_writable_boundary(
+    monkeypatch,
+    tmp_path,
+):
     _repo, ticket, config = workflow_inputs(tmp_path)
+    original_boundary = writable_worker_module.run_writable_codex
+    operations: list[str] = []
+
+    def record_boundary(**kwargs):
+        operations.append(kwargs["operation"])
+        return original_boundary(**kwargs)
+
+    monkeypatch.setattr(
+        writable_worker_module,
+        "run_writable_codex",
+        record_boundary,
+    )
     codex = SequencedCodexRunner(
         steps=[
             CodexStep(
@@ -323,6 +338,7 @@ def test_lifecycle_review_correction_is_verified_and_rereviewed(tmp_path):
     )
 
     assert result.successful
+    assert operations == ["implementation", "correction-round-1"]
     assert result.run_record.current_correction_round == 1
     assert result.run_record.current_review_round == 2
     assert [item.round_result.round_index for item in result.verification_results] == [
@@ -923,7 +939,7 @@ def test_unexpected_writable_exception_before_process_start_is_failed(
     def fail_before_process(**_kwargs):
         raise RuntimeError("synthetic failure before process start")
 
-    monkeypatch.setattr(implementation_module, "execute_codex", fail_before_process)
+    monkeypatch.setattr(writable_worker_module, "execute_codex", fail_before_process)
 
     result = run_ticket_lifecycle(
         config,

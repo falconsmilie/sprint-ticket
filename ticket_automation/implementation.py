@@ -18,13 +18,8 @@ from .audit import (
 )
 from .codex import (
     CodexExecution,
-    CodexExecutionFailure,
     CodexFailureKind,
     CodexProcessRunner,
-    Sandbox,
-)
-from .codex import (
-    execute as execute_codex,
 )
 from .config import AppConfig
 from .failure_classification import classify_writable_failure
@@ -47,18 +42,9 @@ from .runs import (
     load_baseline_record,
     load_run_record,
 )
-from .workspace_guard import (
-    WorkspaceGuardInspection,
-    capture_workspace_environment_snapshot,
-    format_workspace_hygiene_violation,
-    implementation_guard_artifact_path,
-    inspect_workspace_environment_change,
-)
-from .writable_attempts import (
-    WritableAttempt,
-    _track_writable_process_start,
-    capture_writable_attempt,
-)
+from .workspace_guard import WorkspaceGuardInspection
+from .writable_attempts import WritableAttempt
+from . import writable_worker
 
 
 class _SafetyInspectionPhase:
@@ -197,13 +183,21 @@ def run_implementation_stage(
     ticket_text = _read_snapshotted_ticket(run_path / RUN_TICKET_FILE)
     active_record = run_record
     prompt = _render_implementation_prompt(ticket_text)
-    environment_snapshot = capture_workspace_environment_snapshot(repository.path)
-    writable_attempt = capture_writable_attempt(
-        repository,
-        run_path,
+    writable_invocation = writable_worker.run_writable_codex(
+        repository=repository,
+        run_dir=run_path,
         operation="implementation",
+        phase=WorkflowState.IMPLEMENTING.value,
+        prompt=prompt,
+        output_schema=_IMPLEMENTATION_RESULT_SCHEMA,
+        artifact_directory=implementation_dir,
+        executable=config.codex.executable,
+        execution_config=config.codex.execution,
+        runner=codex_runner,
+        clock=clock,
     )
-    if not writable_attempt.before_complete:
+    workspace_guard = writable_invocation.workspace_guard
+    if not writable_invocation.invocation_permitted:
         return _finish(
             run_record=active_record,
             run_dir=run_path,
@@ -214,44 +208,30 @@ def run_implementation_stage(
             changed_files=(),
             patch_path=None,
             diff_stats_path=None,
-            workspace_guard=None,
+            workspace_guard=workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
-            controller_message=(
-                "Could not capture a complete workspace snapshot before writable "
-                "implementation."
+            controller_message=writable_worker._format_writable_guard_stop(
+                workspace_guard,
+                operation="implementation",
+                run_dir=run_path,
+                git_safety=_format_failure_safety(()),
             ),
         )
 
-    try:
-        execution = execute_codex(
-            prompt=prompt,
-            repo_path=repository.path,
-            sandbox=Sandbox.WORKSPACE_WRITE,
-            output_schema=_IMPLEMENTATION_RESULT_SCHEMA,
-            artifact_directory=implementation_dir,
-            executable=config.codex.executable,
-            execution_config=config.codex.execution,
-            runner=_track_writable_process_start(codex_runner, writable_attempt),
-        )
-    except CodexExecutionFailure as error:
-        writable_attempt.record_process_started(error.execution.process_started)
-        workspace_guard = inspect_workspace_environment_change(
-            before=environment_snapshot,
-            phase=WorkflowState.IMPLEMENTING.value,
-            artifact_path=implementation_guard_artifact_path(run_path),
-            clock=clock,
-        )
+    if writable_invocation.failure is not None:
+        error = writable_invocation.failure
         failed_audit = _audit_failed_writable_invocation(
             repository,
             run_path,
             active_record,
             execution=error.execution,
-            writable_attempt=writable_attempt,
+            writable_attempt=writable_invocation.attempt,
+            after_workspace=writable_invocation.after_workspace,
             workspace_guard=workspace_guard,
         )
         decision = classify_writable_failure(
             repository,
-            attempt=writable_attempt,
+            attempt=writable_invocation.attempt,
             message=error.execution.failure_message or str(error),
             category_if_safe=StopCategory.EXTERNAL_TOOL_FAILURE,
             retryable_if_safe=True,
@@ -268,7 +248,10 @@ def run_implementation_stage(
         )
         outcome = (
             StageOutcome.HUMAN_REQUIRED
-            if decision.state == WorkflowState.HUMAN_REQUIRED
+            if (
+                decision.state == WorkflowState.HUMAN_REQUIRED
+                or workspace_guard.requires_human
+            )
             else StageOutcome.FAILED
         )
         message = (
@@ -296,19 +279,39 @@ def run_implementation_stage(
             controller_message=message,
         )
 
+    execution = writable_invocation.execution
+    if execution is None:
+        raise ImplementationError(
+            "Writable Codex boundary returned no execution result."
+        )
     agent_result = _require_agent_result(execution.structured_result)
-    workspace_guard = inspect_workspace_environment_change(
-        before=environment_snapshot,
-        phase=WorkflowState.IMPLEMENTING.value,
-        artifact_path=implementation_guard_artifact_path(run_path),
-        clock=clock,
-    )
+    if writable_invocation.after_workspace is None:
+        return _finish(
+            run_record=active_record,
+            run_dir=run_path,
+            artifact_directory=implementation_dir,
+            execution=execution,
+            agent_result=agent_result,
+            safety_violations=(),
+            changed_files=(),
+            patch_path=None,
+            diff_stats_path=None,
+            workspace_guard=workspace_guard,
+            outcome=StageOutcome.HUMAN_REQUIRED,
+            controller_message=writable_worker._format_writable_guard_stop(
+                workspace_guard,
+                operation="implementation",
+                run_dir=run_path,
+                git_safety=_format_failure_safety(()),
+            ),
+        )
     safety_violations = _inspect_safety(
         repository,
         active_record,
         phase=_SafetyInspectionPhase.AFTER_IMPLEMENTATION,
+        snapshot=writable_invocation.after_workspace,
     )
-    if workspace_guard.has_violation:
+    if workspace_guard.requires_human:
         return _finish(
             run_record=active_record,
             run_dir=run_path,
@@ -321,7 +324,7 @@ def run_implementation_stage(
             diff_stats_path=None,
             workspace_guard=workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
-            controller_message=format_workspace_hygiene_violation(
+            controller_message=writable_worker._format_writable_guard_stop(
                 workspace_guard,
                 operation="implementation",
                 run_dir=run_path,
@@ -450,15 +453,19 @@ def format_implementation_result(result: ImplementationStageResult) -> str:
         rows.append(f"Patch: {result.patch_path}")
     if result.diff_stats_path is not None:
         rows.append(f"Diff stats: {result.diff_stats_path}")
-    if result.workspace_guard is not None and result.workspace_guard.has_violation:
-        rows.append(f"Workspace guard: {result.workspace_guard.artifact_path}")
-        rows.append("Workspace hygiene violations:")
-        rows.extend(
-            "  - "
-            f"{environment.root_path.relative_to(result.workspace_guard.after.repository_path)}: "
-            f"marker {environment.primary_marker_path.relative_to(result.workspace_guard.after.repository_path)}"
-            for environment in result.workspace_guard.new_environments
-        )
+    if result.workspace_guard is not None and result.workspace_guard.requires_human:
+        if result.workspace_guard.artifact_path is not None:
+            rows.append(f"Workspace guard: {result.workspace_guard.artifact_path}")
+        if result.workspace_guard.has_violation:
+            rows.append("Workspace hygiene violations:")
+            rows.extend(
+                "  - "
+                f"{environment.root_path.relative_to(result.workspace_guard.after.repository_path)}: "
+                f"marker {environment.primary_marker_path.relative_to(result.workspace_guard.after.repository_path)}"
+                for environment in result.workspace_guard.new_environments
+            )
+        if result.workspace_guard.has_inspection_failure:
+            rows.append("Workspace environment inspection was incomplete.")
     if result.codex_execution is not None and not result.codex_execution.successful:
         rows.append(f"Codex execution: {result.codex_execution.execution_json_path}")
         rows.append(f"Codex events: {result.codex_execution.events_jsonl_path}")
@@ -528,8 +535,9 @@ def _inspect_safety(
     *,
     phase: str,
     require_clean_worktree: bool = False,
+    snapshot: WorkspaceSnapshot | None = None,
 ) -> tuple[_ImplementationSafetyViolation, ...]:
-    snapshot = WorkspaceSnapshot.capture(repository)
+    snapshot = snapshot or WorkspaceSnapshot.capture(repository)
     changes = workspace_safety_changes(
         snapshot,
         expected_repository_path=run_record.target_repository_path,
@@ -628,15 +636,28 @@ def _audit_failed_writable_invocation(
     *,
     execution: CodexExecution,
     writable_attempt: WritableAttempt,
+    after_workspace: WorkspaceSnapshot | None,
     workspace_guard: WorkspaceGuardInspection | None,
 ) -> _FailedWritableAudit:
-    violations = list(
-        _inspect_safety(
-            repository,
-            run_record,
-            phase=_SafetyInspectionPhase.AFTER_IMPLEMENTATION,
+    violations: list[_ImplementationSafetyViolation] = []
+    if after_workspace is None:
+        violations.append(
+            _ImplementationSafetyViolation(
+                name="workspace-inspection",
+                expected="complete post-call canonical workspace snapshot",
+                actual="unavailable",
+                message="Could not inspect the workspace after writable Codex execution.",
+            )
         )
-    )
+    else:
+        violations.extend(
+            _inspect_safety(
+                repository,
+                run_record,
+                phase=_SafetyInspectionPhase.AFTER_IMPLEMENTATION,
+                snapshot=after_workspace,
+            )
+        )
     changed_files: tuple[str, ...] = ()
     try:
         changed_files = _worktree_changed_files(repository, run_record.baseline_sha)
@@ -654,8 +675,8 @@ def _audit_failed_writable_invocation(
         )
 
     if changed_files and _workspace_changed_since_writable_attempt(
-        repository,
         writable_attempt,
+        after_workspace,
     ):
         violations.append(
             _ImplementationSafetyViolation(
@@ -672,7 +693,7 @@ def _audit_failed_writable_invocation(
     human_required = (
         execution.process_started
         or bool(violations)
-        or bool(workspace_guard is not None and workspace_guard.has_violation)
+        or bool(workspace_guard is not None and workspace_guard.requires_human)
     )
     patch_path: Path | None = None
     diff_stats_path: Path | None = None
@@ -699,16 +720,13 @@ def _audit_failed_writable_invocation(
 
 
 def _workspace_changed_since_writable_attempt(
-    repository: GitRepository,
     writable_attempt: WritableAttempt,
+    after_workspace: WorkspaceSnapshot | None,
 ) -> bool:
     before = writable_attempt.before_snapshot
-    if before is None:
+    if before is None or after_workspace is None:
         return True
-    try:
-        return not before.matches(WorkspaceSnapshot.capture(repository))
-    except (GitCommandError, OSError, RuntimeError, ValueError):
-        return True
+    return not before.matches(after_workspace)
 
 
 def _capture_failed_diff(
@@ -764,9 +782,9 @@ def _failed_writable_message(
         rows.append(f"Failure diff stats: {audit.diff_stats_path}")
     if audit.patch_error is not None:
         rows.append(f"Failure patch capture error: {audit.patch_error}")
-    if audit.workspace_guard is not None and audit.workspace_guard.has_violation:
+    if audit.workspace_guard is not None and audit.workspace_guard.requires_human:
         rows.append(
-            format_workspace_hygiene_violation(
+            writable_worker._format_writable_guard_stop(
                 audit.workspace_guard,
                 operation=operation,
                 run_dir=run_dir,
