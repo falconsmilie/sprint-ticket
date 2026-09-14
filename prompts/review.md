@@ -56,6 +56,41 @@ Assess at least:
 
 Identify genuine implementation defects without turning unrelated improvement opportunities into mandatory corrective work.
 
+## Evidence-Based Requirement Review
+
+Before returning `PASS`, trace every testable ticket requirement and acceptance
+criterion to both the implementation that enforces it and the evidence that
+protects it. Inspect the tests themselves; a passing command or a test name is
+not evidence that the relevant behaviour is covered.
+
+For every changed executable behaviour, check the following where applicable:
+
+- The test exercises the behaviour through the public API or the supported
+  repository boundary that owns the contract. Do not accept a private-helper
+  test as the only evidence when a stable assembly, execution, or provenance
+  boundary can demonstrate the required behaviour.
+- A valid, ordinary-workflow case demonstrates that the new or changed feature
+  works. For validation, plan, or configuration contracts, inspect every
+  supported construction path, including trusted or internal direct
+  construction when repository patterns permit it.
+- Invalid inputs and incompatible cross-field combinations are rejected at the
+  owning validation boundary. Check required fields, mutually dependent fields,
+  and new constraints introduced by the ticket.
+- Deferred, contract-only, or intentionally unsupported functionality fails at
+  its execution boundary with the promised typed and actionable error. When
+  practical, a test must also establish that the failed attempt leaves input
+  data and observable state unchanged.
+- Changes to serialization or provenance are tested through the supported
+  provenance-assembly boundary and cover the ticket-required payload or record
+  fields.
+
+Do not demand redundant tests when an existing behavioural test already proves
+the requirement at the appropriate boundary. Do raise a `REQUIRED` finding when
+a ticket requirement or implementation change lacks practical behavioural
+coverage, or when its only coverage bypasses the contract it is meant to
+protect. Classify a refactor-sensitive private-helper test as `ADVISORY` when
+the required behaviour is otherwise covered through a supported boundary.
+
 ## Run Context
 
 Baseline SHA: {{BASELINE_SHA}}

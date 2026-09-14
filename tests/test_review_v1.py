@@ -55,6 +55,36 @@ class PassingVerificationRunner:
         return VerificationProcessResult(returncode=0, stdout="", stderr="")
 
 
+def test_review_prompt_requires_requirement_to_evidence_traceability(
+    tmp_path: Path,
+) -> None:
+    repository = create_git_repo(tmp_path / "target")
+    config = make_config(repository)
+    ticket = tmp_path / "TA-ARCH-009.md"
+    ticket.write_text("# Ticket\n", encoding="utf-8")
+    snapshot = create_trusted_prepared_run(
+        config,
+        ticket,
+        runs_dir=tmp_path / "runs",
+        clock=fixed_clock,
+    )
+
+    prompt = review_module._render_review_prompt(
+        ticket_text="# Ticket\n",
+        run_record=snapshot.run_record,
+        current_branch="main",
+        verification_results="{}",
+        implementation_summary="implemented",
+    )
+
+    assert "## Evidence-Based Requirement Review" in prompt
+    assert "trace every testable ticket requirement and acceptance" in prompt
+    normalized_prompt = " ".join(prompt.split())
+    assert "trusted or internal direct construction" in normalized_prompt
+    assert "leaves input data and observable state unchanged" in normalized_prompt
+    assert "supported provenance-assembly boundary" in normalized_prompt
+
+
 def test_review_snapshot_failure_is_recorded_as_human_required(
     tmp_path: Path,
     monkeypatch,
