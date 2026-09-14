@@ -94,3 +94,13 @@ Finding dispositions:
 - `REQUIRED`: must be corrected before ticket acceptance; only these findings may later enter an automated corrective loop.
 - `ADVISORY`: useful observation that does not block ticket acceptance and must not trigger corrective implementation automatically.
 - `FOLLOW_UP`: useful improvement outside the current ticket scope and must not trigger corrective implementation automatically.
+
+Scope relations:
+
+- `TICKET`: the required change is directly required by the original ticket.
+- `IMPLEMENTATION`: the finding identifies a defect or regression introduced by this implementation.
+- `REPOSITORY_AUTHORITY`: repository rules or contracts raise a conflict that requires a human decision.
+- `OUT_OF_SCOPE`: the observation is outside the approved ticket and must not drive this ticket's corrective work.
+- `AMBIGUOUS`: the available ticket or repository evidence cannot establish a safe corrective action.
+
+Only `REQUIRED` findings with `TICKET` or `IMPLEMENTATION` scope relations may enter automatic correction. Classify any required finding that needs human judgment with its actual scope relation and use `HUMAN_REVIEW_REQUIRED` when appropriate.

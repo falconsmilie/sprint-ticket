@@ -439,6 +439,8 @@ def test_correction_reason_kinds_distinguish_review_findings():
         finding_id="review-1",
         summary="Reviewer found a bug.",
         details="Future review details.",
+        disposition="REQUIRED",
+        scope_relation="TICKET",
     )
 
     assert finding.to_dict()["kind"] == "ReviewFinding"

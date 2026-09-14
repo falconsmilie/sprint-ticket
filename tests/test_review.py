@@ -125,6 +125,8 @@ def test_review_prompt_contains_full_ticket_baseline_verification_and_scope(tmp_
     assert "implemented synthetic ticket" in prompt
     assert "baseline SHA -> complete current working tree" in prompt
     assert "Do not limit review scope to the latest changed file" in prompt
+    assert "`TICKET`: the required change is directly required" in prompt
+    assert "`AMBIGUOUS`: the available ticket or repository evidence" in prompt
     assert repo.joinpath("file.txt").read_text(encoding="utf-8") == "implemented\n"
 
 
@@ -227,9 +229,17 @@ def test_pass_review_accepts_advisory_and_follow_up_observations(tmp_path):
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for review tests")
-def test_corrections_required_moves_to_correct_and_exposes_required_findings(tmp_path):
+@pytest.mark.parametrize("scope_relation", ["TICKET", "IMPLEMENTATION"])
+def test_correction_eligible_required_findings_move_to_correct_and_are_preserved(
+    tmp_path,
+    scope_relation,
+):
     _repo, run_dir, config = verified_run(tmp_path)
-    required = finding("R1-F1", disposition="REQUIRED")
+    required = finding(
+        "R1-F1",
+        disposition="REQUIRED",
+        scope_relation=scope_relation,
+    )
 
     result = run_review_stage(
         config,
@@ -244,7 +254,39 @@ def test_corrections_required_moves_to_correct_and_exposes_required_findings(tmp
 
     assert result.outcome == StageOutcome.CORRECTION_REQUIRED
     assert result.required_findings == (required,)
-    assert "required corrections" in result.controller_message
+    assert "correction-eligible" in result.controller_message
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for review tests")
+@pytest.mark.parametrize(
+    "scope_relation",
+    ["OUT_OF_SCOPE", "AMBIGUOUS", "REPOSITORY_AUTHORITY"],
+)
+def test_non_eligible_required_findings_move_to_human_required(
+    tmp_path,
+    scope_relation,
+):
+    _repo, run_dir, config = verified_run(tmp_path)
+
+    result = run_review_stage(
+        config,
+        run_dir,
+        codex_runner=ReviewRunner(
+            result=review_result(
+                verdict="CORRECTIONS_REQUIRED",
+                findings=[
+                    finding(
+                        "R1-F1",
+                        disposition="REQUIRED",
+                        scope_relation=scope_relation,
+                    )
+                ],
+            )
+        ),
+    )
+
+    assert result.outcome == StageOutcome.HUMAN_REQUIRED
+    assert "none are safely eligible" in result.controller_message
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for review tests")
@@ -258,7 +300,6 @@ def test_human_review_required_moves_to_human_required(tmp_path):
             result=review_result(
                 verdict="HUMAN_REVIEW_REQUIRED",
                 summary="Repository authority is ambiguous.",
-                confidence="LOW",
             )
         ),
     )
@@ -461,6 +502,21 @@ def test_review_result_schema_rejects_unsupported_results(patch):
         validate_json_schema(result, schema)
 
 
+def test_review_result_schema_rejects_unknown_finding_fields():
+    schema = review_schema()
+    result = review_result(
+        findings=[
+            {
+                **finding("R1-F1", disposition="REQUIRED"),
+                "unexpected": "must be rejected",
+            }
+        ]
+    )
+
+    with pytest.raises(CodexResultValidationError):
+        validate_json_schema(result, schema)
+
+
 def test_review_result_semantics_reject_contradictions():
     with pytest.raises(ReviewResultConsistencyError):
         validate_review_result_semantics(
@@ -534,13 +590,11 @@ def review_result(
     *,
     verdict: str = ReviewVerdict.PASS.value,
     summary: str = "review passed",
-    confidence: str = "HIGH",
     findings: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     return {
         "verdict": verdict,
         "summary": summary,
-        "confidence": confidence,
         "findings": [] if findings is None else findings,
     }
 
@@ -549,14 +603,12 @@ def finding(
     finding_id: str,
     *,
     disposition: str,
-    severity: str = "MEDIUM",
+    scope_relation: str = "TICKET",
 ) -> dict[str, object]:
     return {
         "id": finding_id,
-        "severity": severity,
-        "category": "CORRECTNESS",
         "disposition": disposition,
-        "scope_relation": "TICKET",
+        "scope_relation": scope_relation,
         "title": "Synthetic finding",
         "description": "Synthetic review finding description.",
         "evidence": "Synthetic evidence.",

@@ -48,6 +48,7 @@ from .reporting import (
     run_report_stage,
 )
 from .review import (
+    _AUTOMATIC_CORRECTION_SCOPE_RELATIONS,
     ReviewStageResult,
     ReviewVerdict,
     run_review_stage,
@@ -1069,6 +1070,14 @@ def _require_correction_source_checkpoint(
             return (
                 "Review correction source is not internally consistent: "
                 "no required review findings were persisted."
+            )
+        if not all(
+            finding.scope_relation in _AUTOMATIC_CORRECTION_SCOPE_RELATIONS
+            for finding in findings
+        ):
+            return (
+                "Review correction source is not eligible for automatic correction: "
+                "it contains REQUIRED findings that are not safely eligible."
             )
         return None
 

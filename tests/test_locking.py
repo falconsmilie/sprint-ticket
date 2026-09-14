@@ -500,7 +500,6 @@ def review_result() -> dict[str, object]:
     return {
         "verdict": "PASS",
         "summary": "accepted",
-        "confidence": "HIGH",
         "findings": [],
     }
 

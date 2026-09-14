@@ -8,6 +8,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from . import writable_worker
 from ._verification_artifacts import (
     VERIFICATION_DIR_NAME,
     _baseline_verification_evidence_problem,
@@ -39,6 +40,10 @@ from .git_safety import (
     workspace_safety_changes,
 )
 from .models import StageOutcome, StopCategory, WorkflowState
+from .review import (
+    _AUTOMATIC_CORRECTION_SCOPE_RELATIONS,
+    _REVIEW_FINDING_SCOPE_RELATIONS,
+)
 from .runs import (
     BASELINE_RECORD_FILE,
     RUN_RECORD_FILE,
@@ -50,7 +55,6 @@ from .runs import (
 )
 from .workspace_guard import WorkspaceGuardInspection
 from .writable_attempts import WritableAttempt
-from . import writable_worker
 
 
 class CorrectionReasonKind(StrEnum):
@@ -111,12 +115,21 @@ class ReviewFinding:
     finding_id: str
     summary: str
     details: str
-    severity: str = ""
-    category: str = ""
+    disposition: str
+    scope_relation: str
     evidence: str = ""
     required_change: str = ""
     acceptance_criteria: tuple[str, ...] = ()
-    disposition: str = "REQUIRED"
+
+    def __post_init__(self) -> None:
+        if self.disposition not in _REVIEW_FINDING_DISPOSITIONS:
+            raise ValueError(
+                "Review finding disposition must be a supported disposition."
+            )
+        if self.scope_relation not in _REVIEW_FINDING_SCOPE_RELATIONS:
+            raise ValueError(
+                "Review finding scope_relation must be a supported scope relation."
+            )
 
     @property
     def kind(self) -> CorrectionReasonKind:
@@ -128,12 +141,11 @@ class ReviewFinding:
             "finding_id": self.finding_id,
             "summary": self.summary,
             "details": self.details,
-            "severity": self.severity,
-            "category": self.category,
             "evidence": self.evidence,
             "required_change": self.required_change,
             "acceptance_criteria": list(self.acceptance_criteria),
             "disposition": self.disposition,
+            "scope_relation": self.scope_relation,
         }
 
 
@@ -658,8 +670,6 @@ def correction_reason_from_dict(data: dict[str, Any]) -> CorrectionReason:
             finding_id=_required_string(data, "finding_id", source=source),
             summary=_required_string(data, "summary", source=source),
             details=_required_string(data, "details", source=source),
-            severity=_required_string(data, "severity", source=source),
-            category=_required_string(data, "category", source=source),
             evidence=_required_string(data, "evidence", source=source),
             required_change=_required_string(
                 data,
@@ -672,6 +682,7 @@ def correction_reason_from_dict(data: dict[str, Any]) -> CorrectionReason:
                 source=source,
             ),
             disposition=disposition,
+            scope_relation=_required_review_scope_relation(data, source=source),
         )
     raise CorrectionError(f"Unsupported correction reason kind: {kind!r}.")
 
@@ -862,6 +873,12 @@ def _load_required_review_findings(
         raise CorrectionError(
             "Review requested corrections but did not contain REQUIRED findings."
         )
+    eligible_findings = _eligible_reasons(findings)
+    if len(eligible_findings) != len(findings):
+        raise CorrectionError(
+            "Review requested corrections but contains REQUIRED findings that "
+            "are not safely eligible for automatic correction."
+        )
     return findings
 
 
@@ -924,8 +941,7 @@ def _render_review_correction_ticket(
                 "",
                 f"### {finding.finding_id} - {_text_or_default(finding.summary)}",
                 "",
-                f"Severity: {_display_enum(finding.severity)}",
-                f"Category: {_display_enum(finding.category)}",
+                f"Scope relation: {_display_enum(finding.scope_relation)}",
                 "",
                 "Finding:",
                 _text_or_default(finding.details),
@@ -1382,8 +1398,6 @@ def _review_finding_from_dict(data: dict[str, Any], *, index: int) -> ReviewFind
         finding_id=_required_string(data, "id", source=source),
         summary=_required_string(data, "title", source=source),
         details=_required_string(data, "description", source=source),
-        severity=_required_string(data, "severity", source=source),
-        category=_required_string(data, "category", source=source),
         evidence=_required_string(data, "evidence", source=source),
         required_change=_required_string(data, "required_change", source=source),
         acceptance_criteria=_required_string_tuple(
@@ -1392,6 +1406,7 @@ def _review_finding_from_dict(data: dict[str, Any], *, index: int) -> ReviewFind
             source=source,
         ),
         disposition="REQUIRED",
+        scope_relation=_required_review_scope_relation(data, source=source),
     )
 
 
@@ -1401,7 +1416,11 @@ def _eligible_reasons(
     return tuple(
         reason
         for reason in reasons
-        if not isinstance(reason, ReviewFinding) or reason.disposition == "REQUIRED"
+        if not isinstance(reason, ReviewFinding)
+        or (
+            reason.disposition == "REQUIRED"
+            and reason.scope_relation in _AUTOMATIC_CORRECTION_SCOPE_RELATIONS
+        )
     )
 
 
@@ -1476,6 +1495,19 @@ def _display_enum(value: str) -> str:
     if not value:
         return "Unspecified"
     return value.replace("_", " ").title()
+
+
+def _required_review_scope_relation(
+    data: dict[str, Any],
+    *,
+    source: str,
+) -> str:
+    scope_relation = _required_string(data, "scope_relation", source=source)
+    if scope_relation not in _REVIEW_FINDING_SCOPE_RELATIONS:
+        raise CorrectionError(
+            f"{source} has unsupported scope_relation: {scope_relation!r}."
+        )
+    return scope_relation
 
 
 def _text_or_default(value: str) -> str:

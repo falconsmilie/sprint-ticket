@@ -52,7 +52,6 @@ def review_result() -> dict[str, object]:
     return {
         "verdict": "PASS",
         "summary": "fake review accepted the implementation",
-        "confidence": "HIGH",
         "findings": [],
     }
 

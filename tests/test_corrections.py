@@ -16,8 +16,8 @@ from tests.helpers import (
     run_git,
 )
 from tests.helpers import create_trusted_prepared_run as create_run_snapshot
-from ticket_automation import workspace_guard as workspace_guard_module
 from ticket_automation import corrections as corrections_module
+from ticket_automation import workspace_guard as workspace_guard_module
 from ticket_automation.codex import (
     CodexCommand,
     CodexFailureKind,
@@ -30,7 +30,9 @@ from ticket_automation.corrections import (
     CORRECTIONS_DIR_NAME,
     CorrectionError,
     ReviewFinding,
+    correction_reason_from_dict,
     render_correction_ticket,
+    review_findings_from_result,
     run_correction_stage,
 )
 from ticket_automation.git import GitCommandError
@@ -135,8 +137,8 @@ def test_required_review_finding_renders_markdown_correction():
                 finding_id="R1-F1",
                 summary="Validation incorrectly includes untested sites",
                 details="The validation table includes rows that were never tested.",
-                severity="MEDIUM",
-                category="CORRECTNESS",
+                disposition="REQUIRED",
+                scope_relation="TICKET",
                 evidence="tests/test_validation.py::test_sites fails.",
                 required_change="Filter validation rows to tested sites only.",
                 acceptance_criteria=("Untested sites are excluded.",),
@@ -147,10 +149,61 @@ def test_required_review_finding_renders_markdown_correction():
     assert "# QDEB-003 - Corrective Round 1" in markdown
     assert "independent review of QDEB-003" in markdown
     assert "### R1-F1 - Validation incorrectly includes untested sites" in markdown
-    assert "Severity: Medium" in markdown
-    assert "Category: Correctness" in markdown
+    assert "Scope relation: Ticket" in markdown
     assert "Filter validation rows to tested sites only." in markdown
     assert "- Untested sites are excluded." in markdown
+
+
+def test_review_finding_scope_relation_survives_serialization():
+    finding = ReviewFinding(
+        finding_id="R1-F1",
+        summary="A regression was introduced.",
+        details="The implementation changed an established behavior.",
+        disposition="REQUIRED",
+        evidence="tests/test_regression.py::test_behavior fails.",
+        required_change="Restore the established behavior.",
+        acceptance_criteria=("The regression test passes.",),
+        scope_relation="IMPLEMENTATION",
+    )
+
+    restored = correction_reason_from_dict(finding.to_dict())
+
+    assert isinstance(restored, ReviewFinding)
+    assert restored.scope_relation == "IMPLEMENTATION"
+    assert restored.to_dict() == finding.to_dict()
+
+
+def test_structured_review_finding_preserves_scope_relation():
+    structured_finding = finding(
+        "R1-F1",
+        disposition="REQUIRED",
+        title="Implementation regression",
+    )
+    structured_finding["scope_relation"] = "IMPLEMENTATION"
+
+    findings = review_findings_from_result({"findings": [structured_finding]})
+
+    assert findings[0].scope_relation == "IMPLEMENTATION"
+    assert findings[0].to_dict()["scope_relation"] == "IMPLEMENTATION"
+
+
+def test_review_finding_requires_a_supported_explicit_scope_relation():
+    with pytest.raises(TypeError, match="scope_relation"):
+        ReviewFinding(
+            finding_id="R1-F1",
+            summary="Missing scope.",
+            details="A scope relation is required.",
+            disposition="REQUIRED",
+        )
+
+    with pytest.raises(ValueError, match="scope_relation"):
+        ReviewFinding(
+            finding_id="R1-F1",
+            summary="Invalid scope.",
+            details="The scope relation is unsupported.",
+            disposition="REQUIRED",
+            scope_relation="UNKNOWN",
+        )
 
 
 @pytest.mark.skipif(
@@ -804,8 +857,6 @@ def test_malformed_required_review_finding_is_rejected_before_invocation(tmp_pat
     result_data["findings"] = [
         {
             "id": "R1-F1",
-            "severity": "MEDIUM",
-            "category": "CORRECTNESS",
             "disposition": "REQUIRED",
             "scope_relation": "TICKET",
             "title": "Missing evidence",
@@ -1098,7 +1149,6 @@ def review_result(
     return {
         "verdict": ReviewVerdict.CORRECTIONS_REQUIRED.value,
         "summary": "review requires correction",
-        "confidence": "HIGH",
         "findings": findings,
     }
 
@@ -1111,8 +1161,6 @@ def finding(
 ) -> dict[str, object]:
     return {
         "id": finding_id,
-        "severity": "MEDIUM",
-        "category": "CORRECTNESS",
         "disposition": disposition,
         "scope_relation": "TICKET",
         "title": title,

@@ -4,7 +4,7 @@ repo = "C:/Projects/phospy"
 protected_branches = ["main", "master"]
 
 [runner]
-max_correction_rounds = 3
+max_correction_rounds = 1
 
 [codex]
 executable = "codex"

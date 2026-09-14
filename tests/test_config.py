@@ -22,7 +22,7 @@ def test_loads_example_config(tmp_path):
     assert config.project.name == "PhosPy"
     assert config.project.repo.as_posix() == "C:/Projects/phospy"
     assert config.project.protected_branches == ("main", "master")
-    assert config.runner.max_correction_rounds == 3
+    assert config.runner.max_correction_rounds == 1
     assert config.codex.executable == "codex"
     assert config.codex.model == DEFAULT_CODEX_MODEL
     assert config.codex.reasoning_effort == DEFAULT_CODEX_REASONING_EFFORT

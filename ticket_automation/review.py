@@ -80,6 +80,26 @@ class FindingDisposition(StrEnum):
     FOLLOW_UP = "FOLLOW_UP"
 
 
+class _FindingScopeRelation(StrEnum):
+    TICKET = "TICKET"
+    IMPLEMENTATION = "IMPLEMENTATION"
+    REPOSITORY_AUTHORITY = "REPOSITORY_AUTHORITY"
+    OUT_OF_SCOPE = "OUT_OF_SCOPE"
+    AMBIGUOUS = "AMBIGUOUS"
+
+
+_REVIEW_FINDING_SCOPE_RELATIONS = frozenset(
+    relation.value for relation in _FindingScopeRelation
+)
+
+_AUTOMATIC_CORRECTION_SCOPE_RELATIONS = frozenset(
+    {
+        _FindingScopeRelation.TICKET.value,
+        _FindingScopeRelation.IMPLEMENTATION.value,
+    }
+)
+
+
 class _ReviewArtifactState(StrEnum):
     MISSING = "MISSING"
     PARTIAL = "PARTIAL"
@@ -328,6 +348,16 @@ def validate_review_result_semantics(result: dict[str, Any]) -> None:
         )
 
 
+def _correction_eligible_review_findings(
+    result: dict[str, Any],
+) -> tuple[dict[str, Any], ...]:
+    return tuple(
+        finding
+        for finding in _required_findings(result)
+        if finding.get("scope_relation") in _AUTOMATIC_CORRECTION_SCOPE_RELATIONS
+    )
+
+
 def format_review_result(result: ReviewStageResult) -> str:
     rows = [
         f"Review state: {result.run_record.state.value}",
@@ -377,8 +407,23 @@ def _finish_valid_review_result(
         outcome = StageOutcome.COMPLETED
         controller_message = "Review passed; final report can start."
     elif verdict == ReviewVerdict.CORRECTIONS_REQUIRED:
-        outcome = StageOutcome.CORRECTION_REQUIRED
-        controller_message = "Review found required corrections."
+        required_findings = _required_findings(review_result)
+        eligible_findings = _correction_eligible_review_findings(review_result)
+        if len(eligible_findings) == len(required_findings):
+            outcome = StageOutcome.CORRECTION_REQUIRED
+            controller_message = "Review found correction-eligible required findings."
+        elif not eligible_findings:
+            outcome = StageOutcome.HUMAN_REQUIRED
+            controller_message = (
+                "Review found REQUIRED findings, but none are safely eligible for "
+                "automatic correction."
+            )
+        else:
+            outcome = StageOutcome.HUMAN_REQUIRED
+            controller_message = (
+                "Review contains REQUIRED findings that are not safely eligible "
+                "for automatic correction."
+            )
     else:
         outcome = StageOutcome.HUMAN_REQUIRED
         controller_message = "Review requires human attention."

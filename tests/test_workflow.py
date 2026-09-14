@@ -363,6 +363,133 @@ def test_implementation_and_correction_use_the_shared_writable_boundary(
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+@pytest.mark.parametrize(
+    "scope_relation",
+    ["OUT_OF_SCOPE", "AMBIGUOUS", "REPOSITORY_AUTHORITY"],
+)
+def test_mixed_scope_review_findings_never_invoke_writable_correction(
+    tmp_path,
+    scope_relation,
+):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+    codex = SequencedCodexRunner(
+        steps=[
+            CodexStep(
+                result=implementation_result(), mutation=write_file("implemented\n")
+            ),
+            CodexStep(
+                result=review_result(
+                    verdict=ReviewVerdict.CORRECTIONS_REQUIRED.value,
+                    findings=[
+                        finding("R1-F0", disposition="REQUIRED"),
+                        finding(
+                            "R1-F1",
+                            disposition="REQUIRED",
+                            scope_relation=scope_relation,
+                        ),
+                    ],
+                )
+            ),
+        ],
+        calls=[],
+    )
+    verification = SequencedVerificationRunner(steps=[VerificationStep()], calls=[])
+
+    result = run_ticket_lifecycle(
+        config,
+        ticket,
+        runs_dir=tmp_path / "runs",
+        codex_runner=codex,
+        verification_runner=PassingBaselineVerificationRunner(verification),
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.correction_results == ()
+    assert [sandbox_value(command.argv) for command, _stdin in codex.calls] == [
+        Sandbox.WORKSPACE_WRITE.value,
+        Sandbox.READ_ONLY.value,
+    ]
+    assert not result.run_dir.joinpath("correction-executions").exists()
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+@pytest.mark.parametrize("disposition", ["ADVISORY", "FOLLOW_UP"])
+def test_non_required_review_finding_never_creates_correction(tmp_path, disposition):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+    codex = SequencedCodexRunner(
+        steps=[
+            CodexStep(
+                result=implementation_result(), mutation=write_file("implemented\n")
+            ),
+            CodexStep(
+                result=review_result(
+                    findings=[finding("R1-F1", disposition=disposition)]
+                )
+            ),
+        ],
+        calls=[],
+    )
+    verification = SequencedVerificationRunner(steps=[VerificationStep()], calls=[])
+
+    result = run_ticket_lifecycle(
+        config,
+        ticket,
+        runs_dir=tmp_path / "runs",
+        codex_runner=codex,
+        verification_runner=PassingBaselineVerificationRunner(verification),
+        clock=fixed_clock,
+    )
+
+    assert result.successful
+    assert result.correction_results == ()
+    assert result.run_record.current_correction_round == 0
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+def test_v1_correction_budget_stops_second_required_review_after_fresh_review(tmp_path):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+    codex = SequencedCodexRunner(
+        steps=[
+            CodexStep(
+                result=implementation_result(), mutation=write_file("implemented\n")
+            ),
+            CodexStep(
+                result=review_result(verdict=ReviewVerdict.CORRECTIONS_REQUIRED.value)
+            ),
+            CodexStep(
+                result=implementation_result(), mutation=write_file("corrected\n")
+            ),
+            CodexStep(
+                result=review_result(verdict=ReviewVerdict.CORRECTIONS_REQUIRED.value)
+            ),
+        ],
+        calls=[],
+    )
+    verification = SequencedVerificationRunner(
+        steps=[VerificationStep(), VerificationStep()], calls=[]
+    )
+
+    result = run_ticket_lifecycle(
+        config,
+        ticket,
+        runs_dir=tmp_path / "runs",
+        codex_runner=codex,
+        verification_runner=PassingBaselineVerificationRunner(verification),
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.run_record.current_correction_round == 1
+    assert result.run_record.current_review_round == 2
+    assert len(result.correction_results) == 1
+    assert len(result.verification_results) == 2
+    assert len(result.review_results) == 2
+    assert not result.run_dir.joinpath("correction-executions", "round-2").exists()
+    assert "Maximum corrective rounds exhausted" in result.run_record.terminal_reason
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
 def test_lifecycle_verification_failure_drives_correction_without_review(tmp_path):
     _repo, ticket, config = workflow_inputs(tmp_path)
     codex = SequencedCodexRunner(
@@ -2425,7 +2552,7 @@ def test_resume_restarts_interrupted_read_only_review_with_fresh_review(tmp_path
 def workflow_inputs(
     tmp_path,
     *,
-    max_correction_rounds: int = 3,
+    max_correction_rounds: int = 1,
 ) -> tuple[Path, Path, object]:
     repo = create_git_repo(tmp_path / "repo")
     ticket = tmp_path / "QDEB-003.md"
@@ -2465,18 +2592,20 @@ def review_result(
     return {
         "verdict": verdict,
         "summary": summary,
-        "confidence": "HIGH",
         "findings": [] if findings is None else findings,
     }
 
 
-def finding(finding_id: str, *, disposition: str) -> dict[str, object]:
+def finding(
+    finding_id: str,
+    *,
+    disposition: str,
+    scope_relation: str = "TICKET",
+) -> dict[str, object]:
     return {
         "id": finding_id,
-        "severity": "MEDIUM",
-        "category": "CORRECTNESS",
         "disposition": disposition,
-        "scope_relation": "TICKET",
+        "scope_relation": scope_relation,
         "title": "Synthetic finding",
         "description": "Synthetic finding description.",
         "evidence": "Synthetic evidence.",
