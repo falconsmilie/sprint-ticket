@@ -1,194 +1,122 @@
 # TicketAutomation
 
-TicketAutomation is a standalone Python project for coordinating automation around implementation tickets. It is independent of the repositories it works on: target projects are configured through local settings and are not part of this package.
+TicketAutomation is a synchronous local controller for one implementation
+ticket at a time. It asks Codex to implement, verify, review, and, by default,
+make one corrective pass. The target repository remains under human Git
+control: TicketAutomation never stages, commits, switches branches, or cleans
+up target-worktree changes.
 
-V1 is scoped to one implementation ticket at a time. TicketAutomation now runs the complete mechanical loop for one ticket: preflight, snapshot, implementation, deterministic verification, independent review, bounded correction, reverification, fresh rereview, final reporting, and audit handoff until the run reaches `READY_FOR_HUMAN`, `HUMAN_REQUIRED`, or `FAILED`.
+## Run model
 
-TicketAutomation permits only one active run per target repository working tree. `run` and `resume` take a local process-scoped repository lock under TicketAutomation-owned runtime state before entering the writable lifecycle, keyed by the canonical target repository identity where practical. This protects the uncommitted ticket boundary from two local automation processes editing the same working tree at once; Git history safety is still enforced separately by branch, HEAD, and staging checks.
+Each run has an immutable resolved configuration, a snapshotted ticket, and a
+clean Git baseline. The controller drives this explicit state machine:
 
-Human control remains explicit. TicketAutomation does not commit, push, change branches, stage files, reset work, stash work, or clean a target repository. The implementation agent may edit the working tree, and TicketAutomation verifies the branch, HEAD, and staging area after that writable boundary. The review agent runs in a separate read-only Codex invocation and must not edit the repository.
+```text
+PREPARING -> PREPARED -> IMPLEMENTING -> VERIFYING -> REVIEWING -> REPORTING
+                                                    |              |
+                                                    v              v
+                                           CORRECTION_PENDING   READY_FOR_HUMAN
+                                                    |
+                                                    v
+                                               CORRECTING
+```
 
-Writable implementation and correction prompts instruct Codex to use the target project's existing development environment and tooling, avoid workaround environments and global installation, and return `BLOCKED` when missing tooling prevents safe completion. V1 deterministically enforces only one part of that policy: a writable call must not create a new detectable Python virtual-environment or Conda environment root inside the target repository. It does not claim to detect every package cache, dependency tree, or external/global environment mutation.
+Verification or review can request correction. Any safety failure, failed
+infrastructure call, or finding outside the configured automatic-correction
+scope ends in `HUMAN_REQUIRED`.
+
+Before the final transition, the controller captures the canonical
+`WorkspaceSnapshot` and checks that branch, HEAD, staging, the latest writable
+attempt fingerprint, deterministic verification, and review all agree. It
+captures `final.patch`, rechecks that the workspace did not change during that
+capture, then transitions to `READY_FOR_HUMAN` or `HUMAN_REQUIRED`.
+`report.md` only renders those records; it does not make acceptance decisions.
 
 ## Configuration
 
-Copy the example configuration and edit the local file for your machine:
-
-```powershell
-Copy-Item config.example.toml config.local.toml
-```
-
-Set the required project-specific values in `config.local.toml`, including `project`, `codex.executable`, and verification commands. `config.example.toml` is a documentation template only; TicketAutomation never loads it at runtime. Application defaults supply the correction limit, Codex model, and reasoning effort when they are absent from `config.local.toml`.
-
-Codex execution policy is configured by TicketAutomation, so runs do not depend on your global Codex model defaults:
-
-```toml
-[codex]
-model = "gpt-5.5"
-reasoning_effort = "xhigh"
-```
-
-The effective Codex model and reasoning effort are resolved in this order:
-
-```text
-CLI override
-> config.local.toml
-> application default
-```
-
-To temporarily run a ticket with a different model or reasoning effort, pass either override to `run`:
-
-```powershell
-python -m ticket_automation run tickets/example.md --model gpt-5.5 --reasoning-effort high
-```
-
-## CLI
-
-Show the available commands:
-
-```powershell
-python -m ticket_automation --help
-```
-
-Load, validate, and summarize the effective configuration:
-
-```powershell
-python -m ticket_automation config
-```
-
-Inspect the configured target repository before any writable automation runs:
-
-```powershell
-python -m ticket_automation preflight
-```
-
-Create a persistent run record from a local Markdown ticket and run the complete V1 mechanical lifecycle:
-
-```powershell
-python -m ticket_automation run tickets/example.md
-```
-
-The `run` command performs preflight, copies the ticket verbatim into `runs/<run-id>/ticket.md`, records the starting branch and clean workspace fingerprint, and runs all configured deterministic verification commands against that clean baseline. Only a passing baseline advances to `PREPARED` and permits Codex to start with a `workspace-write` sandbox. After implementation, the same commands run again against the changed workspace, followed by a fresh Codex reviewer with a `read-only` sandbox when verification passes. A passing review transitions through `REPORTING`, writes `diffs/final.patch` and `final-report.md`, then reaches `READY_FOR_HUMAN` only if final verification, review, and Git safety evidence still hold.
-
-List known run records:
-
-```powershell
-python -m ticket_automation status
-```
-
-Resume a non-terminal run from an explicitly safe persisted checkpoint:
-
-```powershell
-python -m ticket_automation resume <run-id>
-```
-
-Verification commands belong in `config.local.toml`. Each command uses an argument array and an explicit timeout:
+Copy `config.example.toml` to `config.local.toml` and set the target repository
+and exact verification commands. Verification is run in the target repository,
+so commands must explicitly select that project's intended environment and
+tooling. For example:
 
 ```toml
 [[verification.commands]]
 name = "tests"
-argv = ["python", "-m", "pytest"]
+argv = ["C:/Projects/my-target/.venv/Scripts/python.exe", "-m", "pytest"]
 timeout_seconds = 1800
 ```
 
-## Repository Preflight
+TicketAutomation does not install or own pytest, ruff, pyright, or any other
+target-project verification tool. Its own development tools are in the `dev`
+dependency group.
 
-Preflight is the safety gate for target repositories. It checks that `project.repo` exists, is a Git working tree, is on a branch, has no unstaged, untracked, or staged changes, and is not on one of the configured protected branches such as `main` or `master`.
+`runner.max_correction_rounds` defaults to `1`. The resolved configuration is
+persisted in `run.json`, so changing `config.local.toml` cannot change a run
+that already exists. Sandboxes are fixed by phase: implementation and
+correction use `workspace-write`; verification, review, and reporting are
+read-only with respect to the target project.
 
-Codex runs use `--ephemeral`. V1 also rejects a target repository containing `.codex/config.toml` before automated execution, because project Codex execution configuration cannot be suppressed reliably while preserving a testable policy boundary. Repository guidance such as `AGENTS.md`, ADRs, tests, and documentation remains available to the agent.
+## Artifacts and attempts
 
-`run` acquires the target repository ownership lock before preflight and releases it on controlled terminal outcomes or ordinary exceptions. If a later preflight check fails, the process ownership is released; the failed preflight does not strand the repository.
-
-The target repository must start clean. TicketAutomation deliberately does not stash changes, discard files, switch branches, reset history, or perform any automatic Git cleanup. If preflight fails, fix the repository yourself and run preflight again.
-
-## Run Records
-
-Run snapshots are stored under `runs/`. A run ID uses a timestamp plus a sanitized ticket identifier, such as `20260911-130512_QDEB-003`. Existing run directories are not overwritten; a numeric suffix is added if a timestamp collision occurs.
-
-Each run directory contains `run.json`, `ticket.md`, `baseline.json`, and `baseline-verification/verification.json` plus its human-readable log. `run.json` contains one immutable `resolved_config` snapshot: target repository, protected branches, resolved Codex executable and CLI version, model and reasoning effort, fixed phase sandboxes, verification commands and timeouts, correction limit, TicketAutomation identity, and prompt/schema fingerprints. Resume uses this snapshot rather than the current local configuration.
-
-A successful run also contains `diffs/final.patch` and `final-report.md`. The final patch is always relative to the original baseline SHA and the complete current working tree. The final report separates controller-observed facts from implementation-agent claims, so runner verification and Git evidence are not confused with agent-reported targeted tests.
-
-## Mechanical V1 Loop
-
-`python -m ticket_automation run tickets/example.md` advances the ticket without manual stage commands:
+Runs are append-only evidence directories:
 
 ```text
-PREPARING
-  -> run deterministic verification against the clean baseline
-  -> PREPARED
-  -> IMPLEMENTING
-  -> VERIFYING
-  -> REVIEWING
-  -> REPORTING
-  -> READY_FOR_HUMAN
+runs/<run-id>/
+  run.json
+  ticket.md
+  baseline.json
+  attempts/
+    001-preparation/
+      attempt.json
+      result.json
+    002-implementation/
+      attempt.json
+      prompt.md
+      events.jsonl
+      stderr.log
+      execution.json
+      result.json
+    003-verification/
+      attempt.json
+      result.json
+  final.patch
+  report.md
 ```
 
-Failed verification or a review that requires corrections advances through `CORRECTION_PENDING -> CORRECTING -> VERIFYING`.
+Attempt directory numbers are monotonically increasing. `attempt.json` records
+the phase, status, before/after workspace fingerprints, process-start status,
+timestamps, and result/execution paths. Codex prompts, raw events, stderr, and
+typed results live with the attempt that produced them. Verification stdout and
+stderr live once in its typed result; there is no parallel human log. The only
+human-readable patch is the final `final.patch`.
 
-If deterministic verification fails, TicketAutomation skips review and generates a corrective ticket directly from typed `VerificationFailure` records. If review returns `CORRECTIONS_REQUIRED`, TicketAutomation generates a corrective ticket from the reviewer's `REQUIRED` findings. Every correction is followed by deterministic verification. If verification passes, the next review is a completely fresh review of the original ticket against the original baseline and the complete current working tree.
+Workspace-guard evidence is recorded in the writable execution metadata.
+There are no per-round patch or `.stat` copies, duplicate Codex result files,
+or automatic Git cleanup.
 
-Verification-driven and review-driven corrections share the same `[runner].max_correction_rounds` limit. The application default is `1`; configure a different limit in `config.local.toml` before creating a run. The resolved limit is immutable for that run.
+## Resume behavior
 
-Python owns all orchestration decisions. Codex may edit source files during writable implementation or correction phases, and Codex may return structured implementation and review judgments. TicketAutomation decides transitions from typed state only: implementation status, deterministic verification results, review verdict, correction count, and Git safety checks. It does not infer acceptance or correction needs from prose, stdout, reviewer narrative, or summary wording.
+Resume never adopts a completed artifact whose controller state transition may
+have been interrupted. It allocates a new attempt for safe work.
 
-## Final Reporting And Resume
+`PREPARING`, `VERIFYING`, `REVIEWING`, and `REPORTING` can run again when the
+current workspace fingerprint matches the persisted expected fingerprint.
+Incomplete attempts remain diagnostic history. `IMPLEMENTING` and `CORRECTING`
+are conservative: an interruption always moves the run to `HUMAN_REQUIRED` so
+a person can inspect the target workspace before deciding what to do.
 
-`REPORTING` is a read-only target-repository phase. It gathers already persisted evidence, captures the final Git state, writes `runs/<run-id>/diffs/final.patch`, writes `runs/<run-id>/final-report.md`, and prints a concise terminal handoff. It does not stage files, commit, switch branches, or alter target source code.
+Attempt records are trusted only when their sequence, phase, status, paths, and
+directory agree. Invalid attempt evidence stops resume for human inspection;
+the controller never follows an artifact path outside its own attempt.
 
-`READY_FOR_HUMAN` is entered only when deterministic verification currently passes, the final independent review verdict is `PASS`, the canonical workspace fingerprint still matches the last verified writable checkpoint, Git safety invariants still hold, and both final report artifacts were persisted. The fingerprint covers repository path, branch, `HEAD`, staging, tracked diff content, untracked paths and content, detected local Python/Conda environment roots, and inspection completeness. Writable checkpoints persist the fingerprint in `after-implementation.workspace.sha256` or `after-correction-<round>.workspace.sha256`. Raw patch files remain human-readable evidence and are not used as workspace identity or as the locator for the fingerprint checkpoint. `HUMAN_REQUIRED` and `FAILED` runs get a best-effort report where enough state exists.
+## Commands
 
-`resume <run-id>` resumes only from explicit checkpoints recorded in `run.json` and the run artifacts. It does not infer safety from a run directory alone. If implementation or correction was interrupted after a writable phase was marked active but before completion was proven, resume stops at `HUMAN_REQUIRED` and explains that the working tree may contain partial modifications.
+```text
+ticket-automation preflight
+ticket-automation run tickets/TA-ARCH-009.md
+ticket-automation resume <run-id>
+ticket-automation status
+```
 
-Read-only and deterministic checkpoints are recoverable when the repository still matches the recorded baseline and writable checkpoint. An interrupted `PREPARING` run may rerun or adopt baseline verification only while the current canonical workspace, snapshotted ticket, and configured verification commands still match their recorded fingerprints. If deterministic verification finished writing a complete round artifact but `run.json` was not advanced, resume validates that artifact against the current run, round, repository state, and configured verification gates before adopting it. If a read-only review finished writing a valid `result.json` but `run.json` was not advanced, resume validates the saved prompt, controller checkpoint metadata, fixed review-result contract, and repository invariants before adopting it. Partial verification or review artifacts are preserved under recovery artifact directories and the safe stage is rerun when the repository still matches the checkpoint. If repository contents changed after the evidence was written, resume does not reuse that evidence and stops for human inspection.
-
-## Implementation Stage
-
-The implementation stage renders `prompts/implement.md` with the complete snapshotted ticket, then runs a fresh Codex process against the target repository using the `workspace-write` sandbox and `schemas/implementation-result.schema.json`. Codex receives that schema, while TicketAutomation parses the canonical last message with its fixed implementation-result contract: `COMPLETED` or `BLOCKED`, a concise summary, tests run, assumptions, and known issues. It does not ask Codex to report changed files because Git remains the source of truth.
-
-After Codex exits, TicketAutomation independently inspects Git. The current branch must still match the starting branch, `HEAD` must still match the baseline SHA, and the staging area must be empty. If any of those invariants are violated, the run becomes `HUMAN_REQUIRED` and TicketAutomation does not undo the mutation. A `BLOCKED` implementation result also becomes `HUMAN_REQUIRED` with the agent result preserved in `implementation/result.json`. If Codex reports `COMPLETED` without any worktree changes for an implementation ticket, the run becomes `HUMAN_REQUIRED`. Codex execution failures become `FAILED`.
-
-Implementation and correction use the same writable Codex boundary. It captures canonical workspace snapshots and detectable Python/Conda environment-root baselines before and after every writable call, records process-started evidence, and compares the results. A newly created detectable environment or an incomplete environment scan becomes `HUMAN_REQUIRED`; TicketAutomation leaves the workspace untouched for inspection. Clean environment evidence is stored in the writable execution record. A `workspace-guard/<operation>.json` artifact is written only for an environment-policy violation or scanner failure.
-
-When implementation completes and the safety checks pass, TicketAutomation captures `runs/<run-id>/diffs/after-implementation.patch` and `runs/<run-id>/diffs/after-implementation.stat` from Git.
-
-## Verification
-
-TicketAutomation has two validation levels. Implementation-agent targeted validation is whatever the writable agent chose to run while doing the work. Those claims are kept in `runs/<run-id>/implementation/result.json` as implementation feedback.
-
-Runner deterministic acceptance gates are the configured `[[verification.commands]]` records. TicketAutomation runs those commands itself from the target repository directory, preserves stdout and stderr, and treats those results as authoritative for workflow acceptance. Commands are executed from argument arrays without a shell.
-
-Before implementation, the same runner writes `runs/<run-id>/baseline-verification/verification.json` and a status/timing summary in `verification.log`; command stdout and stderr are stored once in the JSON evidence. Its checkpoint is explicitly marked as the `PREPARING` stage and tied to the clean workspace and configured-command fingerprints. A failing baseline gate, execution error, incomplete repository inspection, or repository mutation stops at `HUMAN_REQUIRED`. Baseline failures never create correction reasons or corrective tickets, never invoke Codex, and are left untouched for human inspection.
-
-The first verification attempt writes `runs/<run-id>/verification/round-0.json` and `runs/<run-id>/verification/round-0.log`. Later correction rounds use `round-1`, `round-2`, and so on. A complete verification round includes checkpoint metadata tying it to the run, round, baseline, branch, source state, and configured verification gates that were used. Passing gates move the run to review. Failing gates move the run to `CORRECTION_PENDING` and produce typed `VerificationFailure` correction reasons. Environment or process execution problems, such as a missing executable or timeout, move the run to `HUMAN_REQUIRED` instead of asking a correction agent to rewrite source code for a broken local environment.
-
-## Review
-
-Review deliberately uses a separate Codex invocation from implementation. The reviewer receives `prompts/review.md`, the complete snapshotted ticket, baseline SHA, starting branch, current branch, deterministic verification results, and the implementation summary where available. The prompt instructs the reviewer to inspect the complete current working tree relative to the original baseline and to respect repository authority such as AGENTS.md, ADRs, contracts, validation rules, provenance rules, tests, documentation, and established implementation patterns.
-
-The structured result is supplied through Codex's canonical last-message output and parsed with the fixed review-result contract: one of `PASS`, `CORRECTIONS_REQUIRED`, or `HUMAN_REVIEW_REQUIRED`. `PASS` may include advisory or follow-up findings, but it must not include `REQUIRED` findings. `CORRECTIONS_REQUIRED` must include at least one `REQUIRED` finding. A structurally valid but contradictory result, such as `PASS` with a required finding, moves the run to `HUMAN_REQUIRED` without manufacturing a corrected verdict.
-
-Each review writes `prompt.md`, `events.jsonl`, `stderr.log`, `last-message.json`, and normalized `result.json` under `runs/<run-id>/reviews/round-<n>/`. `events.jsonl` is diagnostic evidence only; its event shapes do not determine the result. Review round 1 is the first independent review after implementation, even if deterministic verification drove a correction before any review could run. After a review-driven correction, the next passing verification leads to the next review round. After the reviewer exits, TicketAutomation independently checks that the branch still matches the recorded starting branch, `HEAD` still equals the baseline SHA, and the staging area is empty. If any invariant changed, the run becomes `HUMAN_REQUIRED` and TicketAutomation does not reset or repair the repository.
-
-If a process stops after a review result is written but before the run record advances, resume may adopt the saved review instead of invoking a new reviewer. Adoption requires the saved controller checkpoint and prompt to match the current review checkpoint, the result to satisfy the fixed review contract, and the repository to still match the verified source state. Partial read-only review artifacts are archived and a fresh review is run when those safety checks still pass.
-
-A `PASS` review may include `ADVISORY` or `FOLLOW_UP` findings and still reaches `READY_FOR_HUMAN`. `CORRECTIONS_REQUIRED` must include at least one `REQUIRED` finding and enters the bounded correction loop. `HUMAN_REVIEW_REQUIRED` stops at `HUMAN_REQUIRED`.
-
-## Corrections
-
-Correction tickets are generated mechanically from structured runner data. TicketAutomation does not ask another LLM to author `runs/<run-id>/corrections/<ticket-id>-CORR-R<round>.md`; it renders Markdown directly from either deterministic `VerificationFailure` records or independent `ReviewFinding` records. Verification failures keep their command, exit code, useful output excerpts, and a reference to the persisted verification log. Review findings keep the reviewer-authored severity, category, finding text, evidence, required change, and acceptance criteria.
-
-The two correction sources remain distinct. A failed deterministic gate is not converted into a reviewer finding, and a reviewer finding is eligible only when its disposition is `REQUIRED`. `ADVISORY` and `FOLLOW_UP` findings are retained in review artifacts but are excluded from automated corrective work because they do not block acceptance for the current ticket.
-
-Each correction round uses a fresh Codex invocation with the `workspace-write` sandbox and stores artifacts under `runs/<run-id>/correction-executions/round-<round>/`: `prompt.md`, `events.jsonl`, `stderr.log`, `last-message.json`, and normalized `result.json`. The correction prompt includes the complete original ticket, the generated corrective ticket, and current repository context. It explicitly tells the correction agent that existing uncommitted changes are the original implementation and must be preserved unless the corrective ticket identifies a defect.
-
-After every writable correction invocation, TicketAutomation independently verifies that the branch still matches the starting branch, `HEAD` still equals the baseline SHA, and the staging area is empty. If any invariant is violated, the run becomes `HUMAN_REQUIRED` and TicketAutomation does not reset or repair the repository. A correction result of `BLOCKED` also becomes `HUMAN_REQUIRED` with the agent explanation preserved.
-
-
-Completed corrections capture `runs/<run-id>/diffs/after-correction-<round>.patch`. That patch is always the full diff from the original baseline SHA to the complete current working tree, including valid existing implementation work, rather than only the incremental correction delta. The next step is always deterministic verification before any further review.
-
-## V1 Safety Boundary
-
-V1 does not create branches, switch branches, stage files, commit, amend commits, reset, stash, clean, push, merge, retrieve GitHub issues, update GitHub issues, orchestrate multiple tickets, orchestrate epics, manage releases, create pull requests, or perform automatic acceptance.
-
-After `READY_FOR_HUMAN`, the user still inspects the final diff, accepts or rejects the implementation, commits manually if accepted, and selects the next ticket. TicketAutomation is an audit-producing assistant, not the final authority.
+The controller requires a clean target worktree and an empty staging area at
+run creation. Baseline verification runs before the first writable Codex call.

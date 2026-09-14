@@ -10,20 +10,20 @@ from typing import Any
 
 from . import writable_worker
 from ._verification_artifacts import (
-    VERIFICATION_DIR_NAME,
     _baseline_verification_evidence_problem,
     _read_verification_source_fingerprint,
     _VerificationArtifactError,
 )
+from .attempts import (
+    attempt_result_path,
+    finish_phase_attempt,
+    latest_attempt,
+    start_attempt,
+)
 from .audit import (
     changed_files_including_untracked as _changed_files_including_untracked,
 )
-from .audit import (
-    diff_including_untracked as _diff_including_untracked,
-)
-from .audit import (
-    diff_stats_including_untracked as _diff_stats_including_untracked,
-)
+from .audit import diff_stats_including_untracked as _diff_stats_including_untracked
 from .codex import (
     CodexExecution,
     CodexFailureKind,
@@ -35,8 +35,6 @@ from .git import GitCommandError, GitRepository
 from .git_safety import (
     WorkspaceChange,
     WorkspaceSnapshot,
-    _workspace_fingerprint_path,
-    _write_workspace_fingerprint,
     workspace_safety_changes,
 )
 from .models import StageOutcome, StopCategory, WorkflowState
@@ -65,18 +63,13 @@ class CorrectionReasonKind(StrEnum):
 
 CORRECTIONS_DIR_NAME = "corrections"
 CORRECTION_EXECUTIONS_DIR_NAME = "correction-executions"
-REVIEW_DIR_NAME = "reviews"
-DIFFS_DIR_NAME = "diffs"
 CORRECTION_TICKET_SUFFIX = "CORR"
 CORRECTION_TICKET_EXCERPT_CHARS = 1200
-AFTER_CORRECTION_PATCH_TEMPLATE = "after-correction-{round_number}.patch"
-_FAILED_CORRECTION_PATCH_TEMPLATE = "failed-correction-{round_number}.patch"
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _CORRECTION_PROMPT_TEMPLATE = _PROJECT_ROOT / "prompts" / "correct.md"
 _CORRECTION_RESULT_SCHEMA = (
     _PROJECT_ROOT / "schemas" / "implementation-result.schema.json"
 )
-_REVIEW_RESULT_FILE = "result.json"
 _REVIEW_FINDING_DISPOSITIONS = frozenset({"REQUIRED", "ADVISORY", "FOLLOW_UP"})
 
 
@@ -92,7 +85,7 @@ class VerificationFailure:
     stdout_excerpt: str
     stderr_excerpt: str
     exit_code: int | None
-    log_path: Path
+    result_path: Path
 
     @property
     def kind(self) -> CorrectionReasonKind:
@@ -107,7 +100,7 @@ class VerificationFailure:
             "stdout_excerpt": self.stdout_excerpt,
             "stderr_excerpt": self.stderr_excerpt,
             "exit_code": self.exit_code,
-            "log_path": str(self.log_path),
+            "result_path": str(self.result_path),
         }
 
 
@@ -174,7 +167,6 @@ class CorrectionStageResult:
     agent_result: dict[str, Any] | None
     safety_violations: tuple[CorrectionSafetyViolation, ...]
     correction_reasons: tuple[CorrectionReason, ...]
-    patch_path: Path | None
     workspace_guard: WorkspaceGuardInspection | None
     controller_message: str
 
@@ -187,8 +179,6 @@ class CorrectionStageResult:
 class _FailedWritableAudit:
     safety_violations: tuple[CorrectionSafetyViolation, ...]
     changed_files: tuple[str, ...]
-    patch_path: Path | None
-    patch_error: str | None
     workspace_guard: WorkspaceGuardInspection | None
     human_required: bool
 
@@ -217,9 +207,18 @@ def run_correction_stage(
 
     correction_round = run_record.current_correction_round + 1
     repository = GitRepository(Path(run_record.target_repository_path))
-    artifact_directory = (
-        run_path / CORRECTION_EXECUTIONS_DIR_NAME / f"round-{correction_round}"
+    try:
+        before_snapshot = WorkspaceSnapshot.capture(repository)
+        before_fingerprint = before_snapshot.fingerprint
+    except (OSError, RuntimeError, ValueError):
+        before_fingerprint = None
+    attempt_record = start_attempt(
+        run_path,
+        phase=WorkflowState.CORRECTING.value,
+        before_workspace_fingerprint=before_fingerprint,
+        clock=clock,
     )
+    artifact_directory = attempt_record.artifact_directory
     if run_record.current_correction_round >= run_record.max_correction_rounds:
         return _finish(
             run_record=run_record,
@@ -231,7 +230,6 @@ def run_correction_stage(
             agent_result=None,
             safety_violations=(),
             correction_reasons=(),
-            patch_path=None,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=(
                 "Maximum corrective rounds exhausted; human intervention is required."
@@ -263,7 +261,6 @@ def run_correction_stage(
                 ),
             ),
             correction_reasons=(),
-            patch_path=None,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=evidence_problem,
             advance_correction_round=False,
@@ -293,7 +290,6 @@ def run_correction_stage(
             agent_result=None,
             safety_violations=starting_violations,
             correction_reasons=(),
-            patch_path=None,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=(
                 "Repository no longer matches the recorded correction baseline."
@@ -301,10 +297,6 @@ def run_correction_stage(
             advance_correction_round=False,
         )
 
-    if artifact_directory.exists() and any(artifact_directory.iterdir()):
-        raise CorrectionError(
-            f"Correction artifacts already exist for round-{correction_round}."
-        )
     reasons = _load_correction_reasons(run_path, run_record)
     ticket_markdown = render_correction_ticket(
         ticket_id=run_record.ticket_id,
@@ -314,7 +306,7 @@ def run_correction_stage(
     )
     active_record = run_record
     ticket_path = _write_correction_ticket(
-        run_path=run_path,
+        artifact_directory=artifact_directory,
         ticket_id=active_record.ticket_id,
         round_number=correction_round,
         markdown=ticket_markdown,
@@ -334,6 +326,7 @@ def run_correction_stage(
         run_dir=run_path,
         operation=f"correction-round-{correction_round}",
         phase=WorkflowState.CORRECTING.value,
+        attempt_record=attempt_record,
         prompt=prompt,
         output_schema=_CORRECTION_RESULT_SCHEMA,
         artifact_directory=artifact_directory,
@@ -354,7 +347,6 @@ def run_correction_stage(
             agent_result=None,
             safety_violations=(),
             correction_reasons=reasons,
-            patch_path=None,
             workspace_guard=workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=writable_worker._format_writable_guard_stop(
@@ -422,7 +414,6 @@ def run_correction_stage(
             agent_result=None,
             safety_violations=failed_audit.safety_violations,
             correction_reasons=reasons,
-            patch_path=failed_audit.patch_path,
             workspace_guard=workspace_guard,
             outcome=outcome,
             controller_message=message,
@@ -444,7 +435,6 @@ def run_correction_stage(
             agent_result=agent_result,
             safety_violations=(),
             correction_reasons=reasons,
-            patch_path=None,
             workspace_guard=workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=writable_worker._format_writable_guard_stop(
@@ -460,12 +450,6 @@ def run_correction_stage(
         phase="after correction",
         current_snapshot=writable_invocation.after_workspace,
     )
-    patch_path, patch_error = _try_capture_correction_diff(
-        repository,
-        run_path,
-        baseline_sha=active_record.baseline_sha,
-        round_number=correction_round,
-    )
     if workspace_guard.requires_human:
         message = writable_worker._format_writable_guard_stop(
             workspace_guard,
@@ -473,8 +457,6 @@ def run_correction_stage(
             run_dir=run_path,
             git_safety=_format_failure_safety(safety_violations),
         )
-        if patch_error is not None:
-            message = f"{message} Correction patch capture error: {patch_error}"
         return _finish(
             run_record=active_record,
             run_dir=run_path,
@@ -485,7 +467,6 @@ def run_correction_stage(
             agent_result=agent_result,
             safety_violations=safety_violations,
             correction_reasons=reasons,
-            patch_path=patch_path,
             workspace_guard=workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=message,
@@ -501,7 +482,6 @@ def run_correction_stage(
             agent_result=agent_result,
             safety_violations=safety_violations,
             correction_reasons=reasons,
-            patch_path=patch_path,
             workspace_guard=workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message="Repository safety invariants were violated.",
@@ -518,27 +498,9 @@ def run_correction_stage(
             agent_result=agent_result,
             safety_violations=(),
             correction_reasons=reasons,
-            patch_path=patch_path,
             workspace_guard=workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message="Correction agent returned BLOCKED.",
-        )
-
-    if patch_error is not None:
-        return _finish(
-            run_record=active_record,
-            run_dir=run_path,
-            correction_round=correction_round,
-            ticket_path=ticket_path,
-            artifact_directory=artifact_directory,
-            execution=execution,
-            agent_result=agent_result,
-            safety_violations=(),
-            correction_reasons=reasons,
-            patch_path=None,
-            workspace_guard=workspace_guard,
-            outcome=StageOutcome.HUMAN_REQUIRED,
-            controller_message=patch_error,
         )
 
     return _finish(
@@ -551,7 +513,6 @@ def run_correction_stage(
         agent_result=agent_result,
         safety_violations=(),
         correction_reasons=reasons,
-        patch_path=patch_path,
         workspace_guard=workspace_guard,
         outcome=StageOutcome.COMPLETED,
         controller_message=(
@@ -659,7 +620,7 @@ def correction_reason_from_dict(data: dict[str, Any]) -> CorrectionReason:
                 allow_empty=True,
             ),
             exit_code=_required_optional_int(data, "exit_code", source=source),
-            log_path=Path(_required_string(data, "log_path", source=source)),
+            result_path=Path(_required_string(data, "result_path", source=source)),
         )
     if kind == CorrectionReasonKind.REVIEW_FINDING.value:
         source = "review correction reason"
@@ -698,8 +659,6 @@ def format_correction_result(result: CorrectionStageResult) -> str:
     ]
     if result.ticket_path is not None:
         rows.append(f"Correction ticket: {result.ticket_path}")
-    if result.patch_path is not None:
-        rows.append(f"Patch: {result.patch_path}")
     if result.codex_execution is not None and not result.codex_execution.successful:
         rows.append(f"Codex execution: {result.codex_execution.execution_json_path}")
         rows.append(f"Codex events: {result.codex_execution.events_jsonl_path}")
@@ -739,12 +698,26 @@ def _finish(
     agent_result: dict[str, Any] | None,
     safety_violations: tuple[CorrectionSafetyViolation, ...],
     correction_reasons: tuple[CorrectionReason, ...],
-    patch_path: Path | None,
     workspace_guard: WorkspaceGuardInspection | None = None,
     outcome: StageOutcome,
     controller_message: str,
     advance_correction_round: bool = True,
 ) -> CorrectionStageResult:
+    after_fingerprint: str | None = None
+    try:
+        after_fingerprint = WorkspaceSnapshot.capture(
+            GitRepository(Path(run_record.target_repository_path))
+        ).fingerprint
+    except (OSError, RuntimeError, ValueError):
+        pass
+    finish_phase_attempt(
+        run_dir,
+        phase=WorkflowState.CORRECTING.value,
+        stage_outcome=outcome.value,
+        after_workspace_fingerprint=after_fingerprint,
+        process_started=(None if execution is None else execution.process_started),
+        execution_path=(None if execution is None else execution.execution_json_path),
+    )
     return CorrectionStageResult(
         run_dir=run_dir,
         run_record=run_record,
@@ -757,7 +730,6 @@ def _finish(
         agent_result=agent_result,
         safety_violations=safety_violations,
         correction_reasons=correction_reasons,
-        patch_path=patch_path,
         workspace_guard=workspace_guard,
         controller_message=controller_message,
     )
@@ -786,9 +758,15 @@ def _load_verification_failures(
     run_path: Path,
     run_record: RunRecord,
 ) -> tuple[VerificationFailure, ...]:
-    round_index = run_record.current_correction_round
-    verification_path = run_path / VERIFICATION_DIR_NAME / f"round-{round_index}.json"
-    if not verification_path.is_file():
+    attempt = latest_attempt(
+        run_path,
+        phases=(WorkflowState.VERIFYING.value,),
+        statuses=("COMPLETED",),
+    )
+    if attempt is None:
+        return ()
+    verification_path = attempt_result_path(run_path, attempt)
+    if verification_path is None or not verification_path.is_file():
         return ()
     data = _read_json_object(verification_path)
     if data.get("status") != "FAIL":
@@ -817,14 +795,14 @@ def _load_verification_failures(
 
     return _verification_failures_from_commands(
         data,
-        log_path=run_path / VERIFICATION_DIR_NAME / f"round-{round_index}.log",
+        result_path=verification_path,
     )
 
 
 def _verification_failures_from_commands(
     data: dict[str, Any],
     *,
-    log_path: Path,
+    result_path: Path,
 ) -> tuple[VerificationFailure, ...]:
     commands = data.get("commands", [])
     if not isinstance(commands, list):
@@ -849,7 +827,7 @@ def _verification_failures_from_commands(
                     _string_value(command.get("stderr"), "")
                 ),
                 exit_code=exit_code,
-                log_path=log_path,
+                result_path=result_path,
             )
         )
     return tuple(failures)
@@ -859,13 +837,15 @@ def _load_required_review_findings(
     run_path: Path,
     run_record: RunRecord,
 ) -> tuple[ReviewFinding, ...]:
-    review_round = run_record.current_review_round
-    if review_round < 1:
-        return ()
-    result_path = (
-        run_path / REVIEW_DIR_NAME / f"round-{review_round}" / _REVIEW_RESULT_FILE
+    attempt = latest_attempt(
+        run_path,
+        phases=(WorkflowState.REVIEWING.value,),
+        statuses=("COMPLETED",),
     )
-    if not result_path.is_file():
+    if attempt is None:
+        return ()
+    result_path = attempt_result_path(run_path, attempt)
+    if result_path is None or not result_path.is_file():
         return ()
     data = _read_json_object(result_path)
     if data.get("verdict") != "CORRECTIONS_REQUIRED":
@@ -898,16 +878,12 @@ def _read_json_object(path: Path) -> dict[str, Any]:
 
 def _write_correction_ticket(
     *,
-    run_path: Path,
+    artifact_directory: Path,
     ticket_id: str,
     round_number: int,
     markdown: str,
 ) -> Path:
-    corrections_dir = run_path / CORRECTIONS_DIR_NAME
-    corrections_dir.mkdir(parents=True, exist_ok=True)
-    path = (
-        corrections_dir / f"{ticket_id}-{CORRECTION_TICKET_SUFFIX}-R{round_number}.md"
-    )
+    path = artifact_directory / "correction-ticket.md"
     if path.exists():
         raise CorrectionError(f"Correction ticket already exists: {path}")
     path.write_text(markdown, encoding="utf-8", newline="\n")
@@ -990,7 +966,7 @@ def _render_verification_correction_ticket(
         "## Required corrections",
     ]
     for failure in failures:
-        log_reference = _format_log_reference(failure.log_path, run_dir)
+        result_reference = _format_result_reference(failure.result_path, run_dir)
         output_excerpt = _verification_output_excerpt(failure)
         lines.extend(
             [
@@ -1013,8 +989,8 @@ def _render_verification_correction_ticket(
                 output_excerpt,
                 "```",
                 "",
-                "Full log:",
-                log_reference,
+                "Full typed result:",
+                result_reference,
             ]
         )
     lines.extend(_constraints_and_validation())
@@ -1155,10 +1131,10 @@ def _inspect_correction_source_fingerprint(
     except _VerificationArtifactError as error:
         return (
             CorrectionSafetyViolation(
-                name="workspace-checkpoint",
+                name="verification-evidence",
                 expected="readable canonical workspace fingerprint",
                 actual=str(error),
-                message="Could not validate the correction source checkpoint.",
+                message="Could not validate the correction source evidence.",
             ),
         )
     if not current.inspection_complete:
@@ -1177,59 +1153,9 @@ def _inspect_correction_source_fingerprint(
             name="workspace-fingerprint",
             expected=expected,
             actual=current.fingerprint,
-            message="Correction source workspace changed after its checkpoint.",
+            message="Correction source workspace changed after verification.",
         ),
     )
-
-
-def _capture_correction_diff(
-    repository: GitRepository,
-    run_path: Path,
-    *,
-    baseline_sha: str,
-    round_number: int,
-    patch_template: str = AFTER_CORRECTION_PATCH_TEMPLATE,
-) -> Path:
-    diffs_dir = run_path / DIFFS_DIR_NAME
-    patch_path = diffs_dir / patch_template.format(
-        round_number=round_number,
-    )
-    try:
-        diffs_dir.mkdir(parents=True, exist_ok=True)
-        patch = _diff_including_untracked(repository, baseline_sha)
-        patch_path.write_text(patch, encoding="utf-8", newline="\n")
-        if patch_template == AFTER_CORRECTION_PATCH_TEMPLATE:
-            snapshot = WorkspaceSnapshot.capture(repository)
-            _write_workspace_fingerprint(
-                _workspace_fingerprint_path(patch_path),
-                snapshot,
-            )
-    except (GitCommandError, OSError, RuntimeError, ValueError) as error:
-        raise CorrectionError(f"Could not capture correction diff: {error}") from error
-    return patch_path
-
-
-def _try_capture_correction_diff(
-    repository: GitRepository,
-    run_path: Path,
-    *,
-    baseline_sha: str,
-    round_number: int,
-    patch_template: str = AFTER_CORRECTION_PATCH_TEMPLATE,
-) -> tuple[Path | None, str | None]:
-    try:
-        return (
-            _capture_correction_diff(
-                repository,
-                run_path,
-                baseline_sha=baseline_sha,
-                round_number=round_number,
-                patch_template=patch_template,
-            ),
-            None,
-        )
-    except CorrectionError as error:
-        return None, str(error)
 
 
 def _audit_failed_writable_invocation(
@@ -1299,22 +1225,9 @@ def _audit_failed_writable_invocation(
         or bool(violations)
         or bool(workspace_guard is not None and workspace_guard.requires_human)
     )
-    patch_path: Path | None = None
-    patch_error: str | None = None
-    if human_required:
-        patch_path, patch_error = _try_capture_correction_diff(
-            repository,
-            run_path,
-            baseline_sha=run_record.baseline_sha,
-            round_number=round_number,
-            patch_template=_FAILED_CORRECTION_PATCH_TEMPLATE,
-        )
-
     return _FailedWritableAudit(
         safety_violations=tuple(violations),
         changed_files=changed_files,
-        patch_path=patch_path,
-        patch_error=patch_error,
         workspace_guard=workspace_guard,
         human_required=human_required,
     )
@@ -1356,10 +1269,6 @@ def _failed_writable_message(
         f"Git safety: {_format_failure_safety(audit.safety_violations)}",
         f"Changed files relative to baseline: {_format_files(audit.changed_files)}",
     ]
-    if audit.patch_path is not None:
-        rows.append(f"Baseline-relative failure patch: {audit.patch_path}")
-    if audit.patch_error is not None:
-        rows.append(f"Failure patch capture error: {audit.patch_error}")
     if audit.workspace_guard is not None and audit.workspace_guard.requires_human:
         rows.append(
             writable_worker._format_writable_guard_stop(
@@ -1468,17 +1377,17 @@ def _ticket_excerpt(value: str) -> str:
     omission = len(value) - CORRECTION_TICKET_EXCERPT_CHARS
     return (
         f"{value[:CORRECTION_TICKET_EXCERPT_CHARS].rstrip()}\n"
-        f"... <truncated {omission} chars; see full log>"
+        f"... <truncated {omission} chars; see full typed result>"
     )
 
 
-def _format_log_reference(log_path: Path, run_dir: Path | None) -> str:
+def _format_result_reference(result_path: Path, run_dir: Path | None) -> str:
     if run_dir is None:
-        return str(log_path)
+        return str(result_path)
     try:
-        return str(log_path.relative_to(run_dir))
+        return str(result_path.relative_to(run_dir))
     except ValueError:
-        return str(log_path)
+        return str(result_path)
 
 
 def _format_command(command: tuple[str, ...]) -> str:
@@ -1597,7 +1506,6 @@ def _yes_no(value: bool) -> str:
 
 
 __all__ = [
-    "AFTER_CORRECTION_PATCH_TEMPLATE",
     "CORRECTIONS_DIR_NAME",
     "CORRECTION_EXECUTIONS_DIR_NAME",
     "CorrectionError",

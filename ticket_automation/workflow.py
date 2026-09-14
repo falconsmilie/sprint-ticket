@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -8,16 +9,25 @@ from pathlib import Path
 
 from ._verification_artifacts import (
     _baseline_verification_evidence_problem,
+    _read_verification_source_fingerprint,
     _verification_commands_fingerprint,
+    _VerificationArtifactError,
 )
+from .attempts import (
+    AttemptError,
+    AttemptRecord,
+    attempt_result_path,
+    finish_phase_attempt,
+    latest_attempt,
+    latest_writable_attempt,
+    load_attempt_records,
+    start_attempt,
+)
+from .audit import diff_including_untracked
 from .codex import CodexProcessRunner
 from .config import AppConfig
 from .corrections import (
-    CorrectionError,
     CorrectionStageResult,
-    VerificationFailure,
-    correction_reason_from_dict,
-    review_findings_from_result,
     run_correction_stage,
 )
 from .failure_classification import (
@@ -26,10 +36,7 @@ from .failure_classification import (
     classify_unexpected_controller_failure,
 )
 from .git import GitCommandError, GitRepository
-from .git_safety import (
-    WorkspaceSnapshot,
-    _read_workspace_fingerprint,
-)
+from .git_safety import WorkspaceSnapshot
 from .implementation import (
     ImplementationStageResult,
     run_implementation_stage,
@@ -38,20 +45,18 @@ from .locking import RepositoryRunLock, acquire_repository_run_lock
 from .models import StageOutcome, StopCategory, StopReason, WorkflowState
 from .preflight import PreflightResult
 from .reporting import (
+    FINAL_PATCH_FILE,
+    ReportError,
     ReportStageResult,
-    _latest_writable_workspace_fingerprint_path,
     collect_report_context,
     generate_terminal_report_best_effort,
-    inspect_git_safety,
-    latest_review_result,
-    latest_verification_round,
     run_report_stage,
 )
 from .resolved_config import config_from_resolved_run_config
 from .review import (
-    _AUTOMATIC_CORRECTION_SCOPE_RELATIONS,
     ReviewStageResult,
     ReviewVerdict,
+    _validate_review_result_artifact,
     run_review_stage,
 )
 from .runs import (
@@ -321,11 +326,11 @@ def _resume_ticket_lifecycle_locked(
             correction_results=(),
         )
 
-    checkpoint_problem = _resume_checkpoint_problem(run_dir, run_record)
-    if checkpoint_problem is not None:
+    resume_problem = _resume_problem(run_dir, run_record)
+    if resume_problem is not None:
         run_record = _mark_human_required(
             run_dir,
-            terminal_reason=checkpoint_problem,
+            terminal_reason=resume_problem,
             clock=clock,
         )
         _update_repository_lock(repository_lock, run_record)
@@ -490,7 +495,7 @@ def format_lifecycle_result(result: LifecycleResult) -> str:
         lines.extend(["", "Controller error", f"  {result.controller_error}"])
     if result.successful:
         lines.extend(["", "No files have been staged or committed."])
-    report_path = result.run_dir / "final-report.md"
+    report_path = result.run_dir / "report.md"
     if report_path.is_file():
         lines.extend(["", "Report", f"  {report_path}"])
     lines.append("----------------------------------------")
@@ -631,19 +636,126 @@ def _drive_lifecycle(
             continue
 
         if run_record.state == WorkflowState.REPORTING:
-            report_result = run_report_stage(
+            try:
+                snapshot = WorkspaceSnapshot.capture(
+                    GitRepository(Path(run_record.target_repository_path))
+                )
+                snapshot_problem: str | None = None
+            except (GitCommandError, OSError, RuntimeError, ValueError) as error:
+                snapshot = None
+                snapshot_problem = (
+                    "Could not inspect the workspace before human handoff: "
+                    f"{type(error).__name__}: {error}"
+                )
+            report_attempt = start_attempt(
                 run_dir,
-                transition_record=lambda record, outcome, reason: (
-                    _record_after_stage_outcome(
-                        record,
-                        outcome,
-                        terminal_reason=reason,
-                        clock=clock,
-                    )
+                phase=WorkflowState.REPORTING.value,
+                before_workspace_fingerprint=(
+                    None if snapshot is None else snapshot.fingerprint
                 ),
+                clock=clock,
             )
-            run_record = report_result.run_record
-            save_run_record(run_record, run_dir / RUN_RECORD_FILE)
+            handoff_problem = snapshot_problem or _final_handoff_problem(
+                run_dir,
+                run_record,
+                snapshot=snapshot,
+            )
+            if handoff_problem is not None:
+                _write_attempt_result(
+                    report_attempt,
+                    status="HUMAN_REQUIRED",
+                    message=handoff_problem,
+                )
+                finish_phase_attempt(
+                    run_dir,
+                    phase=WorkflowState.REPORTING.value,
+                    stage_outcome=StageOutcome.HUMAN_REQUIRED.value,
+                    after_workspace_fingerprint=(
+                        None if snapshot is None else snapshot.fingerprint
+                    ),
+                    metadata={"controller_message": handoff_problem},
+                    clock=clock,
+                )
+                run_record = _mark_human_required(
+                    run_dir,
+                    terminal_reason=handoff_problem,
+                    clock=clock,
+                    category=StopCategory.SAFETY_VIOLATION,
+                )
+                _update_repository_lock(repository_lock, run_record)
+                continue
+            assert snapshot is not None
+            try:
+                _capture_final_patch(run_dir, run_record)
+                after_patch_snapshot = WorkspaceSnapshot.capture(
+                    GitRepository(Path(run_record.target_repository_path))
+                )
+            except (GitCommandError, OSError, RuntimeError, ValueError) as error:
+                handoff_problem = (
+                    "Could not capture the final handoff patch safely: "
+                    f"{type(error).__name__}: {error}"
+                )
+            else:
+                if not snapshot.matches(after_patch_snapshot):
+                    handoff_problem = (
+                        "Workspace changed while the final handoff patch was being "
+                        "captured."
+                    )
+                else:
+                    snapshot = after_patch_snapshot
+            if handoff_problem is not None:
+                _write_attempt_result(
+                    report_attempt,
+                    status="HUMAN_REQUIRED",
+                    message=handoff_problem,
+                )
+                finish_phase_attempt(
+                    run_dir,
+                    phase=WorkflowState.REPORTING.value,
+                    stage_outcome=StageOutcome.HUMAN_REQUIRED.value,
+                    after_workspace_fingerprint=snapshot.fingerprint,
+                    metadata={"controller_message": handoff_problem},
+                    clock=clock,
+                )
+                run_record = _mark_human_required(
+                    run_dir,
+                    terminal_reason=handoff_problem,
+                    clock=clock,
+                    category=StopCategory.SAFETY_VIOLATION,
+                )
+                _update_repository_lock(repository_lock, run_record)
+                continue
+            _write_attempt_result(
+                report_attempt,
+                status="PASS",
+                message="Final workspace and evidence consistency checks passed.",
+            )
+            finish_phase_attempt(
+                run_dir,
+                phase=WorkflowState.REPORTING.value,
+                stage_outcome=StageOutcome.COMPLETED.value,
+                after_workspace_fingerprint=snapshot.fingerprint,
+                metadata={
+                    "controller_message": (
+                        "Final workspace and evidence consistency checks passed."
+                    )
+                },
+                clock=clock,
+            )
+            run_record = _persist_stage_outcome(
+                run_dir,
+                run_record,
+                StageOutcome.COMPLETED,
+                terminal_reason="Final workspace and evidence consistency checks passed.",
+                clock=clock,
+            )
+            try:
+                report_result = run_report_stage(run_dir)
+            except (OSError, ReportError, ValueError):
+                # The controller has already made and persisted the terminal
+                # decision. Rendering is retriable presentation work and cannot
+                # move a READY_FOR_HUMAN run to another terminal state.
+                report_result = None
             _update_repository_lock(repository_lock, run_record)
             continue
 
@@ -681,6 +793,92 @@ def _persist_requested_transition(
     )
     save_run_record(updated_record, run_dir / RUN_RECORD_FILE)
     return updated_record
+
+
+def _final_handoff_problem(
+    run_dir: Path,
+    run_record: RunRecord,
+    *,
+    snapshot: WorkspaceSnapshot | None,
+) -> str | None:
+    """Controller-owned acceptance check before moving out of REPORTING."""
+
+    try:
+        load_attempt_records(run_dir)
+    except AttemptError as error:
+        return f"Attempt evidence is invalid before human handoff: {error}"
+    if snapshot is None or not snapshot.inspection_complete:
+        return "Repository safety invariants were violated before human handoff."
+    if snapshot.branch != run_record.starting_branch:
+        return "Repository branch changed before human handoff."
+    if snapshot.head_sha != run_record.baseline_sha:
+        return "Repository HEAD changed before human handoff."
+    if snapshot.staged_paths:
+        return "Repository has staged changes before human handoff."
+    writable = latest_writable_attempt(run_dir)
+    if writable is None or writable.after_workspace_fingerprint is None:
+        return "No completed writable attempt has a workspace fingerprint."
+    if not snapshot.matches_fingerprint(writable.after_workspace_fingerprint):
+        return "Current workspace no longer matches the completed writable attempt."
+    try:
+        _read_verification_source_fingerprint(
+            run_dir,
+            run_record,
+            expected_statuses=frozenset({"PASS"}),
+            verification_commands=run_record.resolved_config.verification_commands,
+        )
+    except _VerificationArtifactError as error:
+        return f"Deterministic verification evidence is not passing: {error}"
+    review = _attempt_result(run_dir, WorkflowState.REVIEWING.value)
+    if review is None:
+        return "Final independent review evidence is missing."
+    try:
+        review = _validate_review_result_artifact(review)
+    except (KeyError, TypeError, ValueError) as error:
+        return f"Final independent review evidence is invalid: {error}"
+    if review.get("verdict") != ReviewVerdict.PASS.value:
+        return "Final independent review did not pass."
+    return None
+
+
+def _capture_final_patch(run_dir: Path, run_record: RunRecord) -> None:
+    patch = diff_including_untracked(
+        GitRepository(Path(run_record.target_repository_path)),
+        run_record.baseline_sha,
+    )
+    (run_dir / FINAL_PATCH_FILE).write_text(
+        patch,
+        encoding="utf-8",
+        newline="\n",
+    )
+
+
+def _write_attempt_result(
+    attempt: AttemptRecord,
+    *,
+    status: str,
+    message: str,
+) -> None:
+    path = attempt.artifact_directory / "result.json"
+    path.write_text(
+        json.dumps({"status": status, "message": message}, indent=2) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+
+def _attempt_result(run_dir: Path, phase: str) -> dict[str, object] | None:
+    attempt = latest_attempt(run_dir, phases=(phase,), statuses=("COMPLETED",))
+    if attempt is None:
+        return None
+    path = attempt_result_path(run_dir, attempt)
+    if path is None:
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def _complete_preparation(
@@ -871,6 +1069,10 @@ def _resume_preflight_problem(
     run_dir: Path,
     run_record: RunRecord,
 ) -> str | None:
+    try:
+        load_attempt_records(run_dir)
+    except AttemptError as error:
+        return f"Attempt evidence is invalid: {error}"
     baseline_path = run_dir / BASELINE_RECORD_FILE
     ticket_path = run_dir / RUN_TICKET_FILE
     if not baseline_path.is_file():
@@ -912,16 +1114,23 @@ def _resume_preflight_problem(
     except OSError as error:
         return f"Could not inspect target repository: {error}"
 
-    safety = inspect_git_safety(run_record)
-    if not safety.safe:
-        return _resume_safety_reason(safety)
-    if run_record.state in {WorkflowState.PREPARING, WorkflowState.PREPARED}:
-        try:
-            snapshot = WorkspaceSnapshot.capture(repository)
-        except (OSError, RuntimeError, ValueError) as error:
-            return f"Could not inspect current workspace for safe resume: {error}"
-        if not snapshot.matches_fingerprint(baseline.workspace_fingerprint):
-            return "Current workspace no longer matches the recorded clean baseline."
+    try:
+        snapshot = WorkspaceSnapshot.capture(repository)
+    except (GitCommandError, OSError, RuntimeError, ValueError) as error:
+        return f"Could not inspect current workspace for safe resume: {error}"
+    if not snapshot.inspection_complete:
+        return "Could not inspect current workspace for safe resume completely."
+    if snapshot.branch != run_record.starting_branch:
+        return "Current branch no longer matches the recorded run baseline."
+    if snapshot.head_sha != run_record.baseline_sha:
+        return "Current HEAD no longer matches the recorded run baseline."
+    if snapshot.staged_paths:
+        return "Current workspace has staged files; human inspection is required."
+    if run_record.state in {
+        WorkflowState.PREPARING,
+        WorkflowState.PREPARED,
+    } and not snapshot.matches_fingerprint(baseline.workspace_fingerprint):
+        return "Current workspace no longer matches the recorded clean baseline."
     if run_record.state != WorkflowState.PREPARING:
         evidence_problem = _baseline_verification_evidence_problem(
             run_dir,
@@ -945,209 +1154,66 @@ def _update_repository_lock(
     )
 
 
-def _resume_checkpoint_problem(run_dir: Path, run_record: RunRecord) -> str | None:
-    if run_record.state == WorkflowState.PREPARED:
-        return None
-
-    if run_record.state == WorkflowState.PREPARING:
-        return None
-
-    if run_record.state == WorkflowState.IMPLEMENTING:
+def _resume_problem(run_dir: Path, run_record: RunRecord) -> str | None:
+    if run_record.state in {WorkflowState.IMPLEMENTING, WorkflowState.CORRECTING}:
+        operation = (
+            "implementation"
+            if run_record.state == WorkflowState.IMPLEMENTING
+            else "correction"
+        )
         return (
-            "Writable implementation was interrupted before completion; the "
+            f"Writable {operation} was interrupted before completion; the "
             "working tree may contain partial source modifications."
         )
 
-    if run_record.state == WorkflowState.VERIFYING:
-        return _require_completed_writable_checkpoint(run_dir, run_record)
-
-    if run_record.state == WorkflowState.REVIEWING:
-        verification = latest_verification_round(run_dir)
-        if not isinstance(verification, dict) or verification.get("status") != "PASS":
-            return "Review cannot resume because the latest verification did not pass."
-        return _require_current_workspace_matches_checkpoint(run_dir, run_record)
-
-    if run_record.state == WorkflowState.CORRECTION_PENDING:
-        checkpoint_problem = _require_current_workspace_matches_checkpoint(
-            run_dir,
+    if run_record.state in {WorkflowState.PREPARING, WorkflowState.PREPARED}:
+        baseline = load_baseline_record(run_dir / BASELINE_RECORD_FILE)
+        return _require_current_workspace_matches_fingerprint(
             run_record,
-        )
-        if checkpoint_problem is not None:
-            return checkpoint_problem
-        return _require_correction_source_checkpoint(run_dir, run_record)
-
-    if run_record.state == WorkflowState.CORRECTING:
-        return (
-            "Writable correction was interrupted before completion; the "
-            "working tree may contain partial source modifications."
+            baseline.workspace_fingerprint,
+            description="the recorded clean baseline",
         )
 
-    if run_record.state == WorkflowState.REPORTING:
-        review = latest_review_result(run_dir)
-        if not isinstance(review, dict) or review.get("verdict") != "PASS":
-            return "Report cannot resume because the final review did not pass."
-        verification = latest_verification_round(run_dir)
-        if not isinstance(verification, dict) or verification.get("status") != "PASS":
-            return (
-                "Report cannot resume because deterministic verification did not pass."
-            )
-        return _require_current_workspace_matches_checkpoint(run_dir, run_record)
+    if run_record.state in {
+        WorkflowState.VERIFYING,
+        WorkflowState.REVIEWING,
+        WorkflowState.REPORTING,
+        WorkflowState.CORRECTION_PENDING,
+    }:
+        writable_attempt = latest_writable_attempt(run_dir)
+        if (
+            writable_attempt is None
+            or writable_attempt.after_workspace_fingerprint is None
+        ):
+            return "No completed writable attempt has a workspace fingerprint."
+        problem = _require_current_workspace_matches_fingerprint(
+            run_record,
+            writable_attempt.after_workspace_fingerprint,
+            description="the most recent completed writable attempt",
+        )
+        if problem is not None:
+            return problem
+        return None
 
     return f"Run state is not resumable in V1: {run_record.state.value}"
 
 
-def _require_completed_writable_checkpoint(
-    run_dir: Path,
+def _require_current_workspace_matches_fingerprint(
     run_record: RunRecord,
+    expected_fingerprint: str,
+    *,
+    description: str,
 ) -> str | None:
-    if run_record.current_correction_round > 0:
-        return _require_completed_correction_checkpoint(run_dir, run_record)
-    return _require_completed_implementation_checkpoint(run_dir, run_record)
-
-
-def _require_completed_implementation_checkpoint(
-    run_dir: Path,
-    run_record: RunRecord,
-) -> str | None:
-    result_path = run_dir / "implementation" / "result.json"
-    result = _read_json_dict(result_path)
-    if result is None or result.get("status") != "COMPLETED":
-        return "Implementation checkpoint is missing a completed agent result."
-    return _require_current_workspace_matches_checkpoint(run_dir, run_record)
-
-
-def _require_completed_correction_checkpoint(
-    run_dir: Path,
-    run_record: RunRecord,
-) -> str | None:
-    result_path = (
-        run_dir
-        / "correction-executions"
-        / f"round-{run_record.current_correction_round}"
-        / "result.json"
-    )
-    result = _read_json_dict(result_path)
-    if result is None or result.get("status") != "COMPLETED":
-        return "Correction checkpoint is missing a completed agent result."
-    return _require_current_workspace_matches_checkpoint(run_dir, run_record)
-
-
-def _require_correction_source_checkpoint(
-    run_dir: Path,
-    run_record: RunRecord,
-) -> str | None:
-    verification = latest_verification_round(run_dir)
-    if isinstance(verification, dict) and verification.get("status") == "FAIL":
-        if "correction_reasons" in verification:
-            reasons = verification["correction_reasons"]
-            if not isinstance(reasons, list):
-                return (
-                    "Verification correction source is not internally consistent: "
-                    "correction_reasons must be a list."
-                )
-            try:
-                parsed_reasons = tuple(
-                    correction_reason_from_dict(reason)
-                    for reason in reasons
-                    if isinstance(reason, dict)
-                )
-            except CorrectionError as error:
-                return (
-                    "Verification correction source is not internally consistent: "
-                    f"{error}"
-                )
-            if len(parsed_reasons) != len(reasons):
-                return (
-                    "Verification correction source is not internally consistent: "
-                    "correction reasons must be objects."
-                )
-            if not all(
-                isinstance(reason, VerificationFailure) for reason in parsed_reasons
-            ):
-                return (
-                    "Verification correction source is not internally consistent: "
-                    "verification correction reasons must describe verification failures."
-                )
-            if parsed_reasons:
-                return None
-        commands = verification.get("commands")
-        if isinstance(commands, list) and any(
-            isinstance(command, dict) and command.get("status") == "FAIL"
-            for command in commands
-        ):
-            return None
-        return (
-            "Verification correction source is not internally consistent: "
-            "no failed verification command was persisted."
-        )
-
-    review = latest_review_result(run_dir)
-    if (
-        isinstance(review, dict)
-        and review.get("verdict") == ReviewVerdict.CORRECTIONS_REQUIRED.value
-    ):
-        try:
-            findings = review_findings_from_result(review)
-        except CorrectionError as error:
-            return f"Review correction source is not internally consistent: {error}"
-        if not findings:
-            return (
-                "Review correction source is not internally consistent: "
-                "no required review findings were persisted."
-            )
-        if not all(
-            finding.scope_relation in _AUTOMATIC_CORRECTION_SCOPE_RELATIONS
-            for finding in findings
-        ):
-            return (
-                "Review correction source is not eligible for automatic correction: "
-                "it contains REQUIRED findings that are not safely eligible."
-            )
-        return None
-
-    return (
-        "Correction source is not internally consistent: the latest verification "
-        "did not fail and the latest review did not require corrections."
-    )
-
-
-def _require_current_workspace_matches_checkpoint(
-    run_dir: Path,
-    run_record: RunRecord,
-) -> str | None:
-    fingerprint_path = _latest_writable_workspace_fingerprint_path(
-        run_dir,
-        run_record,
-    )
-    if fingerprint_path is None:
-        return "Required canonical workspace fingerprint checkpoint is missing."
     repository = GitRepository(Path(run_record.target_repository_path))
     try:
-        expected_fingerprint = _read_workspace_fingerprint(fingerprint_path)
-        current_snapshot = WorkspaceSnapshot.capture(repository)
+        current = WorkspaceSnapshot.capture(repository)
     except (OSError, RuntimeError, ValueError) as error:
-        return f"Could not compare current workspace to checkpoint: {error}"
-    if not current_snapshot.inspection_complete:
-        return (
-            "Could not compare current workspace to checkpoint: workspace "
-            "inspection was incomplete: "
-            + "; ".join(current_snapshot.inspection_errors)
-        )
-    if not current_snapshot.matches_fingerprint(expected_fingerprint):
-        return (
-            "Current workspace no longer matches the last verified writable checkpoint."
-        )
+        return f"Could not inspect current workspace for safe resume: {error}"
+    if not current.inspection_complete:
+        return "Could not inspect current workspace for safe resume completely."
+    if not current.matches_fingerprint(expected_fingerprint):
+        return f"Current workspace no longer matches {description}."
     return None
-
-
-def _read_json_dict(path: Path) -> dict[str, object] | None:
-    try:
-        import json
-
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return None
-    return data if isinstance(data, dict) else None
 
 
 def _mark_controller_exception(
@@ -1157,6 +1223,8 @@ def _mark_controller_exception(
     clock: Callable[[], datetime] | None,
 ) -> RunRecord:
     run_record = load_run_record(run_dir / RUN_RECORD_FILE)
+    if run_record.state in TERMINAL_STATES:
+        return run_record
     stop = classify_unexpected_controller_failure(
         run_dir,
         run_record,
@@ -1394,23 +1462,6 @@ def _git_safety_lines(
         "  branch unchanged",
         "  staging empty",
     ]
-
-
-def _resume_safety_reason(safety: object) -> str:
-    problems: list[str] = []
-    if getattr(safety, "inspection_error", None):
-        problems.append(f"Git inspection failed: {safety.inspection_error}")
-    if not getattr(safety, "branch_ok", False):
-        problems.append(
-            f"branch is {safety.branch_actual}, expected {safety.branch_expected}"
-        )
-    if not getattr(safety, "head_ok", False):
-        problems.append(
-            f"HEAD is {safety.head_actual}, expected {safety.head_expected}"
-        )
-    if not getattr(safety, "staging_ok", False):
-        problems.append("staging area is not empty")
-    return "Resume preflight failed: " + "; ".join(problems)
 
 
 def _timestamp(clock: Callable[[], datetime] | None) -> str:

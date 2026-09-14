@@ -37,7 +37,7 @@ EXISTING_EXECUTABLE = str(Path(sys.executable).resolve())
 @dataclass
 class FakeRunner:
     result: CodexProcessResult | None = None
-    last_message: str | None = None
+    typed_result: str | None = None
     error: Exception | None = None
     command: CodexCommand | None = None
     stdin: str | None = None
@@ -57,8 +57,8 @@ class FakeRunner:
         self.timeout_seconds = timeout_seconds
         if self.error is not None:
             raise self.error
-        if self.last_message is not None:
-            _last_message_path(command).write_text(self.last_message, encoding="utf-8")
+        if self.typed_result is not None:
+            _output_result_path(command).write_text(self.typed_result, encoding="utf-8")
         assert self.result is not None
         return self.result
 
@@ -75,12 +75,8 @@ class StartFailureRunner:
         raise OSError("permission denied")
 
 
-def _last_message_path(command: CodexCommand) -> Path:
+def _output_result_path(command: CodexCommand) -> Path:
     return Path(command.argv[command.argv.index("--output-last-message") + 1])
-
-
-def _artifact_last_message(artifact_directory: Path) -> Path:
-    return artifact_directory / "last-message.json"
 
 
 def implementation_result(**changes: object) -> dict[str, object]:
@@ -109,9 +105,9 @@ def successful_process(*, stdout: str = "") -> CodexProcessResult:
     return CodexProcessResult(returncode=0, stdout=stdout, stderr="progress\n")
 
 
-def test_command_includes_canonical_last_message_argument(tmp_path):
+def test_command_writes_typed_result_to_the_canonical_result_artifact(tmp_path):
     schema = tmp_path / "schema.json"
-    last_message = tmp_path / "last-message.json"
+    result = tmp_path / "result.json"
 
     command = build_codex_command(
         executable="codex",
@@ -124,12 +120,12 @@ def test_command_includes_canonical_last_message_argument(tmp_path):
         schema.resolve()
     )
     assert command.argv[command.argv.index("--output-last-message") + 1] == str(
-        last_message.resolve()
+        result.resolve()
     )
     assert "--json" in command.argv
 
 
-def test_implementation_last_message_is_parsed_and_normalized(tmp_path):
+def test_implementation_result_is_parsed_without_a_duplicate_raw_result(tmp_path):
     payload = implementation_result()
     runner = FakeRunner(successful_process(), json.dumps(payload))
 
@@ -146,14 +142,12 @@ def test_implementation_last_message_is_parsed_and_normalized(tmp_path):
     assert execution.status == CodexExecutionStatus.SUCCESS
     assert execution.structured_result == payload
     assert json.loads(execution.result_json_path.read_text(encoding="utf-8")) == payload
-    assert _artifact_last_message(execution.artifact_directory).read_text(
-        encoding="utf-8"
-    ) == json.dumps(payload)
+    assert not (execution.artifact_directory / "last-message.json").exists()
     assert execution.process_started is True
     assert execution.process_exit_code == 0
 
 
-def test_review_last_message_uses_review_parser(tmp_path):
+def test_review_result_uses_review_parser(tmp_path):
     payload = review_result(
         verdict="CORRECTIONS_REQUIRED",
         findings=[
@@ -202,7 +196,7 @@ def test_correction_uses_implementation_parser(tmp_path):
     assert execution.structured_result == payload
 
 
-def test_missing_last_message_fails_clearly(tmp_path):
+def test_missing_typed_result_fails_clearly(tmp_path):
     runner = FakeRunner(successful_process())
 
     with pytest.raises(CodexExecutionFailure, match="did not write") as raised:
@@ -221,7 +215,7 @@ def test_missing_last_message_fails_clearly(tmp_path):
     assert raised.value.execution.process_exit_code == 0
 
 
-def test_malformed_last_message_json_fails_clearly(tmp_path):
+def test_malformed_typed_result_json_fails_clearly(tmp_path):
     runner = FakeRunner(successful_process(), "{not json")
 
     with pytest.raises(CodexExecutionFailure, match="not valid JSON") as raised:
@@ -266,7 +260,7 @@ def test_invalid_implementation_result_fields_fail(tmp_path, payload):
         )
 
     assert raised.value.kind == CodexFailureKind.INVALID_STRUCTURED_RESULT
-    assert not raised.value.execution.result_json_path.exists()
+    assert raised.value.execution.result_json_path.is_file()
 
 
 def test_diagnostic_jsonl_is_persisted_without_affecting_result(tmp_path):
@@ -291,7 +285,7 @@ def test_diagnostic_jsonl_is_persisted_without_affecting_result(tmp_path):
     assert execution.stderr_log_path.read_text(encoding="utf-8") == "progress\n"
 
 
-def test_canonical_last_message_wins_over_plausible_jsonl_result(tmp_path):
+def test_canonical_typed_result_wins_over_plausible_jsonl_result(tmp_path):
     diagnostics = (
         json.dumps(
             {
@@ -322,10 +316,10 @@ def test_canonical_last_message_wins_over_plausible_jsonl_result(tmp_path):
     )
 
 
-def test_stale_last_message_cannot_satisfy_a_new_execution(tmp_path):
+def test_stale_typed_result_cannot_satisfy_a_new_execution(tmp_path):
     artifact_directory = tmp_path / "artifacts"
     artifact_directory.mkdir()
-    _artifact_last_message(artifact_directory).write_text(
+    (artifact_directory / "result.json").write_text(
         json.dumps(implementation_result(status="BLOCKED")),
         encoding="utf-8",
     )
@@ -343,7 +337,7 @@ def test_stale_last_message_cannot_satisfy_a_new_execution(tmp_path):
         )
 
     assert raised.value.kind == CodexFailureKind.MISSING_STRUCTURED_RESULT
-    assert not _artifact_last_message(artifact_directory).exists()
+    assert not (artifact_directory / "result.json").exists()
 
 
 def test_non_zero_exit_still_fails_from_process_evidence(tmp_path):

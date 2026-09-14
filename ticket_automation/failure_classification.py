@@ -9,8 +9,6 @@ from .runs import RunRecord
 from .writable_attempts import (
     WritableAttempt,
     inspect_writable_attempt_after_failure,
-    load_writable_attempt,
-    writable_attempt_path,
 )
 
 
@@ -125,11 +123,10 @@ def _current_writable_attempt(
     run_dir: Path,
     run_record: RunRecord,
 ) -> WritableAttempt | None:
-    if run_record.state == WorkflowState.IMPLEMENTING:
-        operation = "implementation"
-    else:
-        operation = f"correction-round-{run_record.current_correction_round + 1}"
-    return load_writable_attempt(writable_attempt_path(run_dir, operation=operation))
+    # A controller crash during a writable phase is deliberately never
+    # reconstructed from disk. The caller will classify it as HUMAN_REQUIRED.
+    del run_dir, run_record
+    return None
 
 
 def _repository_uncertain_stop(

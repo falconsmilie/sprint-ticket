@@ -10,7 +10,10 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "TicketAutomation contributors" }]
-dependencies = [
+dependencies = []
+
+[dependency-groups]
+dev = [
     "pytest",
     "ruff",
 ]

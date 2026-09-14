@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-import hashlib
 import json
-import os
-import shutil
-import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -13,18 +9,23 @@ from pathlib import Path
 from typing import Any
 
 from ._verification_artifacts import (
-    VERIFICATION_DIR_NAME,
     _read_verification_source_fingerprint,
     _VerificationArtifactError,
+)
+from .attempts import (
+    attempt_result_path,
+    finish_phase_attempt,
+    latest_attempt,
+    start_attempt,
+    update_attempt,
 )
 from .codex import (
     CodexExecution,
     CodexExecutionFailure,
     CodexProcessRunner,
-    CodexResultValidationError,
     Sandbox,
     _CodexResultKind,
-    _parse_review_result,
+    _parse_codex_result,
 )
 from .codex import (
     _execute as _execute_codex,
@@ -48,17 +49,9 @@ from .runs import (
     load_run_record,
 )
 
-REVIEW_DIR_NAME = "reviews"
-REVIEW_ROUND_OFFSET = 1
-_REVIEW_CHECKPOINT_SCHEMA_VERSION = 2
-_REVIEW_CHECKPOINT_FORMAT = "ticket_automation.review_checkpoint"
-_REVIEW_CHECKPOINT_FILE = "checkpoint.json"
-_INCOMPLETE_ARTIFACT_DIR_NAME = "_incomplete"
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _REVIEW_PROMPT_TEMPLATE = _PROJECT_ROOT / "prompts" / "review.md"
 _REVIEW_RESULT_SCHEMA = _PROJECT_ROOT / "schemas" / "review-result.schema.json"
-_IMPLEMENTATION_DIR_NAME = "implementation"
-_IMPLEMENTATION_RESULT_FILE = "result.json"
 
 
 class ReviewError(RunError):
@@ -101,12 +94,6 @@ _AUTOMATIC_CORRECTION_SCOPE_RELATIONS = frozenset(
 )
 
 
-class _ReviewArtifactState(StrEnum):
-    MISSING = "MISSING"
-    PARTIAL = "PARTIAL"
-    COMPLETE = "COMPLETE"
-
-
 @dataclass(frozen=True)
 class ReviewSafetyViolation:
     name: str
@@ -145,7 +132,6 @@ def run_review_stage(
     codex_runner: CodexProcessRunner | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> ReviewStageResult:
-    del clock
     run_path = Path(run_dir)
     run_record_path = run_path / RUN_RECORD_FILE
     run_record = load_run_record(run_record_path)
@@ -163,11 +149,39 @@ def run_review_stage(
         raise ReviewError("Run record and baseline HEAD do not match.")
 
     repository = GitRepository(Path(run_record.target_repository_path))
-    review_round = run_record.current_review_round + REVIEW_ROUND_OFFSET
-    artifact_directory = run_path / REVIEW_DIR_NAME / f"round-{review_round}"
-    result_path = artifact_directory / "result.json"
-
-    repository_snapshot = WorkspaceSnapshot.capture(repository)
+    try:
+        repository_snapshot = WorkspaceSnapshot.capture(repository)
+        before_workspace_fingerprint = repository_snapshot.fingerprint
+        snapshot_error: ReviewSafetyViolation | None = None
+    except (OSError, RuntimeError, ValueError) as error:
+        repository_snapshot = None
+        before_workspace_fingerprint = None
+        snapshot_error = ReviewSafetyViolation(
+            name="repository-inspection",
+            expected="complete pre-review inspection",
+            actual=f"{type(error).__name__}: {error}",
+            message="Repository inspection failed before independent review.",
+        )
+    attempt_record = start_attempt(
+        run_path,
+        phase=WorkflowState.REVIEWING.value,
+        before_workspace_fingerprint=before_workspace_fingerprint,
+        clock=clock,
+    )
+    artifact_directory = attempt_record.artifact_directory
+    if snapshot_error is not None:
+        return _finish(
+            run_record=run_record,
+            run_dir=run_path,
+            artifact_directory=artifact_directory,
+            execution=None,
+            review_result=None,
+            safety_violations=(snapshot_error,),
+            processing_error=None,
+            outcome=StageOutcome.HUMAN_REQUIRED,
+            controller_message="Repository inspection failed before independent review.",
+        )
+    assert repository_snapshot is not None
     starting_violations = _inspect_review_invariants(
         repository,
         run_record,
@@ -186,17 +200,6 @@ def run_review_stage(
             controller_message="Repository no longer matches the recorded review baseline.",
         )
 
-    prompt = _render_review_prompt(
-        ticket_text=_read_snapshotted_ticket(run_path / RUN_TICKET_FILE),
-        run_record=run_record,
-        current_branch=(
-            "<detached>"
-            if repository_snapshot.branch is None
-            else repository_snapshot.branch
-        ),
-        verification_results=_read_verification_results(run_path, run_record),
-        implementation_summary=_read_implementation_summary(run_path),
-    )
     source_violations = _inspect_review_source_fingerprint(
         run_path,
         run_record,
@@ -217,59 +220,39 @@ def run_review_stage(
                 "Repository no longer matches the verified review source."
             ),
         )
-    artifact_state = _review_artifact_state(artifact_directory, result_path)
-    if artifact_state == _ReviewArtifactState.COMPLETE:
-        review_result, adoption_problem = _load_existing_review_result(
-            artifact_directory=artifact_directory,
-            result_path=result_path,
-            expected_prompt=prompt,
-            run_record=run_record,
-            review_round=review_round,
-            repository_snapshot=repository_snapshot,
-        )
-        if adoption_problem is None and review_result is not None:
-            safety_violations = _inspect_review_invariants(
-                repository,
-                run_record,
-                expected_snapshot=repository_snapshot,
-            )
-            if safety_violations:
-                return _finish(
-                    run_record=run_record,
-                    run_dir=run_path,
-                    artifact_directory=artifact_directory,
-                    execution=None,
-                    review_result=review_result,
-                    safety_violations=safety_violations,
-                    processing_error=None,
-                    outcome=StageOutcome.HUMAN_REQUIRED,
-                    controller_message=(
-                        "Repository safety invariants were violated before "
-                        "review checkpoint adoption."
-                    ),
-                )
-            return _finish_valid_review_result(
-                run_record=run_record,
-                run_dir=run_path,
-                artifact_directory=artifact_directory,
-                execution=None,
-                review_result=review_result,
-            )
-        _archive_review_artifacts(artifact_directory)
-    elif artifact_state == _ReviewArtifactState.PARTIAL:
-        _archive_review_artifacts(artifact_directory)
-
-    _write_review_checkpoint(
-        artifact_directory / _REVIEW_CHECKPOINT_FILE,
-        _review_checkpoint(
-            run_record,
-            review_round=review_round,
-            prompt=prompt,
-            repository_snapshot=repository_snapshot,
-        ),
-    )
-
     try:
+        prompt = _render_review_prompt(
+            ticket_text=_read_snapshotted_ticket(run_path / RUN_TICKET_FILE),
+            run_record=run_record,
+            current_branch=(
+                "<detached>"
+                if repository_snapshot.branch is None
+                else repository_snapshot.branch
+            ),
+            verification_results=_read_verification_results(run_path, run_record),
+            implementation_summary=_read_implementation_summary(run_path),
+        )
+    except ReviewError as error:
+        return _finish(
+            run_record=run_record,
+            run_dir=run_path,
+            artifact_directory=artifact_directory,
+            execution=None,
+            review_result=None,
+            safety_violations=(
+                ReviewSafetyViolation(
+                    name="review-evidence",
+                    expected="readable trusted review inputs",
+                    actual=str(error),
+                    message="Review evidence could not be prepared safely.",
+                ),
+            ),
+            processing_error=str(error),
+            outcome=StageOutcome.HUMAN_REQUIRED,
+            controller_message="Review evidence could not be prepared safely.",
+        )
+    try:
+        update_attempt(attempt_record, process_started=True)
         execution = _execute_codex(
             prompt=prompt,
             repo_path=repository.path,
@@ -346,6 +329,14 @@ def validate_review_result_semantics(result: dict[str, Any]) -> None:
         raise ReviewResultConsistencyError(
             "CORRECTIONS_REQUIRED results must contain at least one REQUIRED finding."
         )
+
+
+def _validate_review_result_artifact(value: Any) -> dict[str, Any]:
+    """Validate persisted review evidence before it influences final handoff."""
+
+    result = _parse_codex_result(value, _result_kind=_CodexResultKind.REVIEW)
+    validate_review_result_semantics(result)
+    return result
 
 
 def _correction_eligible_review_findings(
@@ -453,6 +444,21 @@ def _finish(
     outcome: StageOutcome,
     controller_message: str,
 ) -> ReviewStageResult:
+    after_fingerprint: str | None = None
+    try:
+        after_fingerprint = WorkspaceSnapshot.capture(
+            GitRepository(Path(run_record.target_repository_path))
+        ).fingerprint
+    except (OSError, RuntimeError, ValueError):
+        pass
+    finish_phase_attempt(
+        run_dir,
+        phase=WorkflowState.REVIEWING.value,
+        stage_outcome=outcome.value,
+        after_workspace_fingerprint=after_fingerprint,
+        process_started=(None if execution is None else execution.process_started),
+        execution_path=(None if execution is None else execution.execution_json_path),
+    )
     return ReviewStageResult(
         run_dir=run_dir,
         run_record=run_record,
@@ -464,233 +470,6 @@ def _finish(
         processing_error=processing_error,
         controller_message=controller_message,
     )
-
-
-def _review_artifact_state(
-    artifact_directory: Path,
-    result_path: Path,
-) -> _ReviewArtifactState:
-    if result_path.is_file():
-        return _ReviewArtifactState.COMPLETE
-    if artifact_directory.exists() and any(artifact_directory.iterdir()):
-        return _ReviewArtifactState.PARTIAL
-    return _ReviewArtifactState.MISSING
-
-
-def _load_existing_review_result(
-    *,
-    artifact_directory: Path,
-    result_path: Path,
-    expected_prompt: str,
-    run_record: RunRecord,
-    review_round: int,
-    repository_snapshot: WorkspaceSnapshot,
-) -> tuple[dict[str, Any] | None, str | None]:
-    expected_checkpoint = _review_checkpoint(
-        run_record,
-        review_round=review_round,
-        prompt=expected_prompt,
-        repository_snapshot=repository_snapshot,
-    )
-    checkpoint_problem = _existing_review_checkpoint_problem(
-        artifact_directory / _REVIEW_CHECKPOINT_FILE,
-        expected_checkpoint=expected_checkpoint,
-    )
-    if checkpoint_problem is not None:
-        return None, checkpoint_problem
-
-    prompt_problem = _existing_review_prompt_problem(
-        artifact_directory / "prompt.md",
-        expected_prompt=expected_prompt,
-    )
-    if prompt_problem is not None:
-        return None, prompt_problem
-
-    try:
-        result = json.loads(result_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        return None, f"Could not read existing review result: {error}"
-    if not isinstance(result, dict):
-        return None, "Existing review result is not a JSON object."
-
-    try:
-        result = _parse_review_result(result)
-    except CodexResultValidationError as error:
-        return None, f"Existing review result is invalid: {error}"
-
-    execution_problem = _existing_review_execution_problem(
-        artifact_directory / "execution.json",
-        result_path=result_path,
-        run_record=run_record,
-    )
-    if execution_problem is not None:
-        return None, execution_problem
-
-    return result, None
-
-
-def _existing_review_checkpoint_problem(
-    checkpoint_path: Path,
-    *,
-    expected_checkpoint: dict[str, Any],
-) -> str | None:
-    try:
-        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return "Existing review result is missing checkpoint metadata."
-    except (OSError, json.JSONDecodeError) as error:
-        return f"Could not read existing review checkpoint metadata: {error}"
-    if not isinstance(checkpoint, dict):
-        return "Existing review checkpoint metadata is not a JSON object."
-    for key, expected_value in expected_checkpoint.items():
-        if checkpoint.get(key) != expected_value:
-            return (
-                "Existing review checkpoint does not match current run metadata: "
-                f"{key}."
-            )
-    return None
-
-
-def _existing_review_prompt_problem(
-    prompt_path: Path,
-    *,
-    expected_prompt: str,
-) -> str | None:
-    try:
-        prompt = prompt_path.read_text(encoding="utf-8")
-    except OSError as error:
-        return f"Could not read existing review prompt: {error}"
-    if _normalize_prompt_text(prompt) != _normalize_prompt_text(expected_prompt):
-        return "Existing review prompt does not match the current run checkpoint."
-    return None
-
-
-def _normalize_prompt_text(value: str) -> str:
-    return value.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
-
-
-def _existing_review_execution_problem(
-    execution_path: Path,
-    *,
-    result_path: Path,
-    run_record: RunRecord,
-) -> str | None:
-    if not execution_path.exists():
-        return None
-    try:
-        execution = json.loads(execution_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        return f"Could not read existing review execution metadata: {error}"
-    if not isinstance(execution, dict):
-        return "Existing review execution metadata is not a JSON object."
-    expected_repo = Path(run_record.target_repository_path).resolve()
-    repo_path = execution.get("repo_path")
-    if not isinstance(repo_path, str) or Path(repo_path).resolve() != expected_repo:
-        return "Existing review execution metadata is for a different repository."
-    if execution.get("status") != "SUCCESS":
-        return "Existing review execution metadata is not successful."
-    if execution.get("sandbox") != Sandbox.READ_ONLY.value:
-        return "Existing review execution metadata is not read-only."
-    if execution.get("result_json_present") is not True:
-        return "Existing review execution metadata does not confirm result.json."
-    schema_path = execution.get("output_schema_path")
-    if (
-        isinstance(schema_path, str)
-        and Path(schema_path).resolve() != _REVIEW_RESULT_SCHEMA.resolve()
-    ):
-        return "Existing review execution metadata used a different result schema."
-    artifact_paths = execution.get("artifact_paths")
-    if isinstance(artifact_paths, dict):
-        recorded_result = artifact_paths.get("result_json")
-        if (
-            isinstance(recorded_result, str)
-            and Path(recorded_result).resolve() != result_path.resolve()
-        ):
-            return "Existing review execution metadata points at a different result."
-    return None
-
-
-def _archive_review_artifacts(artifact_directory: Path) -> None:
-    if not artifact_directory.exists():
-        return
-    archive_root = artifact_directory.parent / _INCOMPLETE_ARTIFACT_DIR_NAME
-    archive_root.mkdir(parents=True, exist_ok=True)
-    archive_path = _unique_archive_path(archive_root / artifact_directory.name)
-    shutil.move(str(artifact_directory), str(archive_path))
-
-
-def _unique_archive_path(path: Path) -> Path:
-    if not path.exists():
-        return path
-    for index in range(2, 1000):
-        candidate = path.with_name(f"{path.name}-{index}")
-        if not candidate.exists():
-            return candidate
-    raise ReviewError(f"Could not reserve recovery artifact directory: {path}")
-
-
-def _review_checkpoint(
-    run_record: RunRecord,
-    *,
-    review_round: int,
-    prompt: str,
-    repository_snapshot: WorkspaceSnapshot,
-) -> dict[str, Any]:
-    return {
-        "schema_version": _REVIEW_CHECKPOINT_SCHEMA_VERSION,
-        "format": _REVIEW_CHECKPOINT_FORMAT,
-        "stage": WorkflowState.REVIEWING.value,
-        "status": "STARTED",
-        "run_id": run_record.run_id,
-        "review_round": review_round,
-        "correction_round": run_record.current_correction_round,
-        "target_repository_path": str(
-            Path(run_record.target_repository_path).resolve()
-        ),
-        "starting_branch": run_record.starting_branch,
-        "baseline_sha": run_record.baseline_sha,
-        "source_fingerprint": repository_snapshot.fingerprint,
-        "prompt_sha256": _text_sha256(_normalize_prompt_text(prompt)),
-    }
-
-
-def _write_review_checkpoint(path: Path, checkpoint: dict[str, Any]) -> None:
-    _atomic_write_text(path, json.dumps(checkpoint, indent=2, sort_keys=True) + "\n")
-
-
-def _atomic_write_text(path: Path, contents: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path: Path | None = None
-    file_descriptor = -1
-    try:
-        file_descriptor, temp_name = tempfile.mkstemp(
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            text=True,
-        )
-        temp_path = Path(temp_name)
-        with os.fdopen(
-            file_descriptor,
-            "w",
-            encoding="utf-8",
-            newline="\n",
-        ) as temp_file:
-            file_descriptor = -1
-            temp_file.write(contents)
-            temp_file.flush()
-            os.fsync(temp_file.fileno())
-        os.replace(temp_path, path)
-    except Exception:
-        if file_descriptor != -1:
-            os.close(file_descriptor)
-        if temp_path is not None:
-            temp_path.unlink(missing_ok=True)
-        raise
-
-
-def _text_sha256(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _render_review_prompt(
@@ -735,8 +514,17 @@ def _read_snapshotted_ticket(path: Path) -> str:
 
 
 def _read_verification_results(run_path: Path, run_record: RunRecord) -> str:
-    round_index = run_record.current_correction_round
-    verification_path = run_path / VERIFICATION_DIR_NAME / f"round-{round_index}.json"
+    del run_record
+    attempt = latest_attempt(
+        run_path,
+        phases=(WorkflowState.VERIFYING.value,),
+        statuses=("COMPLETED",),
+    )
+    if attempt is None:
+        raise ReviewError("Missing deterministic verification results.")
+    verification_path = attempt_result_path(run_path, attempt)
+    if verification_path is None:
+        raise ReviewError("Verification attempt has no typed result path.")
     try:
         data = json.loads(verification_path.read_text(encoding="utf-8"))
     except FileNotFoundError as error:
@@ -765,7 +553,14 @@ def _require_passing_verification_round(data: Any, path: Path) -> None:
 
 
 def _read_implementation_summary(run_path: Path) -> str:
-    result_path = run_path / _IMPLEMENTATION_DIR_NAME / _IMPLEMENTATION_RESULT_FILE
+    attempt = latest_attempt(
+        run_path,
+        phases=(WorkflowState.IMPLEMENTING.value,),
+        statuses=("COMPLETED",),
+    )
+    result_path = None if attempt is None else attempt_result_path(run_path, attempt)
+    if result_path is None:
+        return "No implementation summary is available."
     try:
         data = json.loads(result_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -851,7 +646,7 @@ def _inspect_review_source_fingerprint(
     except _VerificationArtifactError as error:
         return (
             ReviewSafetyViolation(
-                name="workspace-checkpoint",
+                name="verification-evidence",
                 expected="readable canonical workspace fingerprint",
                 actual=str(error),
                 message="Could not validate the verified review source.",
@@ -884,8 +679,6 @@ def _format_files(files: tuple[str, ...]) -> str:
 
 
 __all__ = [
-    "REVIEW_DIR_NAME",
-    "REVIEW_ROUND_OFFSET",
     "FindingDisposition",
     "ReviewError",
     "ReviewResultConsistencyError",

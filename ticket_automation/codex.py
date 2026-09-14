@@ -26,7 +26,6 @@ EVENTS_ARTIFACT = "events.jsonl"
 STDERR_ARTIFACT = "stderr.log"
 _EXECUTION_ARTIFACT = "execution.json"
 RESULT_ARTIFACT = "result.json"
-_LAST_MESSAGE_ARTIFACT = "last-message.json"
 
 
 class Sandbox(StrEnum):
@@ -279,7 +278,7 @@ class CodexExecutor:
         artifact_paths = _artifact_paths(artifact_directory)
         start = _utcnow()
         artifact_paths.directory.mkdir(parents=True, exist_ok=True)
-        artifact_paths.last_message.unlink(missing_ok=True)
+        artifact_paths.result.unlink(missing_ok=True)
         artifact_paths.prompt.write_text(prompt, encoding="utf-8", newline="\n")
 
         configured_command = _build_codex_command(
@@ -288,7 +287,7 @@ class CodexExecutor:
             sandbox=sandbox,
             execution_config=self.execution_config,
             output_schema=output_schema,
-            _output_last_message=artifact_paths.last_message,
+            _output_last_message=artifact_paths.result,
         )
 
         project_config = Path(repo_path) / ".codex" / "config.toml"
@@ -344,7 +343,7 @@ class CodexExecutor:
             sandbox=sandbox,
             execution_config=self.execution_config,
             output_schema=output_schema,
-            _output_last_message=artifact_paths.last_message,
+            _output_last_message=artifact_paths.result,
         )
 
         try:
@@ -436,13 +435,13 @@ class CodexExecutor:
             )
 
         try:
-            raw_result = artifact_paths.last_message.read_text(encoding="utf-8")
+            raw_result = artifact_paths.result.read_text(encoding="utf-8")
         except FileNotFoundError:
             return _fail(
                 kind=CodexFailureKind.MISSING_STRUCTURED_RESULT,
                 message=(
                     "Codex exited successfully but did not write the required "
-                    f"last-message result: {artifact_paths.last_message}."
+                    f"typed result: {artifact_paths.result}."
                 ),
                 command=command,
                 sandbox=sandbox,
@@ -458,7 +457,7 @@ class CodexExecutor:
                 kind=CodexFailureKind.MISSING_STRUCTURED_RESULT,
                 message=(
                     "Codex exited successfully but TicketAutomation could not read "
-                    f"the last-message result: {error}."
+                    f"the typed result: {error}."
                 ),
                 command=command,
                 sandbox=sandbox,
@@ -477,7 +476,7 @@ class CodexExecutor:
         except json.JSONDecodeError as error:
             return _fail(
                 kind=CodexFailureKind.INVALID_STRUCTURED_RESULT,
-                message=(f"Codex last-message result was not valid JSON: {error.msg}."),
+                message=(f"Codex typed result was not valid JSON: {error.msg}."),
                 command=command,
                 sandbox=sandbox,
                 execution_config=self.execution_config,
@@ -503,7 +502,6 @@ class CodexExecutor:
                 structured_result_present=True,
             )
 
-        _write_json_artifact(artifact_paths.result, result)
         ended = _utcnow()
         execution = CodexExecution(
             argv=command.argv,
@@ -599,7 +597,7 @@ def build_codex_command(
         sandbox=sandbox,
         execution_config=execution_config,
         output_schema=output_schema,
-        _output_last_message=Path(output_schema).with_name(_LAST_MESSAGE_ARTIFACT),
+        _output_last_message=Path(output_schema).with_name(RESULT_ARTIFACT),
     )
 
 
@@ -884,7 +882,6 @@ class _ArtifactPaths:
     prompt: Path
     events: Path
     stderr: Path
-    last_message: Path
     execution: Path
     result: Path
 
@@ -896,7 +893,6 @@ def _artifact_paths(artifact_directory: Path) -> _ArtifactPaths:
         prompt=directory / PROMPT_ARTIFACT,
         events=directory / EVENTS_ARTIFACT,
         stderr=directory / STDERR_ARTIFACT,
-        last_message=directory / _LAST_MESSAGE_ARTIFACT,
         execution=directory / _EXECUTION_ARTIFACT,
         result=directory / RESULT_ARTIFACT,
     )
@@ -989,9 +985,6 @@ def _execution_record(execution: CodexExecution) -> dict[str, Any]:
             "prompt_md": str(execution.prompt_path),
             "events_jsonl": str(execution.events_jsonl_path),
             "stderr_log": str(execution.stderr_log_path),
-            "last_message_json": str(
-                execution.artifact_directory / _LAST_MESSAGE_ARTIFACT
-            ),
             "execution_json": str(execution.execution_json_path),
             "result_json": str(execution.result_json_path),
         },

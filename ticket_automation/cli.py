@@ -87,7 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     resume_parser = subparsers.add_parser(
         "resume",
-        help="Resume a known run from an explicitly safe persisted checkpoint.",
+        help="Resume a known run when its current phase is safe to rerun.",
     )
     resume_parser.add_argument(
         "run_id",

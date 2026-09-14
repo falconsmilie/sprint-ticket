@@ -8,14 +8,9 @@ from typing import Any
 
 from . import writable_worker
 from ._verification_artifacts import _baseline_verification_evidence_problem
+from .attempts import finish_phase_attempt, start_attempt
 from .audit import (
     changed_files_including_untracked as _changed_files_including_untracked,
-)
-from .audit import (
-    diff_including_untracked as _diff_including_untracked,
-)
-from .audit import (
-    diff_stats_including_untracked as _diff_stats_including_untracked,
 )
 from .codex import (
     CodexExecution,
@@ -28,8 +23,6 @@ from .git import GitCommandError, GitRepository
 from .git_safety import (
     WorkspaceChange,
     WorkspaceSnapshot,
-    _workspace_fingerprint_path,
-    _write_workspace_fingerprint,
     workspace_safety_changes,
 )
 from .models import StageOutcome, StopCategory, WorkflowState
@@ -53,12 +46,6 @@ class _SafetyInspectionPhase:
     AFTER_IMPLEMENTATION = "after implementation"
 
 
-_IMPLEMENTATION_DIR_NAME = "implementation"
-_DIFFS_DIR_NAME = "diffs"
-_AFTER_IMPLEMENTATION_PATCH_FILE = "after-implementation.patch"
-_AFTER_IMPLEMENTATION_STATS_FILE = "after-implementation.stat"
-_FAILED_IMPLEMENTATION_PATCH_FILE = "failed-implementation.patch"
-_FAILED_IMPLEMENTATION_STATS_FILE = "failed-implementation.stat"
 _TICKET_PLACEHOLDER = "{{SNAPSHOTTED_TICKET}}"
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _IMPLEMENTATION_PROMPT_TEMPLATE = _PROJECT_ROOT / "prompts" / "implement.md"
@@ -89,8 +76,6 @@ class ImplementationStageResult:
     agent_result: dict[str, Any] | None
     safety_violations: tuple[_ImplementationSafetyViolation, ...]
     changed_files: tuple[str, ...]
-    patch_path: Path | None
-    diff_stats_path: Path | None
     workspace_guard: WorkspaceGuardInspection | None
     controller_message: str
 
@@ -103,9 +88,6 @@ class ImplementationStageResult:
 class _FailedWritableAudit:
     safety_violations: tuple[_ImplementationSafetyViolation, ...]
     changed_files: tuple[str, ...]
-    patch_path: Path | None
-    diff_stats_path: Path | None
-    patch_error: str | None
     workspace_guard: WorkspaceGuardInspection | None
     human_required: bool
 
@@ -134,7 +116,18 @@ def run_implementation_stage(
         raise ImplementationError("Run record and baseline HEAD do not match.")
 
     repository = GitRepository(Path(run_record.target_repository_path))
-    implementation_dir = run_path / _IMPLEMENTATION_DIR_NAME
+    try:
+        before_snapshot = WorkspaceSnapshot.capture(repository)
+        before_fingerprint = before_snapshot.fingerprint
+    except (OSError, RuntimeError, ValueError):
+        before_fingerprint = None
+    attempt_record = start_attempt(
+        run_path,
+        phase=WorkflowState.IMPLEMENTING.value,
+        before_workspace_fingerprint=before_fingerprint,
+        clock=clock,
+    )
+    implementation_dir = attempt_record.artifact_directory
     evidence_problem = _baseline_verification_evidence_problem(
         run_path,
         run_record,
@@ -157,8 +150,6 @@ def run_implementation_stage(
                 ),
             ),
             changed_files=(),
-            patch_path=None,
-            diff_stats_path=None,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=evidence_problem,
         )
@@ -177,8 +168,6 @@ def run_implementation_stage(
             agent_result=None,
             safety_violations=starting_violations,
             changed_files=(),
-            patch_path=None,
-            diff_stats_path=None,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message="Repository no longer matches the clean implementation baseline.",
         )
@@ -191,6 +180,7 @@ def run_implementation_stage(
         run_dir=run_path,
         operation="implementation",
         phase=WorkflowState.IMPLEMENTING.value,
+        attempt_record=attempt_record,
         prompt=prompt,
         output_schema=_IMPLEMENTATION_RESULT_SCHEMA,
         artifact_directory=implementation_dir,
@@ -209,8 +199,6 @@ def run_implementation_stage(
             agent_result=None,
             safety_violations=(),
             changed_files=(),
-            patch_path=None,
-            diff_stats_path=None,
             workspace_guard=workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=writable_worker._format_writable_guard_stop(
@@ -274,8 +262,6 @@ def run_implementation_stage(
             agent_result=None,
             safety_violations=failed_audit.safety_violations,
             changed_files=failed_audit.changed_files,
-            patch_path=failed_audit.patch_path,
-            diff_stats_path=failed_audit.diff_stats_path,
             workspace_guard=workspace_guard,
             outcome=outcome,
             controller_message=message,
@@ -296,8 +282,6 @@ def run_implementation_stage(
             agent_result=agent_result,
             safety_violations=(),
             changed_files=(),
-            patch_path=None,
-            diff_stats_path=None,
             workspace_guard=workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=writable_worker._format_writable_guard_stop(
@@ -322,8 +306,6 @@ def run_implementation_stage(
             agent_result=agent_result,
             safety_violations=safety_violations,
             changed_files=(),
-            patch_path=None,
-            diff_stats_path=None,
             workspace_guard=workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=writable_worker._format_writable_guard_stop(
@@ -342,8 +324,6 @@ def run_implementation_stage(
             agent_result=agent_result,
             safety_violations=safety_violations,
             changed_files=(),
-            patch_path=None,
-            diff_stats_path=None,
             workspace_guard=workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message="Repository safety invariants were violated.",
@@ -360,8 +340,6 @@ def run_implementation_stage(
             agent_result=agent_result,
             safety_violations=(),
             changed_files=(),
-            patch_path=None,
-            diff_stats_path=None,
             workspace_guard=workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=str(error),
@@ -376,8 +354,6 @@ def run_implementation_stage(
             agent_result=agent_result,
             safety_violations=(),
             changed_files=changed_files,
-            patch_path=None,
-            diff_stats_path=None,
             workspace_guard=workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message="Implementation agent returned BLOCKED.",
@@ -392,34 +368,11 @@ def run_implementation_stage(
             agent_result=agent_result,
             safety_violations=(),
             changed_files=(),
-            patch_path=None,
-            diff_stats_path=None,
             workspace_guard=workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message="Implementation completed without repository changes.",
         )
 
-    try:
-        patch_path, diff_stats_path = _capture_diff(
-            repository,
-            run_path,
-            active_record.baseline_sha,
-        )
-    except ImplementationError as error:
-        return _finish(
-            run_record=active_record,
-            run_dir=run_path,
-            artifact_directory=implementation_dir,
-            execution=execution,
-            agent_result=agent_result,
-            safety_violations=(),
-            changed_files=changed_files,
-            patch_path=None,
-            diff_stats_path=None,
-            workspace_guard=workspace_guard,
-            outcome=StageOutcome.HUMAN_REQUIRED,
-            controller_message=str(error),
-        )
     return _finish(
         run_record=active_record,
         run_dir=run_path,
@@ -428,8 +381,6 @@ def run_implementation_stage(
         agent_result=agent_result,
         safety_violations=(),
         changed_files=changed_files,
-        patch_path=patch_path,
-        diff_stats_path=diff_stats_path,
         workspace_guard=workspace_guard,
         outcome=StageOutcome.COMPLETED,
         controller_message="Implementation completed and Git safety checks passed.",
@@ -451,10 +402,6 @@ def format_implementation_result(result: ImplementationStageResult) -> str:
         f"Artifacts: {result.artifact_directory}",
         result.controller_message,
     ]
-    if result.patch_path is not None:
-        rows.append(f"Patch: {result.patch_path}")
-    if result.diff_stats_path is not None:
-        rows.append(f"Diff stats: {result.diff_stats_path}")
     if result.workspace_guard is not None and result.workspace_guard.requires_human:
         if result.workspace_guard.artifact_path is not None:
             rows.append(f"Workspace guard: {result.workspace_guard.artifact_path}")
@@ -490,12 +437,25 @@ def _finish(
     agent_result: dict[str, Any] | None,
     safety_violations: tuple[_ImplementationSafetyViolation, ...],
     changed_files: tuple[str, ...],
-    patch_path: Path | None,
-    diff_stats_path: Path | None,
     workspace_guard: WorkspaceGuardInspection | None = None,
     outcome: StageOutcome,
     controller_message: str,
 ) -> ImplementationStageResult:
+    after_fingerprint: str | None = None
+    try:
+        after_fingerprint = WorkspaceSnapshot.capture(
+            GitRepository(Path(run_record.target_repository_path))
+        ).fingerprint
+    except (OSError, RuntimeError, ValueError):
+        pass
+    finish_phase_attempt(
+        run_dir,
+        phase=WorkflowState.IMPLEMENTING.value,
+        stage_outcome=outcome.value,
+        after_workspace_fingerprint=after_fingerprint,
+        process_started=(None if execution is None else execution.process_started),
+        execution_path=(None if execution is None else execution.execution_json_path),
+    )
     return ImplementationStageResult(
         run_dir=run_dir,
         run_record=run_record,
@@ -505,8 +465,6 @@ def _finish(
         agent_result=agent_result,
         safety_violations=safety_violations,
         changed_files=changed_files,
-        patch_path=patch_path,
-        diff_stats_path=diff_stats_path,
         workspace_guard=workspace_guard,
         controller_message=controller_message,
     )
@@ -605,32 +563,6 @@ def _changed_files(repository: GitRepository, baseline_sha: str) -> tuple[str, .
         ) from error
 
 
-def _capture_diff(
-    repository: GitRepository,
-    run_dir: Path,
-    baseline_sha: str,
-) -> tuple[Path, Path]:
-    diffs_dir = run_dir / _DIFFS_DIR_NAME
-    diffs_dir.mkdir(parents=True, exist_ok=True)
-    patch_path = diffs_dir / _AFTER_IMPLEMENTATION_PATCH_FILE
-    stats_path = diffs_dir / _AFTER_IMPLEMENTATION_STATS_FILE
-    try:
-        patch = _diff_including_untracked(repository, baseline_sha)
-        stats = _diff_stats_including_untracked(repository, baseline_sha)
-        patch_path.write_text(patch, encoding="utf-8", newline="\n")
-        stats_path.write_text(stats, encoding="utf-8", newline="\n")
-        snapshot = WorkspaceSnapshot.capture(repository)
-        _write_workspace_fingerprint(
-            _workspace_fingerprint_path(patch_path),
-            snapshot,
-        )
-    except (GitCommandError, OSError, RuntimeError, ValueError) as error:
-        raise ImplementationError(
-            f"Could not capture implementation diff: {error}"
-        ) from error
-    return patch_path, stats_path
-
-
 def _audit_failed_writable_invocation(
     repository: GitRepository,
     run_path: Path,
@@ -697,25 +629,9 @@ def _audit_failed_writable_invocation(
         or bool(violations)
         or bool(workspace_guard is not None and workspace_guard.requires_human)
     )
-    patch_path: Path | None = None
-    diff_stats_path: Path | None = None
-    patch_error: str | None = None
-    if human_required:
-        try:
-            patch_path, diff_stats_path = _capture_failed_diff(
-                repository,
-                run_path,
-                run_record.baseline_sha,
-            )
-        except ImplementationError as error:
-            patch_error = str(error)
-
     return _FailedWritableAudit(
         safety_violations=tuple(violations),
         changed_files=changed_files,
-        patch_path=patch_path,
-        diff_stats_path=diff_stats_path,
-        patch_error=patch_error,
         workspace_guard=workspace_guard,
         human_required=human_required,
     )
@@ -729,27 +645,6 @@ def _workspace_changed_since_writable_attempt(
     if before is None or after_workspace is None:
         return True
     return not before.matches(after_workspace)
-
-
-def _capture_failed_diff(
-    repository: GitRepository,
-    run_dir: Path,
-    baseline_sha: str,
-) -> tuple[Path, Path]:
-    diffs_dir = run_dir / _DIFFS_DIR_NAME
-    patch_path = diffs_dir / _FAILED_IMPLEMENTATION_PATCH_FILE
-    stats_path = diffs_dir / _FAILED_IMPLEMENTATION_STATS_FILE
-    try:
-        diffs_dir.mkdir(parents=True, exist_ok=True)
-        patch = _diff_including_untracked(repository, baseline_sha)
-        stats = _diff_stats_including_untracked(repository, baseline_sha)
-        patch_path.write_text(patch, encoding="utf-8", newline="\n")
-        stats_path.write_text(stats, encoding="utf-8", newline="\n")
-    except (GitCommandError, OSError, ValueError) as error:
-        raise ImplementationError(
-            f"Could not capture failed implementation diff: {error}"
-        ) from error
-    return patch_path, stats_path
 
 
 def _failed_writable_message(
@@ -778,12 +673,6 @@ def _failed_writable_message(
         f"Git safety: {_format_failure_safety(audit.safety_violations)}",
         f"Changed files relative to baseline: {_format_files(audit.changed_files)}",
     ]
-    if audit.patch_path is not None:
-        rows.append(f"Baseline-relative failure patch: {audit.patch_path}")
-    if audit.diff_stats_path is not None:
-        rows.append(f"Failure diff stats: {audit.diff_stats_path}")
-    if audit.patch_error is not None:
-        rows.append(f"Failure patch capture error: {audit.patch_error}")
     if audit.workspace_guard is not None and audit.workspace_guard.requires_human:
         rows.append(
             writable_worker._format_writable_guard_stop(

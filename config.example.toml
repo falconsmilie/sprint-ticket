@@ -1,4 +1,5 @@
 # Documentation template only. Copy required project values into config.local.toml.
+# Point verification commands at the target repository's own environment.
 [project]
 name = "PhosPy"
 repo = "C:/Projects/phospy"
@@ -14,10 +15,10 @@ reasoning_effort = "xhigh"
 
 [[verification.commands]]
 name = "tests"
-argv = ["python", "-m", "pytest"]
+argv = ["C:/Projects/phospy/.venv/Scripts/python.exe", "-m", "pytest"]
 timeout_seconds = 1800
 
 [[verification.commands]]
 name = "typing"
-argv = ["pyright"]
+argv = ["C:/Projects/phospy/.venv/Scripts/python.exe", "-m", "pyright"]
 timeout_seconds = 1800

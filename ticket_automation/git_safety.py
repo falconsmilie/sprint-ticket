@@ -18,10 +18,6 @@ _WORKSPACE_SNAPSHOT_FORMAT = "ticket_automation.workspace_snapshot"
 _WORKSPACE_SNAPSHOT_SCHEMA_VERSION = 1
 
 
-class _WorkspaceInspectionError(RuntimeError):
-    """Raised when a complete workspace identity could not be captured."""
-
-
 @dataclass(frozen=True)
 class WorkspaceChange:
     name: str
@@ -448,30 +444,6 @@ def workspace_safety_changes(
                 )
             )
     return tuple(changes)
-
-
-def _workspace_fingerprint_path(patch_path: Path | str) -> Path:
-    path = Path(patch_path)
-    return path.with_suffix(".workspace.sha256")
-
-
-def _write_workspace_fingerprint(
-    path: Path | str,
-    snapshot: WorkspaceSnapshot,
-) -> None:
-    if not snapshot.inspection_complete:
-        raise _WorkspaceInspectionError(
-            "Cannot persist an incomplete workspace fingerprint: "
-            + "; ".join(snapshot.inspection_errors)
-        )
-    Path(path).write_text(snapshot.fingerprint + "\n", encoding="ascii", newline="\n")
-
-
-def _read_workspace_fingerprint(path: Path | str) -> str:
-    value = Path(path).read_text(encoding="ascii").strip()
-    if not _SHA256_RE.fullmatch(value):
-        raise ValueError("Workspace fingerprint must be a lowercase SHA-256 digest.")
-    return value
 
 
 def _file_sha256(path: Path) -> str:

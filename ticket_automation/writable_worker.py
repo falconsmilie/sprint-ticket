@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .attempts import AttemptRecord, update_attempt
 from .codex import (
     CodexExecution,
     CodexExecutionFailure,
@@ -16,14 +18,12 @@ from .codex import execute as execute_codex
 from .git import GitRepository
 from .git_safety import WorkspaceSnapshot
 from .workspace_guard import (
-    WORKSPACE_GUARD_DIR_NAME,
     WorkspaceEnvironmentSnapshot,
     WorkspaceGuardInspection,
     _compare_workspace_environment_change,
     _format_workspace_environment_inspection_failure,
     capture_workspace_environment_snapshot,
     format_workspace_hygiene_violation,
-    write_workspace_guard_inspection,
 )
 from .writable_attempts import (
     WritableAttempt,
@@ -61,6 +61,7 @@ def run_writable_codex(
     run_dir: Path | str,
     operation: str,
     phase: str,
+    attempt_record: AttemptRecord,
     prompt: str,
     output_schema: Path | str,
     artifact_directory: Path | str,
@@ -86,8 +87,8 @@ def run_writable_codex(
         point="before",
     )
     attempt = _capture_writable_attempt(
-        run_dir,
         operation=operation,
+        attempt_record=attempt_record,
         before_snapshot=before_workspace,
         before_error=before_error,
     )
@@ -101,8 +102,7 @@ def run_writable_codex(
         guard = _persist_guard_evidence_if_needed(
             attempt,
             guard,
-            run_dir=run_dir,
-            operation=operation,
+            execution=None,
         )
         return WritableCodexInvocation(
             attempt=attempt,
@@ -160,8 +160,7 @@ def run_writable_codex(
         guard = _persist_guard_evidence_if_needed(
             attempt,
             guard,
-            run_dir=run_dir,
-            operation=operation,
+            execution=execution,
         )
     return WritableCodexInvocation(
         attempt=attempt,
@@ -172,11 +171,6 @@ def run_writable_codex(
         failure=failure,
         invocation_permitted=True,
     )
-
-
-def _workspace_guard_artifact_path(run_dir: Path | str, *, operation: str) -> Path:
-    safe_operation = operation.replace("/", "-").replace("\\", "-")
-    return Path(run_dir) / WORKSPACE_GUARD_DIR_NAME / f"{safe_operation}.json"
 
 
 def _capture_environment_snapshot(
@@ -231,18 +225,37 @@ def _persist_guard_evidence_if_needed(
     attempt: WritableAttempt,
     inspection: WorkspaceGuardInspection,
     *,
-    run_dir: Path | str,
-    operation: str,
+    execution: CodexExecution | None,
 ) -> WorkspaceGuardInspection:
-    """Keep clean evidence in the writable record; artifact failures verbosely."""
+    """Keep workspace-guard evidence with the writable execution metadata."""
 
-    if inspection.requires_human:
-        inspection = replace(
-            inspection,
-            artifact_path=_workspace_guard_artifact_path(run_dir, operation=operation),
-        )
-        write_workspace_guard_inspection(inspection)
-    attempt.record_environment_guard(inspection)
+    path = (
+        attempt.record.artifact_directory / "execution.json"
+        if execution is None
+        else execution.execution_json_path
+    )
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"Could not update writable execution metadata: {error}"
+        ) from error
+    if not isinstance(data, dict):
+        raise TypeError("Writable execution metadata must be a JSON object.")
+    if execution is None:
+        data = {
+            "schema_version": 1,
+            "format": "ticket_automation.writable_execution",
+            "process_started": False,
+            **data,
+        }
+        attempt.record = update_attempt(attempt.record, execution_path="execution.json")
+    data["workspace_guard"] = inspection.to_dict()
+    path.write_text(
+        json.dumps(data, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
     return inspection
 
 

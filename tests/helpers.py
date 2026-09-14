@@ -57,6 +57,11 @@ def review_result() -> dict[str, object]:
 
 
 def emit_result(result: dict[str, object]) -> None:
+    if "--output-last-message" in sys.argv:
+        output_path = pathlib.Path(
+            sys.argv[sys.argv.index("--output-last-message") + 1]
+        )
+        output_path.write_text(json.dumps(result), encoding="utf-8")
     print(json.dumps({"type": "thread.started", "thread_id": "fake-thread"}))
     print(json.dumps({"type": "turn.started"}))
     print(
