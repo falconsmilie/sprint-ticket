@@ -467,6 +467,15 @@ def test_prompt_is_sent_over_stdin_and_uses_repository_cwd(tmp_path):
     assert runner.stdin == "# Ticket\n\nImplement it."
     assert runner.command is not None
     assert runner.command.cwd == repository
+    assert runner.command.environment is not None
+    scratch = Path(runner.command.environment["TEMP"])
+    assert runner.command.environment == {
+        "TEMP": str(scratch),
+        "TMP": str(scratch),
+        "TMPDIR": str(scratch),
+    }
+    assert not scratch.is_relative_to(repository)
+    assert not scratch.exists()
     assert execution.successful
 
 
@@ -544,7 +553,15 @@ def test_subprocess_runner_disables_shell_execution(monkeypatch, tmp_path):
     monkeypatch.setattr(codex_module.subprocess, "run", fake_run)
 
     result = SubprocessCodexRunner().run(
-        CodexCommand(argv=("codex", "exec", "-"), cwd=tmp_path),
+        CodexCommand(
+            argv=("codex", "exec", "-"),
+            cwd=tmp_path,
+            environment={
+                "TEMP": "C:/scratch",
+                "TMP": "C:/scratch",
+                "TMPDIR": "C:/scratch",
+            },
+        ),
         stdin="prompt",
         timeout_seconds=10,
     )
@@ -554,7 +571,42 @@ def test_subprocess_runner_disables_shell_execution(monkeypatch, tmp_path):
     assert isinstance(captured["kwargs"], dict)
     assert captured["kwargs"]["cwd"] == tmp_path
     assert captured["kwargs"]["input"] == b"prompt"
+    environment = captured["kwargs"]["env"]
+    assert isinstance(environment, dict)
+    assert environment["TEMP"] == "C:/scratch"
+    assert environment["TMP"] == "C:/scratch"
+    assert environment["TMPDIR"] == "C:/scratch"
     assert captured["kwargs"]["shell"] is False
+
+
+def test_executor_rejects_a_scratch_directory_inside_the_repository(
+    monkeypatch, tmp_path
+):
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    scratch = repository / "pytest-tmp"
+
+    def create_repository_scratch(*, prefix):
+        del prefix
+        scratch.mkdir()
+        return str(scratch)
+
+    monkeypatch.setattr(codex_module.tempfile, "mkdtemp", create_repository_scratch)
+    runner = FakeRunner(successful_process(), json.dumps(implementation_result()))
+
+    with pytest.raises(CodexExecutionFailure, match="outside the target repository"):
+        execute(
+            prompt="implement",
+            repo_path=repository,
+            sandbox=Sandbox.WORKSPACE_WRITE,
+            output_schema=tmp_path / "implementation.schema.json",
+            artifact_directory=tmp_path / "artifacts",
+            executable=EXISTING_EXECUTABLE,
+            runner=runner,
+        )
+
+    assert runner.calls == 0
+    assert not scratch.exists()
 
 
 def test_invalid_execution_config_fails_before_runner_starts(tmp_path):

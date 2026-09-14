@@ -48,6 +48,12 @@ Do not install project dependencies globally or mutate unrelated machine-level P
 Do not modify `.gitignore` merely to hide local validation environments or generated dependency trees.
 If required validation cannot be performed using the repository's existing environment/tooling, run only the safe validation that is available and report the limitation. Return `BLOCKED` when the missing environment prevents safe completion.
 
+## Temporary Validation Files
+
+The runner sets `TEMP`, `TMP`, and `TMPDIR` to a per-operation scratch directory outside the target repository. Keep those values and use that location for temporary validation output.
+
+Do not create pytest temporary directories, including `pytest --basetemp`, anywhere inside the target repository. If a test command requires `--basetemp`, place it under the runner-provided temporary directory.
+
 ## Repository Context
 
 {{REPOSITORY_CONTEXT}}

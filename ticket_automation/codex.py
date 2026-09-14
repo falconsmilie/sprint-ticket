@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -111,6 +114,7 @@ _StructuredResult: TypeAlias = _ImplementationResult | _ReviewResult
 class CodexCommand:
     argv: tuple[str, ...]
     cwd: Path
+    environment: Mapping[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -133,6 +137,10 @@ class CodexProcessTimedOut(TimeoutError):
             f"Codex process timed out after {result.timeout_seconds:g} seconds."
         )
         self.result = result
+
+
+class CodexScratchDirectoryError(RuntimeError):
+    pass
 
 
 class CodexProcessRunner(Protocol):
@@ -203,6 +211,7 @@ class SubprocessCodexRunner:
             completed = subprocess.run(
                 command.argv,
                 cwd=command.cwd,
+                env=_process_environment(command.environment),
                 input=stdin.encode("utf-8"),
                 capture_output=True,
                 text=False,
@@ -347,10 +356,33 @@ class CodexExecutor:
         )
 
         try:
-            process = self.runner.run(
-                command,
-                stdin=prompt,
-                timeout_seconds=self.timeout_seconds,
+            with _external_scratch_environment(repo_path) as scratch_environment:
+                command = CodexCommand(
+                    argv=command.argv,
+                    cwd=command.cwd,
+                    environment=scratch_environment,
+                )
+                process = self.runner.run(
+                    command,
+                    stdin=prompt,
+                    timeout_seconds=self.timeout_seconds,
+                )
+        except CodexScratchDirectoryError as error:
+            artifact_paths.events.write_text("", encoding="utf-8", newline="\n")
+            artifact_paths.stderr.write_text(
+                f"{error}\n", encoding="utf-8", newline="\n"
+            )
+            return _fail(
+                kind=CodexFailureKind.PROCESS_START_FAILED,
+                message=str(error),
+                command=command,
+                sandbox=sandbox,
+                execution_config=self.execution_config,
+                output_schema=output_schema,
+                artifacts=artifact_paths,
+                started_at=start,
+                process_started=False,
+                exit_code=None,
             )
         except FileNotFoundError as error:
             artifact_paths.events.write_text("", encoding="utf-8", newline="\n")
@@ -633,6 +665,45 @@ def _build_codex_command(
         ),
         cwd=Path(repo_path),
     )
+
+
+def _process_environment(
+    overrides: Mapping[str, str] | None,
+) -> dict[str, str]:
+    environment = os.environ.copy()
+    if overrides is not None:
+        environment.update(overrides)
+    return environment
+
+
+@contextmanager
+def _external_scratch_environment(repo_path: Path) -> Iterator[dict[str, str]]:
+    """Provide Codex an external temporary root without weakening repository safety."""
+
+    try:
+        scratch_path = Path(
+            tempfile.mkdtemp(prefix="ticket-automation-codex-")
+        ).resolve()
+    except OSError as error:
+        raise CodexScratchDirectoryError(
+            f"Could not create an external Codex scratch directory: {error}"
+        ) from error
+
+    try:
+        repository_path = Path(repo_path).resolve()
+        try:
+            scratch_path.relative_to(repository_path)
+        except ValueError:
+            pass
+        else:
+            raise CodexScratchDirectoryError(
+                "Codex scratch directory must be outside the target repository: "
+                f"{scratch_path}"
+            )
+        scratch = str(scratch_path)
+        yield {"TEMP": scratch, "TMP": scratch, "TMPDIR": scratch}
+    finally:
+        shutil.rmtree(scratch_path, ignore_errors=True)
 
 
 def _effective_execution_config(
