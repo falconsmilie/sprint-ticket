@@ -45,6 +45,7 @@ from .git_safety import (
 )
 from .models import StageOutcome, WorkflowState
 from .process_output import decode_human_output
+from .resolved_config import config_from_resolved_run_config
 from .runs import (
     BASELINE_RECORD_FILE,
     RUN_RECORD_FILE,
@@ -458,6 +459,8 @@ def run_verification_stage(
     run_path = Path(run_dir)
     run_record_path = run_path / RUN_RECORD_FILE
     run_record = load_run_record(run_record_path)
+    # Verification commands and timeouts are fixed when the run is created.
+    config = config_from_resolved_run_config(run_record.resolved_config)
     if run_record.state != WorkflowState.VERIFYING:
         raise VerificationError(
             "Verification requires run state VERIFYING; "

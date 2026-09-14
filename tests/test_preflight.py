@@ -144,3 +144,19 @@ def test_codex_cli_check_accepts_path_resolved_bare_command(monkeypatch, tmp_pat
 
     assert result.passed
     assert check(result, "Codex CLI").status == PreflightStatus.PASS
+
+
+@pytest.mark.skipif(
+    GIT is None, reason="git executable is required for preflight tests"
+)
+def test_target_codex_project_configuration_is_rejected(tmp_path):
+    repo = create_git_repo(tmp_path / "repo")
+    project_config = repo / ".codex" / "config.toml"
+    project_config.parent.mkdir()
+    project_config.write_text("model = 'target-controlled'\n", encoding="utf-8")
+
+    result = run_preflight(make_config(repo))
+
+    assert not result.passed
+    assert check(result, "Codex project configuration").status == PreflightStatus.FAIL
+    assert ".codex/config.toml" in check(result, "Codex project configuration").message

@@ -74,6 +74,14 @@ def emit_result(result: dict[str, object]) -> None:
     print(json.dumps({"type": "turn.completed"}))
 
 
+if "--version" in sys.argv:
+    print("fake-codex 1.0")
+    raise SystemExit(0)
+
+if sys.argv[1:] == ["exec", "--help"]:
+    print("--ephemeral  Run without persisting session files to disk")
+    raise SystemExit(0)
+
 prompt = sys.stdin.read()
 record_path = os.environ.get("TA_FAKE_CODEX_RECORD")
 if record_path:
@@ -210,12 +218,16 @@ def make_config(
     repo: Path,
     *,
     protected_branches: tuple[str, ...] = ("main", "master"),
-    codex_executable: str = sys.executable,
+    codex_executable: str | None = None,
     codex_model: str = DEFAULT_CODEX_MODEL,
     codex_reasoning_effort: str = DEFAULT_CODEX_REASONING_EFFORT,
     max_correction_rounds: int = 1,
     verification_commands: tuple[VerificationCommand, ...] | None = None,
 ) -> AppConfig:
+    if codex_executable is None:
+        codex_executable = str(
+            write_fake_codex_executable(repo.parent / "fake-codex-bin")
+        )
     executable = (
         Path(codex_executable).as_posix()
         if os.path.isabs(codex_executable)
@@ -230,8 +242,6 @@ def make_config(
         runner=RunnerSettings(max_correction_rounds=max_correction_rounds),
         codex=CodexSettings(
             executable=executable,
-            implementation_sandbox="workspace-write",
-            review_sandbox="read-only",
             model=codex_model,
             reasoning_effort=codex_reasoning_effort,
         ),
@@ -246,6 +256,7 @@ def make_config(
             ),
         ),
         source_files=(),
+        configuration_directory=repo.parent,
     )
 
 
@@ -321,8 +332,6 @@ def write_preflight_config(
         f"executable = {json.dumps(executable)}",
         f"model = {json.dumps(DEFAULT_CODEX_MODEL)}",
         f"reasoning_effort = {json.dumps(DEFAULT_CODEX_REASONING_EFFORT)}",
-        'implementation_sandbox = "workspace-write"',
-        'review_sandbox = "read-only"',
     ]
     for command in commands:
         lines.extend(
@@ -334,7 +343,7 @@ def write_preflight_config(
                 f"timeout_seconds = {command.timeout_seconds}",
             ]
         )
-    config_dir.joinpath("config.example.toml").write_text(
+    config_dir.joinpath("config.local.toml").write_text(
         "\n".join(lines),
         encoding="utf-8",
     )

@@ -13,6 +13,7 @@ from .config import (
 )
 from .locking import RepositoryLockError, active_repository_locks
 from .preflight import format_preflight_result, run_preflight
+from .resolved_config import config_from_resolved_run_config
 from .runs import (
     RUNS_DIR_NAME,
     RunError,
@@ -20,6 +21,7 @@ from .runs import (
     TicketInputError,
     format_status,
     list_run_records,
+    load_run_record,
 )
 from .workflow import (
     format_lifecycle_result,
@@ -37,7 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--config-dir",
         type=Path,
         default=Path.cwd(),
-        help="Directory containing config.example.toml and optional config.local.toml.",
+        help="Directory containing config.local.toml and run records.",
     )
 
     subparsers = parser.add_subparsers(dest="command")
@@ -163,11 +165,11 @@ def _handle_status(args: argparse.Namespace) -> int:
 
 
 def _handle_resume(args: argparse.Namespace) -> int:
-    config = load_config(args.config_dir)
     runs_dir = args.config_dir / RUNS_DIR_NAME
     try:
+        run_record = load_run_record(runs_dir / args.run_id / "run.json")
         result = resume_ticket_lifecycle(
-            config,
+            config_from_resolved_run_config(run_record.resolved_config),
             args.run_id,
             runs_dir=runs_dir,
         )

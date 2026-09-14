@@ -14,9 +14,6 @@ from typing import Any
 
 from ._verification_artifacts import _verification_commands_fingerprint
 from .config import (
-    DEFAULT_CODEX_MODEL,
-    DEFAULT_CODEX_REASONING_EFFORT,
-    SUPPORTED_CODEX_REASONING_EFFORTS,
     AppConfig,
     CodexExecutionSettings,
 )
@@ -29,8 +26,13 @@ from .models import (
     _validate_workflow_transition,
 )
 from .preflight import PreflightResult, run_preflight
+from .resolved_config import (
+    ResolvedRunConfig,
+    ResolvedRunConfigError,
+    resolve_run_config,
+)
 
-RUN_SCHEMA_VERSION = 3
+RUN_SCHEMA_VERSION = 4
 BASELINE_SCHEMA_VERSION = 2
 RUN_RECORD_FORMAT = "ticket_automation.run"
 BASELINE_RECORD_FORMAT = "ticket_automation.baseline"
@@ -162,20 +164,30 @@ class RunRecord:
     ticket_id: str
     original_ticket_path: str
     run_ticket_copy_path: str
-    target_repository_path: str
     state: WorkflowState
     starting_branch: str
     baseline_sha: str
     current_correction_round: int
-    max_correction_rounds: int
     current_review_round: int
-    codex: CodexExecutionSettings
+    resolved_config: ResolvedRunConfig
     terminal_reason: str | None
     stop_reason: StopReason | None
     created_timestamp: str
     updated_timestamp: str
     schema_version: int = RUN_SCHEMA_VERSION
     format: str = RUN_RECORD_FORMAT
+
+    @property
+    def target_repository_path(self) -> str:
+        return self.resolved_config.target_repository_path
+
+    @property
+    def max_correction_rounds(self) -> int:
+        return self.resolved_config.max_correction_rounds
+
+    @property
+    def codex(self) -> CodexExecutionSettings:
+        return self.resolved_config.codex_execution
 
     def __post_init__(self) -> None:
         """Keep terminal stop evidence inseparable from terminal failure state."""
@@ -236,17 +248,12 @@ class RunRecord:
             "ticket_id": self.ticket_id,
             "original_ticket_path": self.original_ticket_path,
             "run_ticket_copy_path": self.run_ticket_copy_path,
-            "target_repository_path": self.target_repository_path,
             "state": self.state.value,
             "starting_branch": self.starting_branch,
             "baseline_sha": self.baseline_sha,
             "current_correction_round": self.current_correction_round,
-            "max_correction_rounds": self.max_correction_rounds,
             "current_review_round": self.current_review_round,
-            "codex": {
-                "model": self.codex.model,
-                "reasoning_effort": self.codex.reasoning_effort,
-            },
+            "resolved_config": self.resolved_config.to_dict(),
             "terminal_reason": self.terminal_reason,
             "stop_reason": (
                 None
@@ -277,7 +284,6 @@ class RunRecord:
                 ticket_id=_require_string(data, "ticket_id"),
                 original_ticket_path=_require_string(data, "original_ticket_path"),
                 run_ticket_copy_path=_require_string(data, "run_ticket_copy_path"),
-                target_repository_path=_require_string(data, "target_repository_path"),
                 state=_require_workflow_state(data, "state"),
                 starting_branch=_require_string(data, "starting_branch"),
                 baseline_sha=_require_string(data, "baseline_sha"),
@@ -285,20 +291,21 @@ class RunRecord:
                     data,
                     "current_correction_round",
                 ),
-                max_correction_rounds=_require_int(data, "max_correction_rounds"),
                 current_review_round=_optional_non_negative_int(
                     data,
                     "current_review_round",
                     default=0,
                 ),
-                codex=_optional_codex_execution_settings(data),
+                resolved_config=ResolvedRunConfig.from_dict(
+                    data.get("resolved_config")
+                ),
                 terminal_reason=_optional_nullable_string(data, "terminal_reason"),
                 stop_reason=_optional_stop_reason(data),
                 created_timestamp=_require_string(data, "created_timestamp"),
                 updated_timestamp=_require_string(data, "updated_timestamp"),
             )
-        except (TypeError, ValueError) as error:
-            raise RunError(f"Invalid terminal stop record: {error}") from error
+        except (TypeError, ValueError, ResolvedRunConfigError) as error:
+            raise RunError(f"Invalid run record: {error}") from error
 
 
 @dataclass(frozen=True)
@@ -331,6 +338,15 @@ def create_run_snapshot(
             config.verification.commands
         ),
     )
+    try:
+        resolved_config = resolve_run_config(
+            config,
+            target_repository_path=baseline_record.repository_path,
+        )
+    except ResolvedRunConfigError as error:
+        raise RunError(
+            f"Could not resolve immutable run configuration: {error}"
+        ) from error
     ticket_id = sanitize_ticket_id(source_ticket.path.stem)
     run_id, run_dir = _reserve_run_directory(Path(runs_dir), timestamp, ticket_id)
     run_ticket_path = run_dir / RUN_TICKET_FILE
@@ -343,14 +359,12 @@ def create_run_snapshot(
             ticket_id=ticket_id,
             original_ticket_path=str(source_ticket.path.resolve()),
             run_ticket_copy_path=str(run_ticket_path.resolve()),
-            target_repository_path=baseline_record.repository_path,
             state=WorkflowState.PREPARING,
             starting_branch=baseline_record.branch,
             baseline_sha=baseline_record.head_sha,
             current_correction_round=0,
-            max_correction_rounds=config.runner.max_correction_rounds,
             current_review_round=0,
-            codex=config.codex.execution,
+            resolved_config=resolved_config,
             terminal_reason=None,
             stop_reason=None,
             created_timestamp=timestamp,
@@ -649,30 +663,6 @@ def _optional_stop_reason(data: dict[str, Any]) -> StopReason | None:
     if not isinstance(retryable, bool):
         raise RunError("Run record field must be a boolean: stop_reason.retryable")
     return StopReason(category=category, message=message, retryable=retryable)
-
-
-def _optional_codex_execution_settings(
-    data: dict[str, Any],
-) -> CodexExecutionSettings:
-    value = data.get("codex")
-    if value is None:
-        return CodexExecutionSettings(
-            model=DEFAULT_CODEX_MODEL,
-            reasoning_effort=DEFAULT_CODEX_REASONING_EFFORT,
-        )
-    if not isinstance(value, dict):
-        raise RunError("Run record field must be an object: codex")
-    model = _require_nested_string(value, "codex", "model")
-    reasoning_effort = _require_nested_string(value, "codex", "reasoning_effort")
-    if reasoning_effort not in SUPPORTED_CODEX_REASONING_EFFORTS:
-        supported = ", ".join(sorted(SUPPORTED_CODEX_REASONING_EFFORTS))
-        raise RunError(
-            f"Run record field codex.reasoning_effort must be one of: {supported}."
-        )
-    return CodexExecutionSettings(
-        model=model,
-        reasoning_effort=reasoning_effort,
-    )
 
 
 def _require_nested_string(data: dict[str, Any], parent: str, key: str) -> str:

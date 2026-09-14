@@ -7,7 +7,6 @@ import pytest
 
 from tests.helpers import (
     GIT,
-    copy_example_config,
     create_git_repo,
     run_cli,
     run_git,
@@ -29,14 +28,30 @@ def test_cli_help_succeeds(tmp_path):
 
 
 def test_cli_config_output(tmp_path):
-    copy_example_config(tmp_path)
+    tmp_path.joinpath("config.local.toml").write_text(
+        """
+[project]
+name = "Configured project"
+repo = "C:/Projects/configured-project"
+protected_branches = ["main"]
+
+[codex]
+executable = "codex"
+
+[[verification.commands]]
+name = "tests"
+argv = ["python", "-m", "pytest"]
+timeout_seconds = 1800
+""".strip(),
+        encoding="utf-8",
+    )
 
     result = run_cli("config", cwd=tmp_path)
 
     assert result.returncode == 0
     assert "TicketAutomation configuration" in result.stdout
-    assert "PhosPy" in result.stdout
-    assert "C:\\Projects\\phospy" in result.stdout
+    assert "Configured project" in result.stdout
+    assert "C:\\Projects\\configured-project" in result.stdout
     assert "tests (1800s): python -m pytest" in result.stdout
 
 
@@ -120,10 +135,8 @@ def test_cli_run_invokes_fake_codex_and_runs_verification(tmp_path, monkeypatch)
     ] == ['model_reasoning_effort="high"', 'model_reasoning_effort="high"']
     run_record_path = next(config_dir.joinpath("runs").glob("*/run.json"))
     run_record = json.loads(run_record_path.read_text(encoding="utf-8"))
-    assert run_record["codex"] == {
-        "model": "cli-model",
-        "reasoning_effort": "high",
-    }
+    assert run_record["resolved_config"]["codex"]["model"] == "cli-model"
+    assert run_record["resolved_config"]["codex"]["reasoning_effort"] == "high"
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for run CLI tests")

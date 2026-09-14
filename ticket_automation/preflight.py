@@ -83,7 +83,13 @@ def run_preflight(config: AppConfig) -> PreflightResult:
         if branch is not None:
             _check_protected_branch(branch, config.project.protected_branches, checks)
 
-    _check_executable("Codex CLI", config.codex.executable, checks, cwd=repo_path)
+    _check_target_codex_configuration(repo_path, checks)
+    _check_executable(
+        "Codex CLI",
+        config.codex.executable,
+        checks,
+        config_dir=config.configuration_directory,
+    )
     for command in config.verification.commands:
         _check_verification_command(command, checks, cwd=repo_path)
 
@@ -180,7 +186,12 @@ def _check_verification_command(
     cwd: Path,
 ) -> None:
     executable = command.argv[0]
-    _check_executable(f"Verification {command.name}", executable, checks, cwd=cwd)
+    _check_executable(
+        f"Verification {command.name}",
+        executable,
+        checks,
+        config_dir=cwd,
+    )
 
 
 def _check_executable(
@@ -188,12 +199,33 @@ def _check_executable(
     executable: str,
     checks: list[PreflightCheck],
     *,
-    cwd: Path,
+    config_dir: Path,
 ) -> None:
-    if executable_resolution.resolve_executable(executable, cwd=cwd) is not None:
+    if (
+        executable_resolution.resolve_executable(
+            executable,
+            config_dir=config_dir,
+        )
+        is not None
+    ):
         checks.append(_pass(name))
         return
     checks.append(_fail(name, f"Executable not found: {executable}"))
+
+
+def _check_target_codex_configuration(
+    repo_path: Path,
+    checks: list[PreflightCheck],
+) -> None:
+    project_config = repo_path / ".codex" / "config.toml"
+    if project_config.is_file():
+        checks.append(
+            _fail(
+                "Codex project configuration",
+                "Target repository contains .codex/config.toml; V1 rejects it "
+                "because its execution policy cannot be isolated reliably.",
+            )
+        )
 
 
 def _pass(name: str, message: str = "") -> PreflightCheck:

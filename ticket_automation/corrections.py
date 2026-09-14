@@ -40,6 +40,7 @@ from .git_safety import (
     workspace_safety_changes,
 )
 from .models import StageOutcome, StopCategory, WorkflowState
+from .resolved_config import config_from_resolved_run_config
 from .review import (
     _AUTOMATIC_CORRECTION_SCOPE_RELATIONS,
     _REVIEW_FINDING_SCOPE_RELATIONS,
@@ -201,6 +202,8 @@ def run_correction_stage(
 ) -> CorrectionStageResult:
     run_path = Path(run_dir)
     run_record = load_run_record(run_path / RUN_RECORD_FILE)
+    # Corrective writes use the same frozen policy as the initial implementation.
+    config = config_from_resolved_run_config(run_record.resolved_config)
     if run_record.state != WorkflowState.CORRECTING:
         raise CorrectionError(
             f"Correction requires run state CORRECTING; found {run_record.state.value}."

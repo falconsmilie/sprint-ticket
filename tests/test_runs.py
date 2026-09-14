@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -8,7 +9,9 @@ import pytest
 
 import ticket_automation.runs as runs_module
 from tests.helpers import GIT, create_git_repo, make_config, run_git
+from ticket_automation.config import VerificationCommand
 from ticket_automation.models import StopCategory, StopReason, WorkflowState
+from ticket_automation.resolved_config import RESOLVED_RUN_CONFIG_SCHEMA_VERSION
 from ticket_automation.runs import (
     BASELINE_RECORD_FORMAT,
     RUN_RECORD_FORMAT,
@@ -372,7 +375,7 @@ def test_record_schema_metadata_uses_current_supported_formats(tmp_path):
         result.run_dir.joinpath("baseline.json").read_text(encoding="utf-8")
     )
 
-    assert run_data["schema_version"] == 3
+    assert run_data["schema_version"] == 4
     assert run_data["format"] == RUN_RECORD_FORMAT
     assert baseline_data["schema_version"] == 2
     assert baseline_data["format"] == BASELINE_RECORD_FORMAT
@@ -393,7 +396,7 @@ def test_correction_round_and_maximum_are_persisted(tmp_path):
     data = json.loads(result.run_dir.joinpath("run.json").read_text(encoding="utf-8"))
 
     assert data["current_correction_round"] == 0
-    assert data["max_correction_rounds"] == 7
+    assert data["resolved_config"]["max_correction_rounds"] == 7
     assert data["current_review_round"] == 0
     assert "last_completed_state" not in data
     assert data["terminal_reason"] is None
@@ -418,16 +421,140 @@ def test_codex_execution_config_is_persisted_in_run_record(tmp_path):
     )
     data = json.loads(result.run_dir.joinpath("run.json").read_text(encoding="utf-8"))
 
-    assert data["codex"] == {
-        "model": "configured-model",
-        "reasoning_effort": "high",
-    }
+    assert data["resolved_config"]["codex"]["model"] == "configured-model"
+    assert data["resolved_config"]["codex"]["reasoning_effort"] == "high"
     assert load_run_record(result.run_dir / "run.json").codex.model == (
         "configured-model"
     )
     assert load_run_record(result.run_dir / "run.json").codex.reasoning_effort == (
         "high"
     )
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
+def test_run_record_persists_one_complete_resolved_execution_snapshot(tmp_path):
+    repo = create_git_repo(tmp_path / "repo")
+    ticket = tmp_path / "TA-ARCH-007.md"
+    ticket.write_text("# Ticket\n", encoding="utf-8")
+    command = VerificationCommand(
+        name="targeted tests",
+        argv=("python", "-m", "pytest", "tests/test_config.py"),
+        timeout_seconds=91,
+    )
+
+    result = create_run_snapshot(
+        make_config(
+            repo,
+            protected_branches=("main", "release"),
+            codex_model="resolved-model",
+            codex_reasoning_effort="high",
+            max_correction_rounds=2,
+            verification_commands=(command,),
+        ),
+        ticket,
+        runs_dir=tmp_path / "runs",
+        clock=fixed_clock,
+    )
+    data = json.loads(result.run_dir.joinpath("run.json").read_text(encoding="utf-8"))
+    resolved = data["resolved_config"]
+
+    assert set(data) >= {"resolved_config", "run_id", "state"}
+    assert "codex" not in data
+    assert "max_correction_rounds" not in data
+    assert resolved["target_repository_path"] == str(repo.resolve())
+    assert resolved["protected_branches"] == ["main", "release"]
+    assert resolved["codex"]["model"] == "resolved-model"
+    assert resolved["codex"]["reasoning_effort"] == "high"
+    assert Path(resolved["codex"]["executable"]).is_absolute()
+    assert resolved["codex"]["cli_version"]
+    assert resolved["codex"]["ephemeral"] is True
+    assert resolved["sandbox_policy"] == {
+        "implementation": "workspace-write",
+        "review": "read-only",
+    }
+    assert resolved["verification"]["commands"] == [
+        {
+            "name": "targeted tests",
+            "argv": ["python", "-m", "pytest", "tests/test_config.py"],
+            "timeout_seconds": 91,
+        }
+    ]
+    assert resolved["max_correction_rounds"] == 2
+    assert resolved["ticket_automation"]["version"]
+    assert resolved["prompt_schema_versions"]
+    assert all(
+        isinstance(identifier, str) and isinstance(digest, str) and len(digest) == 64
+        for identifier, digest in resolved["prompt_schema_versions"].items()
+    )
+    loaded = load_run_record(result.run_dir / "run.json")
+    assert loaded.resolved_config.runtime_compatibility_problem() is None
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
+def test_snapshot_rejects_executable_without_ephemeral_support(tmp_path):
+    repo = create_git_repo(tmp_path / "repo")
+    ticket = tmp_path / "TA-ARCH-007.md"
+    ticket.write_text("# Ticket\n", encoding="utf-8")
+
+    with pytest.raises(RunError, match="does not support required --ephemeral"):
+        create_run_snapshot(
+            make_config(repo, codex_executable=sys.executable),
+            ticket,
+            runs_dir=tmp_path / "runs",
+            clock=fixed_clock,
+        )
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda data: data.pop("resolved_config"), "resolved_config must be an object"),
+        (
+            lambda data: data["resolved_config"]["codex"].update(
+                {"reasoning_effort": "unsupported"}
+            ),
+            "Codex execution settings are invalid",
+        ),
+        (
+            lambda data: data["resolved_config"]["codex"].update({"ephemeral": False}),
+            "requires ephemeral",
+        ),
+        (
+            lambda data: data["resolved_config"]["sandbox_policy"].update(
+                {"implementation": "read-only"}
+            ),
+            "implementation sandbox is incompatible",
+        ),
+        (
+            lambda data: data["resolved_config"]["codex"].update(
+                {"executable": "target/bin/codex"}
+            ),
+            "codex.executable must be absolute",
+        ),
+    ],
+)
+def test_run_record_rejects_missing_or_incompatible_resolved_config(
+    tmp_path,
+    mutate,
+    message,
+):
+    repo = create_git_repo(tmp_path / "repo")
+    ticket = tmp_path / "TA-ARCH-007.md"
+    ticket.write_text("# Ticket\n", encoding="utf-8")
+    result = create_run_snapshot(
+        make_config(repo),
+        ticket,
+        runs_dir=tmp_path / "runs",
+        clock=fixed_clock,
+    )
+    record_path = result.run_dir / "run.json"
+    data = json.loads(record_path.read_text(encoding="utf-8"))
+    mutate(data)
+    record_path.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(RunError, match=message):
+        load_run_record(record_path)
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
@@ -673,14 +800,12 @@ def trusted_run_record(state: WorkflowState) -> RunRecord:
             "ticket_id": "TA-ARCH-001",
             "original_ticket_path": "ticket.md",
             "run_ticket_copy_path": "runs/trusted-run/ticket.md",
-            "target_repository_path": ".",
             "state": state.value,
             "starting_branch": "feature/state-machine",
             "baseline_sha": "abc123",
             "current_correction_round": 0,
-            "max_correction_rounds": 3,
             "current_review_round": 0,
-            "codex": {"model": "test-model", "reasoning_effort": "high"},
+            "resolved_config": trusted_resolved_config(),
             "terminal_reason": None if stop_reason is None else stop_reason.message,
             "stop_reason": (
                 None
@@ -695,6 +820,48 @@ def trusted_run_record(state: WorkflowState) -> RunRecord:
             "updated_timestamp": "2026-09-11T13:05:12Z",
         }
     )
+
+
+def trusted_resolved_config() -> dict[str, object]:
+    digest = "0" * 64
+    return {
+        "schema_version": RESOLVED_RUN_CONFIG_SCHEMA_VERSION,
+        "target_repository_path": "C:/trusted/repository",
+        "protected_branches": ["main"],
+        "codex": {
+            "model": "test-model",
+            "reasoning_effort": "high",
+            "executable": "C:/trusted/codex",
+            "cli_version": "test-codex 1.0",
+            "ephemeral": True,
+        },
+        "sandbox_policy": {
+            "implementation": "workspace-write",
+            "review": "read-only",
+        },
+        "verification": {
+            "commands": [
+                {
+                    "name": "tests",
+                    "argv": ["python", "-m", "pytest"],
+                    "timeout_seconds": 1800,
+                }
+            ]
+        },
+        "max_correction_rounds": 3,
+        "ticket_automation": {
+            "package": "ticket-automation",
+            "version": "0.1.0",
+            "git_sha": None,
+        },
+        "prompt_schema_versions": {
+            "implementation_prompt": digest,
+            "correction_prompt": digest,
+            "review_prompt": digest,
+            "implementation_result_schema": digest,
+            "review_result_schema": digest,
+        },
+    }
 
 
 def terminal_stop_reason(state: WorkflowState) -> StopReason | None:

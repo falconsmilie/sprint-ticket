@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,6 +13,7 @@ from tests.helpers import (
     GIT,
     create_git_repo,
     make_config,
+    write_path_executable,
 )
 from tests.helpers import create_trusted_prepared_run as create_run_snapshot
 from ticket_automation.config import VerificationCommand
@@ -89,9 +91,8 @@ class TimeoutRunner:
     GIT is None, reason="git executable is required for verification tests"
 )
 def test_one_passing_command_moves_run_to_verify_and_writes_round_zero(tmp_path):
-    repo, run_dir = implementation_ready_run(tmp_path)
-    config = make_config(
-        repo,
+    repo, run_dir, config = implementation_ready_run(
+        tmp_path,
         verification_commands=(python_gate("tests", "print('verification passed')"),),
     )
 
@@ -127,7 +128,7 @@ def test_one_passing_command_moves_run_to_verify_and_writes_round_zero(tmp_path)
     ],
 )
 def test_verification_rejects_untrusted_starting_states(tmp_path, state):
-    repo, run_dir = implementation_ready_run(tmp_path)
+    _repo, run_dir, config = implementation_ready_run(tmp_path)
     run_record_path = run_dir / "run.json"
     stop_reason = (
         StopReason(
@@ -148,16 +149,15 @@ def test_verification_rejects_untrusted_starting_states(tmp_path, state):
     save_run_record(run_record, run_record_path)
 
     with pytest.raises(VerificationError, match="requires run state VERIFYING"):
-        run_verification_stage(make_config(repo), run_dir)
+        run_verification_stage(config, run_dir)
 
 
 @pytest.mark.skipif(
     GIT is None, reason="git executable is required for verification tests"
 )
 def test_multiple_passing_commands_all_run(tmp_path):
-    repo, run_dir = implementation_ready_run(tmp_path)
-    config = make_config(
-        repo,
+    _repo, run_dir, config = implementation_ready_run(
+        tmp_path,
         verification_commands=(
             python_gate("tests", "print('tests pass')"),
             python_gate("typing", "print('typing pass')"),
@@ -193,14 +193,16 @@ def test_failing_gates_move_run_to_correct_and_preserve_all_failures(
     failing_indexes,
     expected_failed,
 ):
-    repo, run_dir = implementation_ready_run(tmp_path)
     commands = tuple(
         failing_gate(name, exit_code=index + 2)
         if index in failing_indexes
         else python_gate(name, "print('pass')")
         for index, name in enumerate(("first", "second", "third"))
     )
-    config = make_config(repo, verification_commands=commands)
+    _repo, run_dir, config = implementation_ready_run(
+        tmp_path,
+        verification_commands=commands,
+    )
 
     result = run_verification_stage(config, run_dir)
 
@@ -224,13 +226,12 @@ def test_failing_gates_move_run_to_correct_and_preserve_all_failures(
     GIT is None, reason="git executable is required for verification tests"
 )
 def test_command_timeout_is_an_error_and_preserves_partial_output(tmp_path):
-    repo, run_dir = implementation_ready_run(tmp_path)
-    config = make_config(
-        repo,
+    _repo, run_dir, config = implementation_ready_run(
+        tmp_path,
         verification_commands=(
             VerificationCommand(
                 name="slow",
-                argv=("slow-tool",),
+                argv=(sys.executable, "-c", "raise SystemExit(0)"),
                 timeout_seconds=3,
             ),
         ),
@@ -254,9 +255,8 @@ def test_command_timeout_is_an_error_and_preserves_partial_output(tmp_path):
     GIT is None, reason="git executable is required for verification tests"
 )
 def test_passing_command_that_mutates_worktree_becomes_human_required(tmp_path):
-    repo, run_dir = implementation_ready_run(tmp_path)
-    config = make_config(
-        repo,
+    _repo, run_dir, config = implementation_ready_run(
+        tmp_path,
         verification_commands=(
             python_gate(
                 "mutating-pass",
@@ -287,17 +287,18 @@ def test_passing_command_that_mutates_worktree_becomes_human_required(tmp_path):
     GIT is None, reason="git executable is required for verification tests"
 )
 def test_executable_unavailable_is_an_error_not_a_correction_reason(tmp_path):
-    repo, run_dir = implementation_ready_run(tmp_path)
-    config = make_config(
-        repo,
+    unavailable = write_path_executable(tmp_path / "missing-bin")
+    _repo, run_dir, config = implementation_ready_run(
+        tmp_path,
         verification_commands=(
             VerificationCommand(
                 name="missing",
-                argv=("ticket-automation-missing-verifier-006",),
+                argv=(str(unavailable),),
                 timeout_seconds=1800,
             ),
         ),
     )
+    unavailable.unlink()
 
     result = run_verification_stage(config, run_dir)
 
@@ -313,9 +314,8 @@ def test_executable_unavailable_is_an_error_not_a_correction_reason(tmp_path):
     GIT is None, reason="git executable is required for verification tests"
 )
 def test_stdout_and_stderr_are_captured_for_successful_commands(tmp_path):
-    repo, run_dir = implementation_ready_run(tmp_path)
-    config = make_config(
-        repo,
+    _repo, run_dir, config = implementation_ready_run(
+        tmp_path,
         verification_commands=(
             python_gate(
                 "output",
@@ -341,9 +341,8 @@ def test_stdout_and_stderr_are_captured_for_successful_commands(tmp_path):
     GIT is None, reason="git executable is required for verification tests"
 )
 def test_arguments_are_preserved_without_shell_interpretation(tmp_path):
-    repo, run_dir = implementation_ready_run(tmp_path)
-    config = make_config(
-        repo,
+    _repo, run_dir, config = implementation_ready_run(
+        tmp_path,
         verification_commands=(
             VerificationCommand(
                 name="argv",
@@ -376,10 +375,9 @@ def test_arguments_are_preserved_without_shell_interpretation(tmp_path):
     GIT is None, reason="git executable is required for verification tests"
 )
 def test_repository_is_used_as_command_cwd(tmp_path):
-    repo, run_dir = implementation_ready_run(tmp_path)
-    config = make_config(
-        repo,
-        verification_commands=(
+    repo, run_dir, config = implementation_ready_run(
+        tmp_path,
+        verification_commands=lambda repository: (
             VerificationCommand(
                 name="cwd",
                 argv=(
@@ -391,7 +389,7 @@ def test_repository_is_used_as_command_cwd(tmp_path):
                         "pathlib.Path(sys.argv[1]).resolve(); "
                         "print(pathlib.Path.cwd().name)"
                     ),
-                    str(repo),
+                    str(repository),
                 ),
                 timeout_seconds=1800,
             ),
@@ -410,9 +408,8 @@ def test_repository_is_used_as_command_cwd(tmp_path):
     GIT is None, reason="git executable is required for verification tests"
 )
 def test_correction_reason_contains_gate_command_summary_output_and_exit_code(tmp_path):
-    repo, run_dir = implementation_ready_run(tmp_path)
-    config = make_config(
-        repo,
+    _repo, run_dir, config = implementation_ready_run(
+        tmp_path,
         verification_commands=(failing_gate("tests", exit_code=9),),
     )
 
@@ -462,8 +459,7 @@ def test_correction_reason_kinds_distinguish_review_findings():
     GIT is None, reason="git executable is required for verification tests"
 )
 def test_unexpected_process_runner_bug_still_propagates(tmp_path):
-    repo, run_dir = implementation_ready_run(tmp_path)
-    config = make_config(repo)
+    _repo, run_dir, config = implementation_ready_run(tmp_path)
 
     class BrokenRunner:
         def run(self, command, *, timeout_seconds):
@@ -486,8 +482,7 @@ def test_post_change_repository_inspection_bug_still_propagates(
     tmp_path,
     monkeypatch,
 ):
-    repo, run_dir = implementation_ready_run(tmp_path)
-    config = make_config(repo)
+    _repo, run_dir, config = implementation_ready_run(tmp_path)
 
     class BreakEndingInspectionRunner:
         def run(self, command, *, timeout_seconds):
@@ -509,11 +504,24 @@ def test_post_change_repository_inspection_bug_still_propagates(
         )
 
 
-def implementation_ready_run(tmp_path):
+def implementation_ready_run(
+    tmp_path,
+    *,
+    verification_commands: (
+        tuple[VerificationCommand, ...]
+        | Callable[[Path], tuple[VerificationCommand, ...]]
+        | None
+    ) = None,
+):
     repo = create_git_repo(tmp_path / "repo")
     ticket = tmp_path / "TA-006.md"
     ticket.write_text("# TA-006\n\nVerify the implementation.\n", encoding="utf-8")
-    config = make_config(repo)
+    commands = (
+        verification_commands(repo)
+        if callable(verification_commands)
+        else verification_commands
+    )
+    config = make_config(repo, verification_commands=commands)
     snapshot = create_run_snapshot(
         config,
         ticket,
@@ -530,7 +538,7 @@ def implementation_ready_run(tmp_path):
         updated_timestamp="2026-09-11T13:05:14Z",
     )
     save_run_record(run_record, run_record_path)
-    return repo, snapshot.run_dir
+    return repo, snapshot.run_dir, config
 
 
 def python_gate(

@@ -6,9 +6,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-SUPPORTED_SANDBOXES = frozenset({"read-only", "workspace-write"})
 DEFAULT_CODEX_MODEL = "gpt-5.5"
 DEFAULT_CODEX_REASONING_EFFORT = "xhigh"
+DEFAULT_MAX_CORRECTION_ROUNDS = 1
+IMPLEMENTATION_SANDBOX_POLICY = "workspace-write"
+REVIEW_SANDBOX_POLICY = "read-only"
 SUPPORTED_CODEX_REASONING_EFFORTS = frozenset(
     {"none", "minimal", "low", "medium", "high", "xhigh"}
 )
@@ -46,8 +48,6 @@ class CodexExecutionOverrides:
 @dataclass(frozen=True)
 class CodexSettings:
     executable: str
-    implementation_sandbox: str
-    review_sandbox: str
     model: str
     reasoning_effort: str
 
@@ -78,33 +78,37 @@ class AppConfig:
     codex: CodexSettings
     verification: VerificationSettings
     source_files: tuple[Path, ...]
+    configuration_directory: Path
 
 
 def load_config(config_dir: Path | str | None = None) -> AppConfig:
-    base_dir = Path.cwd() if config_dir is None else Path(config_dir)
-    example_path = base_dir / "config.example.toml"
+    base_dir = (Path.cwd() if config_dir is None else Path(config_dir)).resolve()
     local_path = base_dir / "config.local.toml"
 
-    if not example_path.is_file():
-        raise ConfigError(f"Missing required configuration file: {example_path}")
-
-    raw_config = _read_toml_file(example_path)
-    source_files = [example_path]
-
+    raw_config = _application_defaults()
+    source_files: tuple[Path, ...] = ()
     if local_path.is_file():
         raw_config = _deep_merge(raw_config, _read_toml_file(local_path))
-        source_files.append(local_path)
+        source_files = (local_path,)
 
-    return parse_config(raw_config, source_files=tuple(source_files))
+    return parse_config(
+        raw_config,
+        source_files=source_files,
+        configuration_directory=base_dir,
+    )
 
 
 def parse_config(
-    raw_config: dict[str, Any], *, source_files: tuple[Path, ...] = ()
+    raw_config: dict[str, Any],
+    *,
+    source_files: tuple[Path, ...] = (),
+    configuration_directory: Path,
 ) -> AppConfig:
     project = _require_table(raw_config, "project")
     runner = _require_table(raw_config, "runner")
     codex = _require_table(raw_config, "codex")
     verification = _require_table(raw_config, "verification")
+    _reject_configurable_sandbox_policy(codex)
 
     return AppConfig(
         project=ProjectSettings(
@@ -126,11 +130,6 @@ def parse_config(
         ),
         codex=CodexSettings(
             executable=_require_non_empty_string(codex, "codex.executable"),
-            implementation_sandbox=_require_sandbox(
-                codex,
-                "codex.implementation_sandbox",
-            ),
-            review_sandbox=_require_sandbox(codex, "codex.review_sandbox"),
             model=_optional_codex_model(codex, "codex.model"),
             reasoning_effort=_optional_reasoning_effort(
                 codex,
@@ -141,6 +140,7 @@ def parse_config(
             commands=_parse_verification_commands(verification),
         ),
         source_files=source_files,
+        configuration_directory=configuration_directory,
     )
 
 
@@ -225,8 +225,8 @@ def format_config_summary(config: AppConfig) -> str:
             f"  executable: {_redact_if_secret('codex.executable', config.codex.executable)}",
             f"  model: {_redact_if_secret('codex.model', config.codex.model)}",
             f"  reasoning effort: {config.codex.reasoning_effort}",
-            f"  implementation sandbox: {config.codex.implementation_sandbox}",
-            f"  review sandbox: {config.codex.review_sandbox}",
+            f"  implementation sandbox: {IMPLEMENTATION_SANDBOX_POLICY}",
+            f"  review sandbox: {REVIEW_SANDBOX_POLICY}",
             "",
             "Verification commands",
             verification,
@@ -240,6 +240,16 @@ def _read_toml_file(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ConfigError(f"Configuration file did not contain a TOML table: {path}")
     return data
+
+
+def _application_defaults() -> dict[str, Any]:
+    return {
+        "runner": {"max_correction_rounds": DEFAULT_MAX_CORRECTION_ROUNDS},
+        "codex": {
+            "model": DEFAULT_CODEX_MODEL,
+            "reasoning_effort": DEFAULT_CODEX_REASONING_EFFORT,
+        },
+    }
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -337,12 +347,16 @@ def _require_string_tuple(
     return tuple(strings)
 
 
-def _require_sandbox(table: dict[str, Any], dotted_name: str) -> str:
-    value = _require_non_empty_string(table, dotted_name)
-    if value not in SUPPORTED_SANDBOXES:
-        supported = ", ".join(sorted(SUPPORTED_SANDBOXES))
-        raise ConfigError(f"{dotted_name} must be one of: {supported}.")
-    return value
+def _reject_configurable_sandbox_policy(codex: dict[str, Any]) -> None:
+    forbidden = tuple(
+        key for key in ("implementation_sandbox", "review_sandbox") if key in codex
+    )
+    if forbidden:
+        names = ", ".join(f"codex.{key}" for key in forbidden)
+        raise ConfigError(
+            "Phase sandbox policy is controller-owned and cannot be configured: "
+            f"{names}."
+        )
 
 
 def _parse_verification_commands(

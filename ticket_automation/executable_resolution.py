@@ -14,7 +14,7 @@ _PATH_SEPARATORS = tuple(
 def resolve_executable(
     configured: str,
     *,
-    cwd: Path | str | None = None,
+    config_dir: Path | str | None = None,
 ) -> Path | None:
     if not configured:
         raise ValueError("Executable must be a non-empty string.")
@@ -22,8 +22,13 @@ def resolve_executable(
     if _has_path_part(configured):
         candidate = Path(configured)
         if not candidate.is_absolute():
-            base = Path.cwd() if cwd is None else Path(cwd)
-            candidate = base / candidate
+            # A target repository is untrusted input. A relative executable is
+            # meaningful only when it has the TicketAutomation configuration
+            # directory that supplied it; never fall back to a process or target
+            # repository working directory.
+            if config_dir is None:
+                return None
+            candidate = Path(config_dir) / candidate
         if candidate.is_file():
             return candidate.resolve()
         return None

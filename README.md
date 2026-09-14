@@ -18,7 +18,7 @@ Copy the example configuration and edit the local file for your machine:
 Copy-Item config.example.toml config.local.toml
 ```
 
-Set `project.repo` in `config.local.toml` to the target repository path on your computer. `config.local.toml` is ignored by Git and overrides values from `config.example.toml`.
+Set the required project-specific values in `config.local.toml`, including `project`, `codex.executable`, and verification commands. `config.example.toml` is a documentation template only; TicketAutomation never loads it at runtime. Application defaults supply the correction limit, Codex model, and reasoning effort when they are absent from `config.local.toml`.
 
 Codex execution policy is configured by TicketAutomation, so runs do not depend on your global Codex model defaults:
 
@@ -82,7 +82,7 @@ Resume a non-terminal run from an explicitly safe persisted checkpoint:
 python -m ticket_automation resume <run-id>
 ```
 
-The verification commands in `config.example.toml` are examples only. They are not assumed to be the final commands for any target repository. Each command uses an argument array and an explicit timeout:
+Verification commands belong in `config.local.toml`. Each command uses an argument array and an explicit timeout:
 
 ```toml
 [[verification.commands]]
@@ -95,6 +95,8 @@ timeout_seconds = 1800
 
 Preflight is the safety gate for target repositories. It checks that `project.repo` exists, is a Git working tree, is on a branch, has no unstaged, untracked, or staged changes, and is not on one of the configured protected branches such as `main` or `master`.
 
+Codex runs use `--ephemeral`. V1 also rejects a target repository containing `.codex/config.toml` before automated execution, because project Codex execution configuration cannot be suppressed reliably while preserving a testable policy boundary. Repository guidance such as `AGENTS.md`, ADRs, tests, and documentation remains available to the agent.
+
 `run` acquires the target repository ownership lock before preflight and releases it on controlled terminal outcomes or ordinary exceptions. If a later preflight check fails, the process ownership is released; the failed preflight does not strand the repository.
 
 The target repository must start clean. TicketAutomation deliberately does not stash changes, discard files, switch branches, reset history, or perform any automatic Git cleanup. If preflight fails, fix the repository yourself and run preflight again.
@@ -103,7 +105,7 @@ The target repository must start clean. TicketAutomation deliberately does not s
 
 Run snapshots are stored under `runs/`. A run ID uses a timestamp plus a sanitized ticket identifier, such as `20260911-130512_QDEB-003`. Existing run directories are not overwritten; a numeric suffix is added if a timestamp collision occurs.
 
-Each run directory contains `run.json`, `ticket.md`, `baseline.json`, and `baseline-verification/verification.json` plus its human-readable log. These records reconstruct the original ticket boundary for later workflow stages: ticket, verification-command, and canonical workspace fingerprints; target repository path; starting branch; baseline HEAD SHA; one explicit current state; correction and review round counters; effective Codex model and reasoning effort; timestamps; and a terminal reason when the run reaches `HUMAN_REQUIRED` or `FAILED`.
+Each run directory contains `run.json`, `ticket.md`, `baseline.json`, and `baseline-verification/verification.json` plus its human-readable log. `run.json` contains one immutable `resolved_config` snapshot: target repository, protected branches, resolved Codex executable and CLI version, model and reasoning effort, fixed phase sandboxes, verification commands and timeouts, correction limit, TicketAutomation identity, and prompt/schema fingerprints. Resume uses this snapshot rather than the current local configuration.
 
 A successful run also contains `diffs/final.patch` and `final-report.md`. The final patch is always relative to the original baseline SHA and the complete current working tree. The final report separates controller-observed facts from implementation-agent claims, so runner verification and Git evidence are not confused with agent-reported targeted tests.
 
@@ -126,7 +128,7 @@ Failed verification or a review that requires corrections advances through `CORR
 
 If deterministic verification fails, TicketAutomation skips review and generates a corrective ticket directly from typed `VerificationFailure` records. If review returns `CORRECTIONS_REQUIRED`, TicketAutomation generates a corrective ticket from the reviewer's `REQUIRED` findings. Every correction is followed by deterministic verification. If verification passes, the next review is a completely fresh review of the original ticket against the original baseline and the complete current working tree.
 
-Verification-driven and review-driven corrections share the same `[runner].max_correction_rounds` limit. With the default value of `3`, TicketAutomation allows implementation, review 1, correction 1, review 2, correction 2, review 3, correction 3, and review 4. If review 4 still requires correction, the run becomes `HUMAN_REQUIRED`; correction round 4 is not started.
+Verification-driven and review-driven corrections share the same `[runner].max_correction_rounds` limit. The application default is `1`; configure a different limit in `config.local.toml` before creating a run. The resolved limit is immutable for that run.
 
 Python owns all orchestration decisions. Codex may edit source files during writable implementation or correction phases, and Codex may return structured implementation and review judgments. TicketAutomation decides transitions from typed state only: implementation status, deterministic verification results, review verdict, correction count, and Git safety checks. It does not infer acceptance or correction needs from prose, stdout, reviewer narrative, or summary wording.
 

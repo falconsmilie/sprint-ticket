@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from tests.helpers import copy_example_config
@@ -14,68 +16,88 @@ from ticket_automation.config import (
 )
 
 
-def test_loads_example_config(tmp_path):
+def test_example_config_is_not_loaded_at_runtime(tmp_path):
     copy_example_config(tmp_path)
 
-    config = load_config(tmp_path)
-
-    assert config.project.name == "PhosPy"
-    assert config.project.repo.as_posix() == "C:/Projects/phospy"
-    assert config.project.protected_branches == ("main", "master")
-    assert config.runner.max_correction_rounds == 1
-    assert config.codex.executable == "codex"
-    assert config.codex.model == DEFAULT_CODEX_MODEL
-    assert config.codex.reasoning_effort == DEFAULT_CODEX_REASONING_EFFORT
-    assert config.codex.implementation_sandbox == "workspace-write"
-    assert config.codex.review_sandbox == "read-only"
-    assert [command.name for command in config.verification.commands] == [
-        "tests",
-        "typing",
-    ]
-    assert [command.timeout_seconds for command in config.verification.commands] == [
-        1800,
-        1800,
-    ]
+    with pytest.raises(ConfigError, match=r"Missing required \[project\]"):
+        load_config(tmp_path)
 
 
-def test_local_config_overrides_example_config(tmp_path):
-    copy_example_config(tmp_path)
+def test_application_defaults_work_without_example_file(tmp_path):
     local_config = tmp_path / "config.local.toml"
     local_config.write_text(
         """
 [project]
-repo = "D:/work/phospy-local"
-
-[runner]
-max_correction_rounds = 2
+name = "Local project"
+repo = "D:/work/local-project"
+protected_branches = ["main"]
 
 [codex]
-model = "local-model"
-reasoning_effort = "high"
+executable = "codex"
+
+[[verification.commands]]
+name = "tests"
+argv = ["python", "-m", "pytest"]
+timeout_seconds = 1800
 """.strip(),
         encoding="utf-8",
     )
 
     config = load_config(tmp_path)
 
-    assert config.project.name == "PhosPy"
+    assert config.project.name == "Local project"
+    assert config.project.repo.as_posix() == "D:/work/local-project"
+    assert config.project.protected_branches == ("main",)
+    assert config.runner.max_correction_rounds == 1
+    assert config.codex.executable == "codex"
+    assert config.codex.model == DEFAULT_CODEX_MODEL
+    assert config.codex.reasoning_effort == DEFAULT_CODEX_REASONING_EFFORT
+    assert config.source_files == (local_config,)
+
+
+def test_local_config_overrides_application_defaults(tmp_path):
+    local_config = tmp_path / "config.local.toml"
+    local_config.write_text(
+        """
+[project]
+name = "PhosPy"
+repo = "D:/work/phospy-local"
+protected_branches = ["main", "master"]
+
+[runner]
+max_correction_rounds = 2
+
+[codex]
+executable = "codex"
+model = "local-model"
+reasoning_effort = "high"
+
+[[verification.commands]]
+name = "tests"
+argv = ["python", "-m", "pytest"]
+timeout_seconds = 1800
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(tmp_path)
+
     assert config.project.repo.as_posix() == "D:/work/phospy-local"
     assert config.runner.max_correction_rounds == 2
     assert config.codex.model == "local-model"
     assert config.codex.reasoning_effort == "high"
-    assert config.source_files == (tmp_path / "config.example.toml", local_config)
+    assert config.source_files == (local_config,)
 
 
-def test_missing_local_config_is_acceptable(tmp_path):
+def test_example_file_does_not_supply_missing_local_values(tmp_path):
     copy_example_config(tmp_path)
 
-    config = load_config(tmp_path)
-
-    assert config.source_files == (tmp_path / "config.example.toml",)
+    with pytest.raises(ConfigError, match=r"Missing required \[project\]"):
+        load_config(tmp_path)
 
 
 def test_codex_execution_defaults_are_application_owned():
-    config = parse_config(base_raw_config())
+    config = parse_config(base_raw_config(), configuration_directory=Path.cwd())
 
     assert config.codex.model == DEFAULT_CODEX_MODEL
     assert config.codex.reasoning_effort == DEFAULT_CODEX_REASONING_EFFORT
@@ -85,7 +107,7 @@ def test_cli_codex_overrides_take_precedence_independently():
     raw_config = base_raw_config()
     raw_config["codex"]["model"] = "local-model"
     raw_config["codex"]["reasoning_effort"] = "medium"
-    config = parse_config(raw_config)
+    config = parse_config(raw_config, configuration_directory=Path.cwd())
 
     model_override = apply_codex_execution_overrides(
         config,
@@ -109,7 +131,11 @@ def test_cli_codex_overrides_take_precedence_independently():
         ({"runner": {"max_correction_rounds": 0}}, "positive integer"),
         (
             {"codex": {"implementation_sandbox": "danger-full-access"}},
-            "codex.implementation_sandbox",
+            "controller-owned",
+        ),
+        (
+            {"codex": {"review_sandbox": "workspace-write"}},
+            "controller-owned",
         ),
         ({"codex": {"model": ""}}, "codex.model"),
         ({"codex": {"reasoning_effort": ""}}, "codex.reasoning_effort"),
@@ -151,7 +177,7 @@ def test_invalid_required_values_are_rejected(config_patch, message):
         raw_config[section].update(values)
 
     with pytest.raises(ConfigError, match=message):
-        parse_config(raw_config)
+        parse_config(raw_config, configuration_directory=Path.cwd())
 
 
 def test_verification_commands_retain_argument_boundaries():
@@ -164,7 +190,8 @@ def test_verification_commands_retain_argument_boundaries():
                     "timeout_seconds": 1800,
                 }
             ],
-        )
+        ),
+        configuration_directory=Path.cwd(),
     )
 
     assert config.verification.commands[0].argv == (
@@ -189,8 +216,6 @@ def base_raw_config(
         "runner": {"max_correction_rounds": 3},
         "codex": {
             "executable": "codex",
-            "implementation_sandbox": "workspace-write",
-            "review_sandbox": "read-only",
         },
         "verification": {
             "commands": verification_commands

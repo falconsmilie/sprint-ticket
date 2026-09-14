@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from . import writable_worker
 from ._verification_artifacts import _baseline_verification_evidence_problem
 from .audit import (
     changed_files_including_untracked as _changed_files_including_untracked,
@@ -32,6 +33,7 @@ from .git_safety import (
     workspace_safety_changes,
 )
 from .models import StageOutcome, StopCategory, WorkflowState
+from .resolved_config import config_from_resolved_run_config
 from .runs import (
     BASELINE_RECORD_FILE,
     RUN_RECORD_FILE,
@@ -44,7 +46,6 @@ from .runs import (
 )
 from .workspace_guard import WorkspaceGuardInspection
 from .writable_attempts import WritableAttempt
-from . import writable_worker
 
 
 class _SafetyInspectionPhase:
@@ -118,6 +119,8 @@ def run_implementation_stage(
 ) -> ImplementationStageResult:
     run_path = Path(run_dir)
     run_record = load_run_record(run_path / RUN_RECORD_FILE)
+    # Existing runs execute exclusively from the policy captured in run.json.
+    config = config_from_resolved_run_config(run_record.resolved_config)
     if run_record.state != WorkflowState.IMPLEMENTING:
         raise ImplementationError(
             "Implementation requires run state IMPLEMENTING; "

@@ -1,3 +1,4 @@
+# Documentation template only. Copy required project values into config.local.toml.
 [project]
 name = "PhosPy"
 repo = "C:/Projects/phospy"
@@ -10,8 +11,6 @@ max_correction_rounds = 1
 executable = "codex"
 model = "gpt-5.5"
 reasoning_effort = "xhigh"
-implementation_sandbox = "workspace-write"
-review_sandbox = "read-only"
 
 [[verification.commands]]
 name = "tests"

@@ -77,6 +77,7 @@ def test_builds_workspace_write_command_arguments(tmp_path):
     assert command.argv == (
         "codex",
         "exec",
+        "--ephemeral",
         "--model",
         "gpt-5.5",
         "-c",
@@ -152,6 +153,7 @@ def test_execute_resolves_bare_executable_from_path(monkeypatch, tmp_path):
     assert runner.command.argv == (
         str(executable.resolve()),
         "exec",
+        "--ephemeral",
         "--model",
         "gpt-5.5",
         "-c",
@@ -227,6 +229,55 @@ def test_execute_uses_explicit_absolute_executable_without_path_lookup(
     assert runner.command.argv[0] == str(executable.resolve())
 
 
+def test_relative_executable_uses_configuration_directory_not_target_repository(
+    tmp_path,
+):
+    config_dir = tmp_path / "automation-config"
+    target_repo = tmp_path / "target-repo"
+    configured_executable = write_path_executable(config_dir / "bin")
+    target_repo.mkdir()
+    write_path_executable(target_repo / "bin")
+
+    resolved = executable_resolution.resolve_executable(
+        configured_executable.relative_to(config_dir).as_posix(),
+        config_dir=config_dir,
+    )
+
+    assert resolved == configured_executable.resolve()
+    assert (
+        executable_resolution.resolve_executable(
+            configured_executable.relative_to(config_dir).as_posix()
+        )
+        is None
+    )
+
+
+def test_execution_rejects_target_codex_project_configuration(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    repo.joinpath(".codex").mkdir()
+    repo.joinpath(".codex", "config.toml").write_text(
+        "model = 'untrusted'\n",
+        encoding="utf-8",
+    )
+    schema = write_schema(tmp_path / "schema.json")
+    runner = FakeRunner(result=successful_process({"status": "ok"}))
+
+    with pytest.raises(CodexExecutionFailure) as error:
+        execute(
+            prompt="prompt",
+            repo_path=repo,
+            sandbox=Sandbox.WORKSPACE_WRITE,
+            output_schema=schema,
+            artifact_directory=tmp_path / "artifacts",
+            executable=EXISTING_EXECUTABLE,
+            runner=runner,
+        )
+
+    assert error.value.kind == CodexFailureKind.PROJECT_CONFIGURATION_REJECTED
+    assert runner.calls == 0
+
+
 @pytest.mark.skipif(GIT is None, reason="git executable is required for shared test")
 def test_preflight_and_execution_use_shared_resolver(monkeypatch, tmp_path):
     repo = create_git_repo(tmp_path / "repo")
@@ -235,18 +286,19 @@ def test_preflight_and_execution_use_shared_resolver(monkeypatch, tmp_path):
     resolved_codex.parent.mkdir(parents=True)
     resolved_codex.write_text("@echo off\nexit /b 0\n", encoding="utf-8")
     resolved_codex = resolved_codex.resolve()
-    calls: list[tuple[str, Path | None]] = []
     original_resolve_executable = executable_resolution.resolve_executable
 
     def fake_resolve_executable(
         configured: str,
         *,
-        cwd: Path | str | None = None,
+        config_dir: Path | str | None = None,
     ) -> Path | None:
-        calls.append((configured, None if cwd is None else Path(cwd)))
         if configured == "codex":
             return resolved_codex
-        return original_resolve_executable(configured, cwd=cwd)
+        return original_resolve_executable(
+            configured,
+            config_dir=config_dir,
+        )
 
     monkeypatch.setattr(
         executable_resolution,
@@ -270,10 +322,6 @@ def test_preflight_and_execution_use_shared_resolver(monkeypatch, tmp_path):
     assert preflight.passed
     assert runner.command is not None
     assert runner.command.argv[0] == str(resolved_codex)
-    assert [call for call in calls if call[0] == "codex"] == [
-        ("codex", repo),
-        ("codex", repo),
-    ]
 
 
 def test_supplies_prompt_over_stdin_and_uses_repository_as_cwd(tmp_path):

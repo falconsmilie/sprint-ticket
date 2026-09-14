@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -207,6 +207,7 @@ class VerificationStep:
 class SequencedVerificationRunner:
     steps: list[VerificationStep]
     calls: list[VerificationProcessCommand]
+    timeouts: list[float | None] = field(default_factory=list)
 
     def run(
         self,
@@ -214,8 +215,8 @@ class SequencedVerificationRunner:
         *,
         timeout_seconds: float | None,
     ) -> VerificationProcessResult:
-        del timeout_seconds
         self.calls.append(command)
+        self.timeouts.append(timeout_seconds)
         assert self.steps, "Unexpected verification invocation."
         step = self.steps.pop(0)
         if step.error is not None:
@@ -1809,40 +1810,24 @@ def test_resume_reruns_review_result_without_checkpoint_metadata(tmp_path):
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
-def test_resume_does_not_adopt_verification_artifact_for_changed_gate_config(
+def test_resume_uses_persisted_verification_config_after_local_config_changes(
     tmp_path,
 ):
-    repo, ticket, config = workflow_inputs(tmp_path)
+    repo, ticket, _ = workflow_inputs(tmp_path)
+    persisted_command = VerificationCommand(
+        name="persisted-tests",
+        argv=(Path(sys.executable).as_posix(), "-c", "print('persisted')"),
+        timeout_seconds=91,
+    )
+    config = make_config(repo, verification_commands=(persisted_command,))
     runs_dir = tmp_path / "runs"
     snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
-    run_implementation_stage(
-        config,
-        snapshot.run_dir,
-        codex_runner=SequencedCodexRunner(
-            steps=[
-                CodexStep(
-                    result=implementation_result(),
-                    mutation=write_file("implemented\n"),
-                )
-            ],
-            calls=[],
-        ),
-        clock=fixed_clock,
-    )
-    record_path = snapshot.run_dir / "run.json"
-    stale_record = load_run_record(record_path)
-    run_verification_stage(
-        config,
-        snapshot.run_dir,
-        process_runner=SequencedVerificationRunner(
-            steps=[VerificationStep()],
-            calls=[],
-        ),
-        clock=fixed_clock,
-    )
-    save_run_record(stale_record, record_path)
     changed_config = make_config(
         repo,
+        codex_executable="untrusted/codex",
+        codex_model="changed-model",
+        codex_reasoning_effort="medium",
+        max_correction_rounds=9,
         verification_commands=(
             VerificationCommand(
                 name="changed-tests",
@@ -1851,8 +1836,23 @@ def test_resume_does_not_adopt_verification_artifact_for_changed_gate_config(
             ),
         ),
     )
+    codex = SequencedCodexRunner(
+        steps=[
+            CodexStep(
+                result=implementation_result(),
+                mutation=write_file("implemented\n"),
+            ),
+            CodexStep(result=review_result()),
+        ],
+        calls=[],
+    )
+    run_implementation_stage(
+        changed_config,
+        snapshot.run_dir,
+        codex_runner=codex,
+        clock=fixed_clock,
+    )
     verification = SequencedVerificationRunner(steps=[VerificationStep()], calls=[])
-    codex = SequencedCodexRunner(steps=[CodexStep(result=review_result())], calls=[])
 
     result = resume_ticket_lifecycle(
         changed_config,
@@ -1863,10 +1863,68 @@ def test_resume_does_not_adopt_verification_artifact_for_changed_gate_config(
         clock=fixed_clock,
     )
 
+    assert result.successful
+    assert [command.argv for command in verification.calls] == [persisted_command.argv]
+    assert verification.timeouts == [persisted_command.timeout_seconds]
+    assert [sandbox_value(command.argv) for command, _stdin in codex.calls] == [
+        Sandbox.WORKSPACE_WRITE.value,
+        Sandbox.READ_ONLY.value,
+    ]
+    for command, _stdin in codex.calls:
+        assert command.argv[0] == str(Path(config.codex.executable).resolve())
+        assert command.argv[command.argv.index("--model") + 1] == config.codex.model
+        assert command.argv[command.argv.index("-c") + 1] == (
+            f'model_reasoning_effort="{config.codex.reasoning_effort}"'
+        )
+    assert (
+        result.run_record.max_correction_rounds == config.runner.max_correction_rounds
+    )
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")
+@pytest.mark.parametrize(
+    ("mutate", "expected_reason"),
+    [
+        (
+            lambda data: data["resolved_config"]["codex"].update(
+                {"cli_version": "incompatible-codex-version"}
+            ),
+            "Codex CLI version no longer matches",
+        ),
+        (
+            lambda data: data["resolved_config"]["prompt_schema_versions"].update(
+                {"review_prompt": "0" * 64}
+            ),
+            "Persisted prompt/schema version is incompatible",
+        ),
+    ],
+)
+def test_resume_stops_safely_for_incompatible_resolved_policy(
+    tmp_path,
+    mutate,
+    expected_reason,
+):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+    snapshot = create_run_snapshot(
+        config,
+        ticket,
+        runs_dir=tmp_path / "runs",
+        clock=fixed_clock,
+    )
+    record_path = snapshot.run_dir / "run.json"
+    data = json.loads(record_path.read_text(encoding="utf-8"))
+    mutate(data)
+    record_path.write_text(json.dumps(data), encoding="utf-8")
+
+    result = resume_ticket_lifecycle(
+        config,
+        snapshot.run_record.run_id,
+        runs_dir=tmp_path / "runs",
+        clock=fixed_clock,
+    )
+
     assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
-    assert "verification_commands_fingerprint" in result.run_record.terminal_reason
-    assert verification.calls == []
-    assert codex.calls == []
+    assert expected_reason in result.run_record.terminal_reason
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for workflow tests")

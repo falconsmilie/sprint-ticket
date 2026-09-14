@@ -11,7 +11,7 @@ from ._verification_artifacts import (
     _verification_commands_fingerprint,
 )
 from .codex import CodexProcessRunner
-from .config import AppConfig, with_codex_execution_settings
+from .config import AppConfig
 from .corrections import (
     CorrectionError,
     CorrectionStageResult,
@@ -47,6 +47,7 @@ from .reporting import (
     latest_verification_round,
     run_report_stage,
 )
+from .resolved_config import config_from_resolved_run_config
 from .review import (
     _AUTOMATIC_CORRECTION_SCOPE_RELATIONS,
     ReviewStageResult,
@@ -152,6 +153,7 @@ def _run_ticket_lifecycle_locked(
         runs_dir=runs_dir,
         clock=clock,
     )
+    config = config_from_resolved_run_config(snapshot.run_record.resolved_config)
     _update_repository_lock(repository_lock, snapshot.run_record)
     implementation_result: ImplementationStageResult | None = None
     verification_results: list[VerificationStageResult] = []
@@ -237,7 +239,10 @@ def resume_ticket_lifecycle(
 
     preflight_result = PreflightResult(())
     run_record = load_run_record(run_dir / RUN_RECORD_FILE)
-    config = with_codex_execution_settings(config, run_record.codex)
+    # A caller may still provide the legacy configuration argument, but an
+    # existing run always executes from its persisted policy snapshot.
+    del config
+    config = config_from_resolved_run_config(run_record.resolved_config)
     with acquire_repository_run_lock(
         run_record.target_repository_path,
         run_id=run_record.run_id,
@@ -268,6 +273,25 @@ def _resume_ticket_lifecycle_locked(
     clock: Callable[[], datetime] | None,
 ) -> LifecycleResult:
     if run_record.state in TERMINAL_STATES:
+        return LifecycleResult(
+            run_dir=run_dir,
+            run_record=run_record,
+            preflight_result=preflight_result,
+            implementation_result=None,
+            verification_results=(),
+            review_results=(),
+            correction_results=(),
+        )
+
+    compatibility_problem = run_record.resolved_config.runtime_compatibility_problem()
+    if compatibility_problem is not None:
+        run_record = _mark_human_required(
+            run_dir,
+            terminal_reason=compatibility_problem,
+            clock=clock,
+        )
+        _update_repository_lock(repository_lock, run_record)
+        generate_terminal_report_best_effort(run_dir)
         return LifecycleResult(
             run_dir=run_dir,
             run_record=run_record,

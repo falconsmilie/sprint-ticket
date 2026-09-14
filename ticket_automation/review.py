@@ -23,7 +23,6 @@ from .codex import (
     CodexProcessRunner,
     CodexResultValidationError,
     Sandbox,
-    parse_sandbox,
     validate_json_schema,
 )
 from .codex import (
@@ -37,6 +36,7 @@ from .git_safety import (
     workspace_safety_changes,
 )
 from .models import StageOutcome, WorkflowState
+from .resolved_config import config_from_resolved_run_config
 from .runs import (
     BASELINE_RECORD_FILE,
     RUN_RECORD_FILE,
@@ -148,6 +148,8 @@ def run_review_stage(
     run_path = Path(run_dir)
     run_record_path = run_path / RUN_RECORD_FILE
     run_record = load_run_record(run_record_path)
+    # A later local configuration cannot select a different review invocation.
+    config = config_from_resolved_run_config(run_record.resolved_config)
     if run_record.state != WorkflowState.REVIEWING:
         raise ReviewError(
             f"Review requires run state REVIEWING; found {run_record.state.value}."
@@ -158,10 +160,6 @@ def run_review_stage(
         raise ReviewError("Run record and baseline branch do not match.")
     if baseline_record.head_sha != run_record.baseline_sha:
         raise ReviewError("Run record and baseline HEAD do not match.")
-
-    review_sandbox = parse_sandbox(config.codex.review_sandbox)
-    if review_sandbox != Sandbox.READ_ONLY:
-        raise ReviewError("Review requires codex.review_sandbox to be read-only.")
 
     repository = GitRepository(Path(run_record.target_repository_path))
     review_round = run_record.current_review_round + REVIEW_ROUND_OFFSET

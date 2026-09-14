@@ -123,6 +123,7 @@ class CodexFailureKind(StrEnum):
     INVALID_STRUCTURED_RESULT = "INVALID_STRUCTURED_RESULT"
     AUTHENTICATION_OR_SERVICE = "AUTHENTICATION_OR_SERVICE"
     INVALID_SCHEMA = "INVALID_SCHEMA"
+    PROJECT_CONFIGURATION_REJECTED = "PROJECT_CONFIGURATION_REJECTED"
 
 
 class CodexEventParseError(ValueError):
@@ -319,6 +320,30 @@ class CodexExecutor:
             output_schema=output_schema,
         )
 
+        project_config = Path(repo_path) / ".codex" / "config.toml"
+        if project_config.is_file():
+            artifact_paths.events.write_text("", encoding="utf-8", newline="\n")
+            artifact_paths.stderr.write_text(
+                f"Target repository Codex configuration rejected: {project_config}\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            return _fail(
+                kind=CodexFailureKind.PROJECT_CONFIGURATION_REJECTED,
+                message=(
+                    "Target repository contains .codex/config.toml; V1 cannot "
+                    "reliably suppress project Codex execution configuration."
+                ),
+                command=configured_command,
+                sandbox=sandbox,
+                execution_config=self.execution_config,
+                output_schema=output_schema,
+                artifacts=artifact_paths,
+                started_at=start,
+                process_started=False,
+                exit_code=None,
+            )
+
         try:
             schema = _load_schema(output_schema)
         except (OSError, json.JSONDecodeError, ValueError) as error:
@@ -337,7 +362,6 @@ class CodexExecutor:
 
         resolved_executable = executable_resolution.resolve_executable(
             self.executable,
-            cwd=repo_path,
         )
         if resolved_executable is None:
             artifact_paths.events.write_text("", encoding="utf-8", newline="\n")
@@ -624,6 +648,7 @@ def build_codex_command(
         argv=(
             executable,
             "exec",
+            "--ephemeral",
             "--model",
             effective_execution_config.model,
             "-c",
