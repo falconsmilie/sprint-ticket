@@ -79,6 +79,14 @@ def _output_result_path(command: CodexCommand) -> Path:
     return Path(command.argv[command.argv.index("--output-last-message") + 1])
 
 
+def _config_values(command: CodexCommand) -> tuple[str, ...]:
+    return tuple(
+        command.argv[index + 1]
+        for index, argument in enumerate(command.argv)
+        if argument == "-c"
+    )
+
+
 def implementation_result(**changes: object) -> dict[str, object]:
     result: dict[str, object] = {
         "status": "COMPLETED",
@@ -123,6 +131,30 @@ def test_command_writes_typed_result_to_the_canonical_result_artifact(tmp_path):
         result.resolve()
     )
     assert "--json" in command.argv
+
+
+def test_workspace_write_commands_enable_network_without_changing_read_only(tmp_path):
+    schema = tmp_path / "schema.json"
+
+    writable_command = build_codex_command(
+        executable="codex",
+        repo_path=tmp_path,
+        sandbox=Sandbox.WORKSPACE_WRITE,
+        output_schema=schema,
+    )
+    read_only_command = build_codex_command(
+        executable="codex",
+        repo_path=tmp_path,
+        sandbox=Sandbox.READ_ONLY,
+        output_schema=schema,
+    )
+
+    assert "sandbox_workspace_write.network_access=true" in _config_values(
+        writable_command
+    )
+    assert "sandbox_workspace_write.network_access=true" not in _config_values(
+        read_only_command
+    )
 
 
 def test_implementation_result_is_parsed_without_a_duplicate_raw_result(tmp_path):

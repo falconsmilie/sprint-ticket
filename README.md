@@ -31,7 +31,9 @@ dependency group.
 persisted in `run.json`, so changing `config.local.toml` cannot change a run
 that already exists. Sandboxes are fixed by phase: implementation and
 correction use `workspace-write`; verification, review, and reporting are
-read-only with respect to the target project.
+read-only with respect to the target project. Workspace-write Codex calls
+enable outbound network access so implementation and correction can run
+dependency-resolving validation; read-only Codex calls do not enable it.
 
 ## Commands
 
@@ -123,4 +125,3 @@ a person can inspect the target workspace before deciding what to do.
 Attempt records are trusted only when their sequence, phase, status, paths, and
 directory agree. Invalid attempt evidence stops resume for human inspection;
 the controller never follows an artifact path outside its own attempt.
-

@@ -131,8 +131,14 @@ def test_cli_run_invokes_fake_codex_and_runs_verification(tmp_path, monkeypatch)
         option_value(tuple(call["argv"]), "--model") for call in fake_record["calls"]
     ] == ["cli-model", "cli-model"]
     assert [
-        option_value(tuple(call["argv"]), "-c") for call in fake_record["calls"]
-    ] == ['model_reasoning_effort="high"', 'model_reasoning_effort="high"']
+        option_values(tuple(call["argv"]), "-c") for call in fake_record["calls"]
+    ] == [
+        (
+            'model_reasoning_effort="high"',
+            "sandbox_workspace_write.network_access=true",
+        ),
+        ('model_reasoning_effort="high"',),
+    ]
     run_record_path = next(config_dir.joinpath("runs").glob("*/run.json"))
     run_record = json.loads(run_record_path.read_text(encoding="utf-8"))
     assert run_record["resolved_config"]["codex"]["model"] == "cli-model"
@@ -232,3 +238,9 @@ def sandbox_value(argv: tuple[str, ...]) -> str:
 def option_value(argv: tuple[str, ...], option: str) -> str:
     option_index = argv.index(option)
     return argv[option_index + 1]
+
+
+def option_values(argv: tuple[str, ...], option: str) -> tuple[str, ...]:
+    return tuple(
+        argv[index + 1] for index, argument in enumerate(argv) if argument == option
+    )

@@ -645,6 +645,11 @@ def _build_codex_command(
     if not isinstance(sandbox, Sandbox):
         raise TypeError("sandbox must be a Sandbox value.")
     effective_execution_config = _effective_execution_config(execution_config)
+    sandbox_config = (
+        ("-c", "sandbox_workspace_write.network_access=true")
+        if sandbox is Sandbox.WORKSPACE_WRITE
+        else ()
+    )
     return CodexCommand(
         argv=(
             executable,
@@ -654,6 +659,7 @@ def _build_codex_command(
             effective_execution_config.model,
             "-c",
             (f'model_reasoning_effort="{effective_execution_config.reasoning_effort}"'),
+            *sandbox_config,
             "--sandbox",
             sandbox.value,
             "--json",
