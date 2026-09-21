@@ -40,6 +40,11 @@ class FindingScopeRelation(StrEnum):
     AMBIGUOUS = "AMBIGUOUS"
 
 
+_AUTOMATIC_CORRECTION_SCOPE_RELATIONS = frozenset(
+    {FindingScopeRelation.TICKET, FindingScopeRelation.IMPLEMENTATION}
+)
+
+
 def _require_non_empty_text(value: object, *, field: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ResultValidationError(f"{field} must be a non-empty string.")
@@ -129,6 +134,15 @@ class ReviewFinding:
             self.acceptance_criteria,
             field="review finding acceptance_criteria",
             minimum_items=1,
+        )
+
+    @property
+    def correction_eligible(self) -> bool:
+        """Whether application policy permits an automatic correction round."""
+
+        return (
+            self.disposition is FindingDisposition.REQUIRED
+            and self.scope_relation in _AUTOMATIC_CORRECTION_SCOPE_RELATIONS
         )
 
 

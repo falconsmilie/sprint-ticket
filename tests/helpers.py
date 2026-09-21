@@ -145,6 +145,9 @@ if action == "malformed-result":
 
 if "--sandbox" in sys.argv and sys.argv[sys.argv.index("--sandbox") + 1] == "read-only":
     result = review_result(corrections_required=action == "review-corrections")
+    if action == "review-unsafe":
+        result = review_result(corrections_required=True)
+        result["findings"][0]["scope_relation"] = "REPOSITORY_AUTHORITY"
     if action == "review-inconsistent":
         result = review_result(corrections_required=True)
         result["verdict"] = "PASS"

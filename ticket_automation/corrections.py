@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import json
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -15,9 +14,7 @@ from ._verification_artifacts import (
     _VerificationArtifactError,
 )
 from .attempts import (
-    attempt_result_path,
     finish_phase_attempt,
-    latest_attempt,
     start_attempt,
 )
 from .audit import (
@@ -31,14 +28,8 @@ from .codex import (
 )
 from .config import AppConfig, VerificationCommand
 from .domain.task_results import (
-    FindingDisposition,
-    FindingScopeRelation,
     ImplementationResult,
     ImplementationStatus,
-    ResultValidationError,
-    ReviewFinding,
-    ReviewResult,
-    ReviewVerdict,
 )
 from .failure_classification import classify_writable_failure
 from .git import GitCommandError, GitRepository
@@ -49,9 +40,6 @@ from .git_safety import (
 )
 from .models import StageOutcome, StopCategory, WorkflowState
 from .resolved_config import config_from_resolved_run_config
-from .review import (
-    _AUTOMATIC_CORRECTION_SCOPE_RELATIONS,
-)
 from .runs import (
     BASELINE_RECORD_FILE,
     RUN_RECORD_FILE,
@@ -61,15 +49,8 @@ from .runs import (
     load_baseline_record,
     load_run_record,
 )
-from .task_result_codecs import decode_review_result
 from .workspace_guard import WorkspaceGuardInspection
 from .writable_attempts import WritableAttempt
-
-
-class CorrectionReasonKind(StrEnum):
-    VERIFICATION_FAILURE = "VerificationFailure"
-    REVIEW_FINDING = "ReviewFinding"
-
 
 CORRECTIONS_DIR_NAME = "corrections"
 CORRECTION_EXECUTIONS_DIR_NAME = "correction-executions"
@@ -80,12 +61,19 @@ _CORRECTION_PROMPT_TEMPLATE = _PROJECT_ROOT / "prompts" / "correct.md"
 _CORRECTION_RESULT_SCHEMA = (
     _PROJECT_ROOT / "schemas" / "implementation-result.schema.json"
 )
+
+
 class CorrectionError(RunError):
     """Raised when corrective work cannot be prepared or persisted."""
 
 
+def _require_correction_text(value: object, *, field: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise CorrectionError(f"{field} must be a non-empty string.")
+
+
 @dataclass(frozen=True)
-class VerificationFailure:
+class VerificationCorrectionCause:
     gate_name: str
     command: tuple[str, ...]
     failure_summary: str
@@ -94,24 +82,93 @@ class VerificationFailure:
     exit_code: int | None
     result_path: Path
 
-    @property
-    def kind(self) -> CorrectionReasonKind:
-        return CorrectionReasonKind.VERIFICATION_FAILURE
+    def __post_init__(self) -> None:
+        _require_correction_text(self.gate_name, field="verification cause gate_name")
+        if (
+            not isinstance(self.command, tuple)
+            or not self.command
+            or any(not isinstance(item, str) or not item for item in self.command)
+        ):
+            raise CorrectionError(
+                "verification cause command must be a non-empty string tuple."
+            )
+        _require_correction_text(
+            self.failure_summary,
+            field="verification cause failure_summary",
+        )
+        if not isinstance(self.stdout_excerpt, str) or not isinstance(
+            self.stderr_excerpt, str
+        ):
+            raise CorrectionError("verification cause excerpts must be strings.")
+        if self.exit_code is not None and (
+            not isinstance(self.exit_code, int) or isinstance(self.exit_code, bool)
+        ):
+            raise CorrectionError(
+                "verification cause exit_code must be an integer or null."
+            )
+        if not isinstance(self.result_path, Path):
+            raise CorrectionError("verification cause result_path must be a Path.")
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "kind": self.kind.value,
-            "gate_name": self.gate_name,
-            "command": list(self.command),
-            "failure_summary": self.failure_summary,
-            "stdout_excerpt": self.stdout_excerpt,
-            "stderr_excerpt": self.stderr_excerpt,
-            "exit_code": self.exit_code,
-            "result_path": str(self.result_path),
-        }
+
+class ReviewCorrectionScope(StrEnum):
+    TICKET = "TICKET"
+    IMPLEMENTATION = "IMPLEMENTATION"
 
 
-CorrectionReason = VerificationFailure | ReviewFinding
+@dataclass(frozen=True)
+class ReviewCorrectionCause:
+    finding_id: str
+    summary: str
+    details: str
+    evidence: str
+    required_change: str
+    acceptance_criteria: tuple[str, ...]
+    scope_relation: ReviewCorrectionScope
+
+    def __post_init__(self) -> None:
+        for field, value in (
+            ("finding_id", self.finding_id),
+            ("summary", self.summary),
+            ("details", self.details),
+            ("evidence", self.evidence),
+            ("required_change", self.required_change),
+        ):
+            _require_correction_text(value, field=f"review cause {field}")
+        if (
+            not isinstance(self.acceptance_criteria, tuple)
+            or not self.acceptance_criteria
+            or any(
+                not isinstance(item, str) or not item.strip()
+                for item in self.acceptance_criteria
+            )
+        ):
+            raise CorrectionError(
+                "review cause acceptance_criteria must be a non-empty string tuple."
+            )
+        if not isinstance(self.scope_relation, ReviewCorrectionScope):
+            raise CorrectionError("review cause scope_relation is not supported.")
+
+
+CorrectionCause = VerificationCorrectionCause | ReviewCorrectionCause
+
+
+@dataclass(frozen=True)
+class CorrectionCauseSet:
+    causes: tuple[CorrectionCause, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.causes, tuple):
+            raise CorrectionError("correction causes must be a tuple.")
+        if not self.causes:
+            raise CorrectionError("Correction requires at least one eligible cause.")
+        cause_types = {type(cause) for cause in self.causes}
+        supported_types = {VerificationCorrectionCause, ReviewCorrectionCause}
+        if not cause_types <= supported_types:
+            raise CorrectionError(f"Unsupported correction cause set: {self.causes!r}")
+        if len(cause_types) != 1:
+            raise CorrectionError(
+                "Correction causes must come from one source type per correction round."
+            )
 
 
 @dataclass(frozen=True)
@@ -134,7 +191,7 @@ class CorrectionStageResult:
     codex_execution: CodexExecution | None
     agent_result: ImplementationResult | None
     safety_violations: tuple[CorrectionSafetyViolation, ...]
-    correction_reasons: tuple[CorrectionReason, ...]
+    correction_causes: tuple[CorrectionCause, ...]
     workspace_guard: WorkspaceGuardInspection | None
     controller_message: str
 
@@ -155,6 +212,7 @@ def run_correction_stage(
     config: AppConfig,
     run_dir: Path | str,
     *,
+    cause_set: CorrectionCauseSet,
     codex_runner: CodexProcessRunner | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> CorrectionStageResult:
@@ -197,7 +255,7 @@ def run_correction_stage(
             execution=None,
             agent_result=None,
             safety_violations=(),
-            correction_reasons=(),
+            correction_causes=(),
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=(
                 "Maximum corrective rounds exhausted; human intervention is required."
@@ -228,7 +286,7 @@ def run_correction_stage(
                     message="Writable correction is not authorized.",
                 ),
             ),
-            correction_reasons=(),
+            correction_causes=(),
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=evidence_problem,
             advance_correction_round=False,
@@ -257,7 +315,7 @@ def run_correction_stage(
             execution=None,
             agent_result=None,
             safety_violations=starting_violations,
-            correction_reasons=(),
+            correction_causes=(),
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=(
                 "Repository no longer matches the recorded correction baseline."
@@ -265,11 +323,11 @@ def run_correction_stage(
             advance_correction_round=False,
         )
 
-    reasons = _load_correction_reasons(run_path, run_record)
+    selected_causes = cause_set.causes
     ticket_markdown = render_correction_ticket(
         ticket_id=run_record.ticket_id,
         round_number=correction_round,
-        reasons=reasons,
+        cause_set=cause_set,
         run_dir=run_path,
     )
     active_record = run_record
@@ -314,7 +372,7 @@ def run_correction_stage(
             execution=None,
             agent_result=None,
             safety_violations=(),
-            correction_reasons=reasons,
+            correction_causes=selected_causes,
             workspace_guard=workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=writable_worker._format_writable_guard_stop(
@@ -381,7 +439,7 @@ def run_correction_stage(
             execution=error.execution,
             agent_result=None,
             safety_violations=failed_audit.safety_violations,
-            correction_reasons=reasons,
+            correction_causes=selected_causes,
             workspace_guard=workspace_guard,
             outcome=outcome,
             controller_message=message,
@@ -402,7 +460,7 @@ def run_correction_stage(
             execution=execution,
             agent_result=agent_result,
             safety_violations=(),
-            correction_reasons=reasons,
+            correction_causes=selected_causes,
             workspace_guard=workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=writable_worker._format_writable_guard_stop(
@@ -434,7 +492,7 @@ def run_correction_stage(
             execution=execution,
             agent_result=agent_result,
             safety_violations=safety_violations,
-            correction_reasons=reasons,
+            correction_causes=selected_causes,
             workspace_guard=workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=message,
@@ -449,7 +507,7 @@ def run_correction_stage(
             execution=execution,
             agent_result=agent_result,
             safety_violations=safety_violations,
-            correction_reasons=reasons,
+            correction_causes=selected_causes,
             workspace_guard=workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message="Repository safety invariants were violated.",
@@ -465,7 +523,7 @@ def run_correction_stage(
             execution=execution,
             agent_result=agent_result,
             safety_violations=(),
-            correction_reasons=reasons,
+            correction_causes=selected_causes,
             workspace_guard=workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message="Correction agent returned BLOCKED.",
@@ -480,7 +538,7 @@ def run_correction_stage(
         execution=execution,
         agent_result=agent_result,
         safety_violations=(),
-        correction_reasons=reasons,
+        correction_causes=selected_causes,
         workspace_guard=workspace_guard,
         outcome=StageOutcome.COMPLETED,
         controller_message=(
@@ -493,28 +551,34 @@ def render_correction_ticket(
     *,
     ticket_id: str,
     round_number: int,
-    reasons: Iterable[CorrectionReason],
+    cause_set: CorrectionCauseSet,
     run_dir: Path | str | None = None,
 ) -> str:
-    selected_reasons = _eligible_reasons(tuple(reasons))
-    if not selected_reasons:
-        raise CorrectionError("Correction requires at least one eligible reason.")
-    reason_kind = _single_reason_kind(selected_reasons)
-    if reason_kind == CorrectionReasonKind.REVIEW_FINDING:
+    selected_causes = cause_set.causes
+    first_cause = selected_causes[0]
+    if isinstance(first_cause, ReviewCorrectionCause):
         body = _render_review_correction_ticket(
             ticket_id=ticket_id,
             round_number=round_number,
-            findings=_review_findings(selected_reasons),
+            findings=tuple(
+                cause
+                for cause in selected_causes
+                if isinstance(cause, ReviewCorrectionCause)
+            ),
         )
-    elif reason_kind == CorrectionReasonKind.VERIFICATION_FAILURE:
+    elif isinstance(first_cause, VerificationCorrectionCause):
         body = _render_verification_correction_ticket(
             ticket_id=ticket_id,
             round_number=round_number,
-            failures=_verification_failures(selected_reasons),
+            failures=tuple(
+                cause
+                for cause in selected_causes
+                if isinstance(cause, VerificationCorrectionCause)
+            ),
             run_dir=None if run_dir is None else Path(run_dir),
         )
     else:
-        raise CorrectionError(f"Unsupported correction reason kind: {reason_kind}")
+        raise CorrectionError(f"Unsupported correction cause: {first_cause!r}")
     return body.rstrip() + "\n"
 
 
@@ -539,70 +603,6 @@ def render_correction_prompt(
     for placeholder, value in replacements.items():
         template = template.replace(placeholder, value)
     return template
-
-
-def review_findings_from_result(result: ReviewResult) -> tuple[ReviewFinding, ...]:
-    if not isinstance(result, ReviewResult):
-        raise CorrectionError("Review correction source has the wrong domain type.")
-    return result.required_findings
-
-
-def correction_reason_from_dict(data: dict[str, Any]) -> CorrectionReason:
-    kind = data.get("kind")
-    if kind == CorrectionReasonKind.VERIFICATION_FAILURE.value:
-        source = "verification correction reason"
-        return VerificationFailure(
-            gate_name=_required_string(data, "gate_name", source=source),
-            command=_required_string_tuple(data, "command", source=source),
-            failure_summary=_required_string(
-                data,
-                "failure_summary",
-                source=source,
-            ),
-            stdout_excerpt=_required_string(
-                data,
-                "stdout_excerpt",
-                source=source,
-                allow_empty=True,
-            ),
-            stderr_excerpt=_required_string(
-                data,
-                "stderr_excerpt",
-                source=source,
-                allow_empty=True,
-            ),
-            exit_code=_required_optional_int(data, "exit_code", source=source),
-            result_path=Path(_required_string(data, "result_path", source=source)),
-        )
-    if kind == CorrectionReasonKind.REVIEW_FINDING.value:
-        source = "review correction reason"
-        try:
-            disposition = FindingDisposition(
-                _required_string(data, "disposition", source=source)
-            )
-        except ValueError as error:
-            raise CorrectionError(
-                f"{source} has unsupported disposition."
-            ) from error
-        return ReviewFinding(
-            id=_required_string(data, "finding_id", source=source),
-            title=_required_string(data, "summary", source=source),
-            description=_required_string(data, "details", source=source),
-            evidence=_required_string(data, "evidence", source=source),
-            required_change=_required_string(
-                data,
-                "required_change",
-                source=source,
-            ),
-            acceptance_criteria=_required_string_tuple(
-                data,
-                "acceptance_criteria",
-                source=source,
-            ),
-            disposition=disposition,
-            scope_relation=_required_review_scope_relation(data, source=source),
-        )
-    raise CorrectionError(f"Unsupported correction reason kind: {kind!r}.")
 
 
 def format_correction_result(result: CorrectionStageResult) -> str:
@@ -652,7 +652,7 @@ def _finish(
     execution: CodexExecution | None,
     agent_result: ImplementationResult | None,
     safety_violations: tuple[CorrectionSafetyViolation, ...],
-    correction_reasons: tuple[CorrectionReason, ...],
+    correction_causes: tuple[CorrectionCause, ...],
     workspace_guard: WorkspaceGuardInspection | None = None,
     outcome: StageOutcome,
     controller_message: str,
@@ -684,155 +684,10 @@ def _finish(
         codex_execution=execution,
         agent_result=agent_result,
         safety_violations=safety_violations,
-        correction_reasons=correction_reasons,
+        correction_causes=correction_causes,
         workspace_guard=workspace_guard,
         controller_message=controller_message,
     )
-
-
-def _load_correction_reasons(
-    run_path: Path,
-    run_record: RunRecord,
-) -> tuple[CorrectionReason, ...]:
-    verification_reasons = _load_verification_failures(run_path, run_record)
-    if verification_reasons:
-        return verification_reasons
-
-    review_findings = _load_required_review_findings(run_path, run_record)
-    if review_findings:
-        return review_findings
-
-    raise CorrectionError(
-        "Run is in CORRECTING state but no verification failures or "
-        "REQUIRED review "
-        "findings were found."
-    )
-
-
-def _load_verification_failures(
-    run_path: Path,
-    run_record: RunRecord,
-) -> tuple[VerificationFailure, ...]:
-    attempt = latest_attempt(
-        run_path,
-        phases=(WorkflowState.VERIFYING.value,),
-        statuses=("COMPLETED",),
-    )
-    if attempt is None:
-        return ()
-    verification_path = attempt_result_path(run_path, attempt)
-    if verification_path is None or not verification_path.is_file():
-        return ()
-    data = _read_json_object(verification_path)
-    if data.get("status") != "FAIL":
-        return ()
-
-    if "correction_reasons" in data:
-        reasons = data["correction_reasons"]
-        if not isinstance(reasons, list):
-            raise CorrectionError(
-                "Verification correction source must contain a correction_reasons list."
-            )
-        parsed: list[VerificationFailure] = []
-        for index, item in enumerate(reasons, start=1):
-            if not isinstance(item, dict):
-                raise CorrectionError(
-                    f"Verification correction reason {index} must be an object."
-                )
-            reason = correction_reason_from_dict(item)
-            if not isinstance(reason, VerificationFailure):
-                raise CorrectionError(
-                    "Verification correction source cannot contain review findings."
-                )
-            parsed.append(reason)
-        if parsed:
-            return tuple(parsed)
-
-    return _verification_failures_from_commands(
-        data,
-        result_path=verification_path,
-    )
-
-
-def _verification_failures_from_commands(
-    data: dict[str, Any],
-    *,
-    result_path: Path,
-) -> tuple[VerificationFailure, ...]:
-    commands = data.get("commands", [])
-    if not isinstance(commands, list):
-        return ()
-    failures: list[VerificationFailure] = []
-    for command in commands:
-        if not isinstance(command, dict) or command.get("status") != "FAIL":
-            continue
-        gate_name = _string_value(command.get("name"), "verification")
-        exit_code = _optional_int(command.get("exit_code"))
-        failures.append(
-            VerificationFailure(
-                gate_name=gate_name,
-                command=_string_tuple(command.get("argv")),
-                failure_summary=(
-                    f"Verification gate {gate_name!r} exited with code {exit_code}."
-                ),
-                stdout_excerpt=_ticket_excerpt(
-                    _string_value(command.get("stdout"), "")
-                ),
-                stderr_excerpt=_ticket_excerpt(
-                    _string_value(command.get("stderr"), "")
-                ),
-                exit_code=exit_code,
-                result_path=result_path,
-            )
-        )
-    return tuple(failures)
-
-
-def _load_required_review_findings(
-    run_path: Path,
-    run_record: RunRecord,
-) -> tuple[ReviewFinding, ...]:
-    attempt = latest_attempt(
-        run_path,
-        phases=(WorkflowState.REVIEWING.value,),
-        statuses=("COMPLETED",),
-    )
-    if attempt is None:
-        return ()
-    result_path = attempt_result_path(run_path, attempt)
-    if result_path is None or not result_path.is_file():
-        return ()
-    data = _read_json_object(result_path)
-    try:
-        result = decode_review_result(data)
-    except ResultValidationError as error:
-        raise CorrectionError(f"Review correction source is invalid: {error}") from error
-    if result.verdict is not ReviewVerdict.CORRECTIONS_REQUIRED:
-        return ()
-    findings = review_findings_from_result(result)
-    if not findings:
-        raise CorrectionError(
-            "Review requested corrections but did not contain REQUIRED findings."
-        )
-    eligible_findings = _eligible_reasons(findings)
-    if len(eligible_findings) != len(findings):
-        raise CorrectionError(
-            "Review requested corrections but contains REQUIRED findings that "
-            "are not safely eligible for automatic correction."
-        )
-    return findings
-
-
-def _read_json_object(path: Path) -> dict[str, Any]:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise CorrectionError(
-            f"Could not read correction source data: {path}: {error}"
-        ) from error
-    if not isinstance(data, dict):
-        raise CorrectionError(f"Correction source data must be an object: {path}")
-    return data
 
 
 def _write_correction_ticket(
@@ -853,7 +708,7 @@ def _render_review_correction_ticket(
     *,
     ticket_id: str,
     round_number: int,
-    findings: tuple[ReviewFinding, ...],
+    findings: tuple[ReviewCorrectionCause, ...],
 ) -> str:
     lines = [
         f"# {ticket_id} - Corrective Round {round_number}",
@@ -876,12 +731,12 @@ def _render_review_correction_ticket(
         lines.extend(
             [
                 "",
-                f"### {finding.id} - {_text_or_default(finding.title)}",
+                f"### {finding.finding_id} - {_text_or_default(finding.summary)}",
                 "",
                 f"Scope relation: {_display_enum(finding.scope_relation.value)}",
                 "",
                 "Finding:",
-                _text_or_default(finding.description),
+                _text_or_default(finding.details),
                 "",
                 "Evidence:",
                 _text_or_default(finding.evidence),
@@ -904,7 +759,7 @@ def _render_verification_correction_ticket(
     *,
     ticket_id: str,
     round_number: int,
-    failures: tuple[VerificationFailure, ...],
+    failures: tuple[VerificationCorrectionCause, ...],
     run_dir: Path | None,
 ) -> str:
     lines = [
@@ -1262,52 +1117,7 @@ def _worktree_changed_files(
     return _changed_files_including_untracked(repository, baseline_sha)
 
 
-def _eligible_reasons(
-    reasons: tuple[CorrectionReason, ...],
-) -> tuple[CorrectionReason, ...]:
-    return tuple(
-        reason
-        for reason in reasons
-        if not isinstance(reason, ReviewFinding)
-        or (
-            reason.disposition is FindingDisposition.REQUIRED
-            and reason.scope_relation in _AUTOMATIC_CORRECTION_SCOPE_RELATIONS
-        )
-    )
-
-
-def _single_reason_kind(reasons: tuple[CorrectionReason, ...]) -> CorrectionReasonKind:
-    kinds = {_correction_reason_kind(reason) for reason in reasons}
-    if len(kinds) != 1:
-        raise CorrectionError(
-            "Correction reasons must come from one source type per correction round."
-        )
-    return next(iter(kinds))
-
-
-def _correction_reason_kind(reason: CorrectionReason) -> CorrectionReasonKind:
-    if isinstance(reason, VerificationFailure):
-        return CorrectionReasonKind.VERIFICATION_FAILURE
-    if isinstance(reason, ReviewFinding):
-        return CorrectionReasonKind.REVIEW_FINDING
-    raise CorrectionError(f"Unsupported correction reason: {reason!r}")
-
-
-def _review_findings(
-    reasons: tuple[CorrectionReason, ...],
-) -> tuple[ReviewFinding, ...]:
-    return tuple(reason for reason in reasons if isinstance(reason, ReviewFinding))
-
-
-def _verification_failures(
-    reasons: tuple[CorrectionReason, ...],
-) -> tuple[VerificationFailure, ...]:
-    return tuple(
-        reason for reason in reasons if isinstance(reason, VerificationFailure)
-    )
-
-
-def _verification_output_excerpt(failure: VerificationFailure) -> str:
+def _verification_output_excerpt(failure: VerificationCorrectionCause) -> str:
     output: list[str] = []
     if failure.stdout_excerpt:
         output.extend(["Stdout:", _ticket_excerpt(failure.stdout_excerpt)])
@@ -1357,84 +1167,8 @@ def _display_enum(value: str) -> str:
     return value.replace("_", " ").title()
 
 
-def _required_review_scope_relation(
-    data: dict[str, Any],
-    *,
-    source: str,
-) -> FindingScopeRelation:
-    scope_relation = _required_string(data, "scope_relation", source=source)
-    try:
-        return FindingScopeRelation(scope_relation)
-    except ValueError as error:
-        raise CorrectionError(
-            f"{source} has unsupported scope_relation: {scope_relation!r}."
-        ) from error
-
-
 def _text_or_default(value: str) -> str:
     return value if value else "Not provided."
-
-
-def _required_string(
-    data: dict[str, Any],
-    field: str,
-    *,
-    source: str,
-    allow_empty: bool = False,
-) -> str:
-    value = data.get(field)
-    if not isinstance(value, str) or (not allow_empty and not value.strip()):
-        raise CorrectionError(
-            f"{source} must contain a non-empty string field {field!r}."
-        )
-    return value
-
-
-def _required_optional_int(
-    data: dict[str, Any],
-    field: str,
-    *,
-    source: str,
-) -> int | None:
-    value = data.get(field)
-    if value is None:
-        return None
-    if isinstance(value, int) and not isinstance(value, bool):
-        return value
-    raise CorrectionError(f"{source} field {field!r} must be an integer or null.")
-
-
-def _required_string_tuple(
-    data: dict[str, Any],
-    field: str,
-    *,
-    source: str,
-) -> tuple[str, ...]:
-    value = data.get(field)
-    if not isinstance(value, (list, tuple)):
-        raise CorrectionError(
-            f"{source} must contain a non-empty string list field {field!r}."
-        )
-    strings = tuple(item for item in value if isinstance(item, str) and item.strip())
-    if len(strings) != len(value) or not strings:
-        raise CorrectionError(
-            f"{source} must contain a non-empty string list field {field!r}."
-        )
-    return strings
-
-
-def _string_value(value: Any, default: str) -> str:
-    return value if isinstance(value, str) else default
-
-
-def _optional_int(value: Any) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
-def _string_tuple(value: Any) -> tuple[str, ...]:
-    if not isinstance(value, list | tuple):
-        return ()
-    return tuple(item for item in value if isinstance(item, str))
 
 
 def _format_optional(value: str | None) -> str:
@@ -1458,17 +1192,16 @@ def _yes_no(value: bool) -> str:
 __all__ = [
     "CORRECTIONS_DIR_NAME",
     "CORRECTION_EXECUTIONS_DIR_NAME",
+    "CorrectionCause",
+    "CorrectionCauseSet",
     "CorrectionError",
-    "CorrectionReason",
-    "CorrectionReasonKind",
     "CorrectionSafetyViolation",
     "CorrectionStageResult",
-    "ReviewFinding",
-    "VerificationFailure",
-    "correction_reason_from_dict",
+    "ReviewCorrectionCause",
+    "ReviewCorrectionScope",
+    "VerificationCorrectionCause",
     "format_correction_result",
     "render_correction_prompt",
     "render_correction_ticket",
-    "review_findings_from_result",
     "run_correction_stage",
 ]

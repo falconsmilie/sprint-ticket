@@ -218,6 +218,41 @@ def test_required_review_finding_creates_correction_work(tmp_path, monkeypatch):
     assert all("result" not in attempt for attempt in controller["attempts"])
 
 
+def test_review_finding_outside_correction_scope_remains_human_required(
+    tmp_path, monkeypatch
+):
+    workspace = build_lifecycle_workspace(tmp_path)
+    configure_fake_codex_actions(
+        monkeypatch,
+        tmp_path,
+        "modify",
+        "review-unsafe",
+    )
+
+    result = run_ticket_lifecycle(
+        workspace.config,
+        workspace.ticket,
+        runs_dir=workspace.runs_dir,
+        verification_runner=ScriptedVerificationRunner([0, 0]),
+        clock=TickingClock(),
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.run_record.terminal_reason == (
+        "Review found REQUIRED findings, but none are safely eligible for automatic "
+        "correction."
+    )
+    assert_attempt_ledger(
+        result.run_dir,
+        [
+            ("PREPARING", "COMPLETED"),
+            ("IMPLEMENTING", "COMPLETED"),
+            ("VERIFYING", "COMPLETED"),
+            ("REVIEWING", "HUMAN_REQUIRED"),
+        ],
+    )
+
+
 def test_inconsistent_review_result_requires_human_review(tmp_path, monkeypatch):
     workspace = build_lifecycle_workspace(tmp_path)
     configure_fake_codex_actions(

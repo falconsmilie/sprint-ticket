@@ -32,6 +32,7 @@ FLAT_GIT_MODULES = frozenset(
 )
 LIFECYCLE_IMPLEMENTATION_MODULES = frozenset(
     {
+        f"{PACKAGE}.correction_planner",
         f"{PACKAGE}.corrections",
         f"{PACKAGE}.implementation",
         f"{PACKAGE}.preflight",
@@ -163,13 +164,6 @@ ARCHITECTURE_DEBT = (
         "_VerificationArtifactError",
         "TA-EVID-001",
         "Move verification evidence errors into the public codec contract.",
-    ),
-    _private_debt(
-        "ticket_automation.corrections",
-        "ticket_automation.review",
-        "_AUTOMATIC_CORRECTION_SCOPE_RELATIONS",
-        "TA-DOM-002",
-        "Move correction eligibility policy to the application correction planner.",
     ),
     _private_debt(
         "ticket_automation.implementation",

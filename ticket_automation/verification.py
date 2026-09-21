@@ -17,7 +17,6 @@ from ._verification_artifacts import (
 )
 from .attempts import finish_phase_attempt, start_attempt
 from .config import AppConfig, VerificationCommand
-from .corrections import CorrectionReason, VerificationFailure
 from .git import GitRepository
 from .git_safety import WorkspaceChange, WorkspaceSnapshot, workspace_safety_changes
 from .models import StageOutcome, WorkflowState
@@ -49,6 +48,121 @@ class VerificationErrorKind(StrEnum):
     EXECUTABLE_UNAVAILABLE = "EXECUTABLE_UNAVAILABLE"
     PROCESS_START_FAILED = "PROCESS_START_FAILED"
     TIMEOUT = "TIMEOUT"
+
+
+@dataclass(frozen=True)
+class VerificationFailure:
+    """A deterministic gate failure owned by the verification domain."""
+
+    gate_name: str
+    command: tuple[str, ...]
+    failure_summary: str
+    stdout_excerpt: str
+    stderr_excerpt: str
+    exit_code: int | None
+    result_path: Path
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.gate_name, str) or not self.gate_name.strip():
+            raise VerificationError("verification failure gate_name must be non-empty.")
+        if (
+            not isinstance(self.command, tuple)
+            or not self.command
+            or any(not isinstance(item, str) or not item for item in self.command)
+        ):
+            raise VerificationError(
+                "verification failure command must be a non-empty string tuple."
+            )
+        if (
+            not isinstance(self.failure_summary, str)
+            or not self.failure_summary.strip()
+        ):
+            raise VerificationError(
+                "verification failure failure_summary must be non-empty."
+            )
+        if not isinstance(self.stdout_excerpt, str) or not isinstance(
+            self.stderr_excerpt, str
+        ):
+            raise VerificationError("verification failure excerpts must be strings.")
+        if self.exit_code is not None and (
+            not isinstance(self.exit_code, int) or isinstance(self.exit_code, bool)
+        ):
+            raise VerificationError(
+                "verification failure exit_code must be an integer or null."
+            )
+        if not isinstance(self.result_path, Path):
+            raise VerificationError("verification failure result_path must be a Path.")
+
+    def to_dict(self) -> dict[str, Any]:
+        # Keep the established evidence shape for existing runs and reports.
+        return {
+            "kind": "VerificationFailure",
+            "gate_name": self.gate_name,
+            "command": list(self.command),
+            "failure_summary": self.failure_summary,
+            "stdout_excerpt": self.stdout_excerpt,
+            "stderr_excerpt": self.stderr_excerpt,
+            "exit_code": self.exit_code,
+            "result_path": str(self.result_path),
+        }
+
+    @classmethod
+    def _from_dict(cls, value: object) -> VerificationFailure:
+        """Reconstruct trusted verification evidence at its owning boundary."""
+
+        if not isinstance(value, dict):
+            raise VerificationError("verification failure evidence must be an object.")
+        if any(not isinstance(key, str) for key in value):
+            raise VerificationError(
+                "verification failure evidence field names must be strings."
+            )
+        fields = {
+            "kind",
+            "gate_name",
+            "command",
+            "failure_summary",
+            "stdout_excerpt",
+            "stderr_excerpt",
+            "exit_code",
+            "result_path",
+        }
+        missing = sorted(fields - set(value))
+        if missing:
+            raise VerificationError(
+                "verification failure evidence is missing fields: "
+                + ", ".join(missing)
+                + "."
+            )
+        extra = sorted(set(value) - fields)
+        if extra:
+            raise VerificationError(
+                "verification failure evidence contains unsupported fields: "
+                + ", ".join(extra)
+                + "."
+            )
+        if value["kind"] != "VerificationFailure":
+            raise VerificationError(
+                "verification failure evidence has an unsupported kind."
+            )
+        command = value["command"]
+        if not isinstance(command, list):
+            raise VerificationError(
+                "verification failure evidence command must be an array."
+            )
+        result_path = value["result_path"]
+        if not isinstance(result_path, str) or not result_path.strip():
+            raise VerificationError(
+                "verification failure evidence result_path must be non-empty."
+            )
+        return cls(
+            gate_name=value["gate_name"],
+            command=tuple(command),
+            failure_summary=value["failure_summary"],
+            stdout_excerpt=value["stdout_excerpt"],
+            stderr_excerpt=value["stderr_excerpt"],
+            exit_code=value["exit_code"],
+            result_path=Path(result_path),
+        )
 
 
 @dataclass(frozen=True)
@@ -189,7 +303,7 @@ class VerificationRound:
     status: VerificationStatus
     commands: tuple[VerificationCommandResult, ...]
     safety_violations: tuple[VerificationSafetyViolation, ...]
-    correction_reasons: tuple[CorrectionReason, ...]
+    failures: tuple[VerificationFailure, ...]
     result_path: Path
     schema_version: int = VERIFICATION_SCHEMA_VERSION
     format: str = VERIFICATION_ROUND_FORMAT
@@ -217,7 +331,7 @@ class VerificationRound:
             "status": self.status.value,
             "commands": [item.to_dict() for item in self.commands],
             "safety_violations": [item.to_dict() for item in self.safety_violations],
-            "correction_reasons": [item.to_dict() for item in self.correction_reasons],
+            "correction_reasons": [item.to_dict() for item in self.failures],
         }
 
 
@@ -285,7 +399,7 @@ def _run_baseline_verification_stage(
             result_path=result_path,
             repository=repository,
             before_snapshot=snapshot,
-            include_correction_reasons=False,
+            include_failures=False,
             process_runner=process_runner,
             clock=clock,
         )
@@ -351,7 +465,7 @@ def run_verification_stage(
             result_path=result_path,
             repository=repository,
             before_snapshot=snapshot,
-            include_correction_reasons=True,
+            include_failures=True,
             process_runner=process_runner,
             clock=clock,
         )
@@ -373,7 +487,7 @@ def _run_round(
     result_path: Path,
     repository: GitRepository | None,
     before_snapshot: WorkspaceSnapshot | None,
-    include_correction_reasons: bool,
+    include_failures: bool,
     process_runner: VerificationProcessRunner | None,
     clock: Callable[[], datetime] | None,
 ) -> VerificationRound:
@@ -392,9 +506,9 @@ def _run_round(
         status=_round_status(commands_result, violations),
         commands=commands_result,
         safety_violations=violations,
-        correction_reasons=(
-            _correction_reasons(commands_result, result_path)
-            if include_correction_reasons
+        failures=(
+            _verification_failures(commands_result, result_path)
+            if include_failures
             else ()
         ),
         result_path=result_path,
@@ -469,7 +583,7 @@ def _controller_error_round(
         status=VerificationStatus.ERROR,
         commands=(),
         safety_violations=violations,
-        correction_reasons=(),
+        failures=(),
         result_path=result_path,
     )
     _write_json(result_path, result.to_dict())
@@ -658,9 +772,9 @@ def _round_status(
     return VerificationStatus.PASS
 
 
-def _correction_reasons(
+def _verification_failures(
     commands: tuple[VerificationCommandResult, ...], result_path: Path
-) -> tuple[CorrectionReason, ...]:
+) -> tuple[VerificationFailure, ...]:
     return tuple(
         VerificationFailure(
             gate_name=item.name,
@@ -715,6 +829,7 @@ __all__ = [
     "VerificationCommandResult",
     "VerificationError",
     "VerificationErrorKind",
+    "VerificationFailure",
     "VerificationProcessCommand",
     "VerificationProcessResult",
     "VerificationProcessRunner",

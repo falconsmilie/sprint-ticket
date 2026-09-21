@@ -26,6 +26,7 @@ from .attempts import (
 from .audit import diff_including_untracked
 from .codex import CodexProcessRunner
 from .config import AppConfig
+from .correction_planner import plan_pending_correction
 from .corrections import (
     CorrectionStageResult,
     run_correction_stage,
@@ -611,9 +612,11 @@ def _drive_lifecycle(
                 clock=clock,
             )
             _update_repository_lock(repository_lock, run_record)
+            cause_set = plan_pending_correction(run_dir)
             correction = run_correction_stage(
                 config,
                 run_dir,
+                cause_set=cause_set,
                 codex_runner=codex_runner,
                 clock=clock,
             )

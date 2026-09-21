@@ -31,7 +31,6 @@ from .codex import (
 from .config import AppConfig, VerificationCommand
 from .domain.task_results import (
     FindingDisposition,
-    FindingScopeRelation,
     ResultValidationError,
     ReviewFinding,
     ReviewResult,
@@ -64,14 +63,6 @@ _REVIEW_RESULT_SCHEMA = _PROJECT_ROOT / "schemas" / "review-result.schema.json"
 
 class ReviewError(RunError):
     """Raised when the review stage cannot be prepared."""
-
-
-_AUTOMATIC_CORRECTION_SCOPE_RELATIONS = frozenset(
-    {
-        FindingScopeRelation.TICKET,
-        FindingScopeRelation.IMPLEMENTATION,
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -311,16 +302,6 @@ def _validate_review_result_artifact(value: Any) -> ReviewResult:
     return decode_review_result(value)
 
 
-def _correction_eligible_review_findings(
-    result: ReviewResult,
-) -> tuple[ReviewFinding, ...]:
-    return tuple(
-        finding
-        for finding in result.required_findings
-        if finding.scope_relation in _AUTOMATIC_CORRECTION_SCOPE_RELATIONS
-    )
-
-
 def format_review_result(result: ReviewStageResult) -> str:
     rows = [
         f"Review state: {result.run_record.state.value}",
@@ -350,13 +331,14 @@ def _finish_valid_review_result(
     execution: CodexExecution | None,
     review_result: ReviewResult,
 ) -> ReviewStageResult:
-    verdict = review_result.verdict
-    if verdict == ReviewVerdict.PASS:
+    if review_result.verdict == ReviewVerdict.PASS:
         outcome = StageOutcome.COMPLETED
         controller_message = "Review passed; final report can start."
-    elif verdict == ReviewVerdict.CORRECTIONS_REQUIRED:
+    elif review_result.verdict == ReviewVerdict.CORRECTIONS_REQUIRED:
         required_findings = review_result.required_findings
-        eligible_findings = _correction_eligible_review_findings(review_result)
+        eligible_findings = tuple(
+            finding for finding in required_findings if finding.correction_eligible
+        )
         if len(eligible_findings) == len(required_findings):
             outcome = StageOutcome.CORRECTION_REQUIRED
             controller_message = "Review found correction-eligible required findings."
