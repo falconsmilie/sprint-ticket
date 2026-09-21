@@ -16,3 +16,5 @@ tickets/*
 !tickets/.gitkeep
 
 .idea/
+
+ticket-automation-implementation-backlog/
