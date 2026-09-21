@@ -6,6 +6,7 @@ import pytest
 
 from tests.architecture_fitness import (
     ARCHITECTURE_DEBT,
+    module_name_for_path,
     scan_package,
     violations_for_source,
 )
@@ -40,6 +41,52 @@ def test_allowed_dependencies_have_no_violations():
 
     for source, module in examples:
         assert violations_for_source(source, module) == ()
+
+
+def test_agent_execution_port_is_application_owned_and_provider_neutral():
+    port_path = PACKAGE_ROOT / "application" / "agent_execution.py"
+    source = port_path.read_text(encoding="utf-8")
+
+    assert (
+        violations_for_source(
+            source,
+            "ticket_automation.application.agent_execution",
+        )
+        == ()
+    )
+
+
+@pytest.mark.parametrize("package_name", ["application", "domain"])
+def test_inward_packages_contain_no_concrete_provider_vocabulary(
+    package_name: str,
+):
+    package = PACKAGE_ROOT / package_name
+    violations = [
+        violation
+        for path in package.rglob("*.py")
+        for violation in violations_for_source(
+            path.read_text(encoding="utf-8"),
+            module_name_for_path(path, PACKAGE_ROOT),
+            is_package=path.name == "__init__.py",
+        )
+        if violation.rule == "concrete_provider_name"
+    ]
+
+    assert violations == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "codex_model = 'provider-model'\n",
+        "sandbox = 'workspace-write'\n",
+        "options = ('--output-schema', 'schema.json')\n",
+    ],
+)
+def test_provider_transport_vocabulary_fails_in_application_port(source: str):
+    assert "concrete_provider_name" in _rules(
+        source, "ticket_automation.application.agent_execution"
+    )
 
 
 @pytest.mark.parametrize(

@@ -21,7 +21,25 @@ LAYERS = frozenset(
     }
 )
 CONCRETE_PROVIDER_NAMES = frozenset(
-    {"CodexExecution", "CodexExecutor", "CodexFailureKind", "CodexSettings"}
+    {
+        "Codex",
+        "CodexCommand",
+        "CodexExecution",
+        "CodexExecutionFailure",
+        "CodexExecutionSettings",
+        "CodexExecutor",
+        "CodexFailureKind",
+        "CodexProcessResult",
+        "CodexProcessRunner",
+        "CodexSettings",
+        "Sandbox",
+        "SubprocessCodexRunner",
+        "--ephemeral",
+        "--json",
+        "--model",
+        "--output-schema",
+        "--sandbox",
+    }
 )
 CONCRETE_PROVIDER_MODULES = frozenset({f"{PACKAGE}.codex"})
 FILESYSTEM_MODULES = frozenset(
@@ -591,14 +609,13 @@ def _import_violations(edge: ImportEdge) -> list[Violation]:
 def _concrete_provider_name_lines(source: str) -> dict[str, int]:
     occurrences: dict[str, int] = {}
     for token in tokenize.generate_tokens(StringIO(source).readline):
-        candidates: set[str] = set()
-        if token.type == tokenize.NAME:
-            candidates.add(token.string)
-        elif token.type == tokenize.STRING:
-            candidates.update(
-                name for name in CONCRETE_PROVIDER_NAMES if name in token.string
-            )
-        for name in CONCRETE_PROVIDER_NAMES & candidates:
+        if token.type not in {tokenize.NAME, tokenize.STRING}:
+            continue
+        token_value = token.string.casefold()
+        candidates = {
+            name for name in CONCRETE_PROVIDER_NAMES if name.casefold() in token_value
+        }
+        for name in candidates:
             occurrences.setdefault(name, token.start[0])
     return occurrences
 
