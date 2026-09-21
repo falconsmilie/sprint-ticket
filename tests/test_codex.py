@@ -8,45 +8,67 @@ from pathlib import Path
 import pytest
 
 from tests.helpers import prepend_executable_path, write_path_executable
-from ticket_automation import codex as codex_module
 from ticket_automation import executable_resolution
-from ticket_automation.codex import (
+from ticket_automation.application.agent_execution import (
+    CORRECTION_RESULT_CONTRACT,
+    IMPLEMENTATION_RESULT_CONTRACT,
+    REVIEW_RESULT_CONTRACT,
+    AgentCapability,
+    AgentExecutionPolicy,
+    AgentExecutionRequest,
+    AgentExecutionStatus,
+    AgentFailureCategory,
+    AgentTaskKind,
+    InvocationStart,
+    NetworkAccess,
+    RepositoryAccess,
+    required_execution_capabilities,
+)
+from ticket_automation.domain.task_results import ImplementationResult, ReviewResult
+from ticket_automation.providers.codex_cli import (
+    CodexCliAgentExecutor,
     CodexCommand,
-    CodexExecutionFailure,
-    CodexExecutionStatus,
-    CodexExecutor,
-    CodexFailureKind,
     CodexProcessResult,
     CodexProcessTimedOut,
     CodexProcessTimeout,
-    Sandbox,
+    CodexSettings,
+    CodexSettingsError,
     SubprocessCodexRunner,
-    _CodexResultKind,
-    _execute,
-    build_codex_command,
-    execute,
 )
-from ticket_automation.config import CodexExecutionSettings, ConfigError
-from ticket_automation.domain.task_results import (
-    ImplementationResult,
-    ResultValidationError,
-    ReviewResult,
-)
-from ticket_automation.task_result_codecs import (
-    decode_implementation_result,
-    decode_review_result,
-    encode_implementation_result,
-    encode_review_result,
-)
+from ticket_automation.providers.codex_cli import process as process_module
+from ticket_automation.providers.codex_cli.command import build_command
 
 EXISTING_EXECUTABLE = str(Path(sys.executable).resolve())
+SETTINGS = CodexSettings(EXISTING_EXECUTABLE, "gpt-5.5", "xhigh")
+
+
+def implementation_payload(**changes: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "status": "COMPLETED",
+        "summary": "Implemented.",
+        "tests_run": [],
+        "assumptions": [],
+        "known_issues": [],
+    }
+    payload.update(changes)
+    return payload
+
+
+def review_payload(**changes: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "verdict": "PASS",
+        "summary": "Approved.",
+        "findings": [],
+    }
+    payload.update(changes)
+    return payload
 
 
 @dataclass
 class FakeRunner:
     result: CodexProcessResult | None = None
     typed_result: str | None = None
-    error: Exception | None = None
+    error: BaseException | None = None
     command: CodexCommand | None = None
     stdin: str | None = None
     timeout_seconds: float | None = None
@@ -66,214 +88,359 @@ class FakeRunner:
         if self.error is not None:
             raise self.error
         if self.typed_result is not None:
-            _output_result_path(command).write_text(self.typed_result, encoding="utf-8")
+            output = Path(command.argv[command.argv.index("--output-last-message") + 1])
+            output.write_text(self.typed_result, encoding="utf-8")
         assert self.result is not None
         return self.result
 
 
-class StartFailureRunner:
-    def run(
-        self,
-        command: CodexCommand,
-        *,
-        stdin: str,
-        timeout_seconds: float | None,
-    ) -> CodexProcessResult:
-        del command, stdin, timeout_seconds
-        raise OSError("permission denied")
-
-
-def _output_result_path(command: CodexCommand) -> Path:
-    return Path(command.argv[command.argv.index("--output-last-message") + 1])
-
-
-def _config_values(command: CodexCommand) -> tuple[str, ...]:
-    return tuple(
-        command.argv[index + 1]
-        for index, argument in enumerate(command.argv)
-        if argument == "-c"
+def request(
+    tmp_path: Path,
+    task_kind: AgentTaskKind = AgentTaskKind.IMPLEMENTATION,
+    *,
+    access: RepositoryAccess | None = None,
+    capabilities: frozenset[AgentCapability] | None = None,
+) -> AgentExecutionRequest:
+    if task_kind is AgentTaskKind.REVIEW:
+        access = access or RepositoryAccess.READ_ONLY
+        contract = REVIEW_RESULT_CONTRACT
+        network = NetworkAccess.DENIED
+    elif task_kind is AgentTaskKind.CORRECTION:
+        access = access or RepositoryAccess.WORKSPACE_WRITE
+        contract = CORRECTION_RESULT_CONTRACT
+        network = NetworkAccess.ALLOWED
+    else:
+        access = access or RepositoryAccess.WORKSPACE_WRITE
+        contract = IMPLEMENTATION_RESULT_CONTRACT
+        network = NetworkAccess.ALLOWED
+    return AgentExecutionRequest(
+        task_kind=task_kind,
+        repository_path=tmp_path,
+        repository_access=access,
+        prompt="Application-owned task prompt.",
+        result_contract=contract,
+        artifact_directory=tmp_path / "artifacts",
+        policy=AgentExecutionPolicy(60, network),
+        required_capabilities=(
+            capabilities
+            if capabilities is not None
+            else required_execution_capabilities(access)
+        ),
     )
 
 
-def implementation_result(**changes: object) -> dict[str, object]:
-    result: dict[str, object] = {
-        "status": "COMPLETED",
-        "summary": "Implemented the ticket.",
-        "tests_run": [{"command": "pytest", "result": "passed"}],
-        "assumptions": [],
-        "known_issues": [],
-    }
-    result.update(changes)
-    return result
-
-
-def review_result(**changes: object) -> dict[str, object]:
-    result: dict[str, object] = {
-        "verdict": "PASS",
-        "summary": "No issues found.",
-        "findings": [],
-    }
-    result.update(changes)
-    return result
-
-
-def successful_process(*, stdout: str = "") -> CodexProcessResult:
-    return CodexProcessResult(returncode=0, stdout=stdout, stderr="progress\n")
-
-
-def test_command_writes_typed_result_to_the_canonical_result_artifact(tmp_path):
-    schema = tmp_path / "schema.json"
-    result = tmp_path / "result.json"
-
-    command = build_codex_command(
+@pytest.mark.parametrize(
+    ("access", "network", "sandbox", "network_setting"),
+    [
+        (RepositoryAccess.READ_ONLY, NetworkAccess.DENIED, "read-only", None),
+        (
+            RepositoryAccess.WORKSPACE_WRITE,
+            NetworkAccess.ALLOWED,
+            "workspace-write",
+            "sandbox_workspace_write.network_access=true",
+        ),
+        (
+            RepositoryAccess.WORKSPACE_WRITE,
+            NetworkAccess.DENIED,
+            "workspace-write",
+            "sandbox_workspace_write.network_access=false",
+        ),
+    ],
+)
+def test_command_construction_enforces_access_and_network(
+    tmp_path: Path,
+    access: RepositoryAccess,
+    network: NetworkAccess,
+    sandbox: str,
+    network_setting: str | None,
+) -> None:
+    command = build_command(
         executable="codex",
-        repo_path=tmp_path,
-        sandbox=Sandbox.WORKSPACE_WRITE,
-        output_schema=schema,
+        repository_path=tmp_path,
+        repository_access=access,
+        network_access=network,
+        settings=SETTINGS,
+        output_schema=tmp_path / "schema.json",
+        output_result=tmp_path / "result.json",
     )
 
+    assert command.argv[0:3] == ("codex", "exec", "--ephemeral")
+    assert command.argv[command.argv.index("--model") + 1] == SETTINGS.model
+    assert f'model_reasoning_effort="{SETTINGS.reasoning_effort}"' in command.argv
+    assert command.argv[command.argv.index("--sandbox") + 1] == sandbox
+    assert "--json" in command.argv
     assert command.argv[command.argv.index("--output-schema") + 1] == str(
-        schema.resolve()
+        (tmp_path / "schema.json").resolve()
     )
     assert command.argv[command.argv.index("--output-last-message") + 1] == str(
-        result.resolve()
+        (tmp_path / "result.json").resolve()
     )
-    assert "--json" in command.argv
+    assert command.argv[-1] == "-"
+    assert network_setting is None or network_setting in command.argv
 
 
-def test_workspace_write_commands_enable_network_without_changing_read_only(tmp_path):
-    schema = tmp_path / "schema.json"
-
-    writable_command = build_codex_command(
-        executable="codex",
-        repo_path=tmp_path,
-        sandbox=Sandbox.WORKSPACE_WRITE,
-        output_schema=schema,
+@pytest.mark.parametrize("task_kind", tuple(AgentTaskKind))
+@pytest.mark.parametrize("access", tuple(RepositoryAccess))
+def test_adapter_accepts_only_the_stage_access_pair(
+    tmp_path: Path, task_kind: AgentTaskKind, access: RepositoryAccess
+) -> None:
+    payload = (
+        review_payload()
+        if task_kind is AgentTaskKind.REVIEW
+        else implementation_payload()
     )
-    read_only_command = build_codex_command(
-        executable="codex",
-        repo_path=tmp_path,
-        sandbox=Sandbox.READ_ONLY,
-        output_schema=schema,
+    runner = FakeRunner(CodexProcessResult(0, "events\n", ""), json.dumps(payload))
+    execution = CodexCliAgentExecutor(SETTINGS, runner=runner).execute(
+        request(tmp_path, task_kind, access=access)
     )
-
-    assert "sandbox_workspace_write.network_access=true" in _config_values(
-        writable_command
+    expected = (
+        RepositoryAccess.READ_ONLY
+        if task_kind is AgentTaskKind.REVIEW
+        else RepositoryAccess.WORKSPACE_WRITE
     )
-    assert "sandbox_workspace_write.network_access=true" not in _config_values(
-        read_only_command
-    )
+    if access is expected:
+        assert execution.successful
+        assert runner.calls == 1
+        assert runner.command is not None
+        schema = Path(
+            runner.command.argv[runner.command.argv.index("--output-schema") + 1]
+        )
+        expected_schema = (
+            "review-result.schema.json"
+            if task_kind is AgentTaskKind.REVIEW
+            else "implementation-result.schema.json"
+        )
+        assert schema.name == expected_schema
+    else:
+        assert (
+            execution.failure_category
+            is AgentFailureCategory.CAPABILITY_OR_CONFIGURATION_FAILURE
+        )
+        assert execution.invocation_start is InvocationStart.NOT_STARTED
+        assert runner.calls == 0
 
 
-def test_implementation_result_is_parsed_without_a_duplicate_raw_result(tmp_path):
-    payload = implementation_result()
-    runner = FakeRunner(successful_process(), json.dumps(payload))
-
-    execution = execute(
-        prompt="implement",
-        repo_path=tmp_path,
-        sandbox=Sandbox.WORKSPACE_WRITE,
-        output_schema=tmp_path / "implementation.schema.json",
-        artifact_directory=tmp_path / "artifacts",
-        executable=EXISTING_EXECUTABLE,
-        runner=runner,
-    )
-
-    assert execution.status == CodexExecutionStatus.SUCCESS
-    assert isinstance(execution.structured_result, ImplementationResult)
-    assert encode_implementation_result(execution.structured_result) == payload
-    assert json.loads(execution.result_json_path.read_text(encoding="utf-8")) == payload
-    assert not (execution.artifact_directory / "last-message.json").exists()
-    assert execution.process_started is True
-    assert execution.process_exit_code == 0
-
-
-def test_review_result_uses_review_parser(tmp_path):
-    payload = review_result(
-        verdict="CORRECTIONS_REQUIRED",
-        findings=[
-            {
-                "id": "R1",
-                "disposition": "REQUIRED",
-                "scope_relation": "IMPLEMENTATION",
-                "title": "Fix it",
-                "description": "A required change.",
-                "evidence": "A failing test.",
-                "required_change": "Make it pass.",
-                "acceptance_criteria": ["Test passes."],
-            }
-        ],
-    )
-    runner = FakeRunner(successful_process(), json.dumps(payload))
-
-    execution = _execute(
-        prompt="review",
-        repo_path=tmp_path,
-        sandbox=Sandbox.READ_ONLY,
-        output_schema=tmp_path / "review.schema.json",
-        artifact_directory=tmp_path / "artifacts",
-        executable=EXISTING_EXECUTABLE,
-        runner=runner,
-        _result_kind=_CodexResultKind.REVIEW,
-    )
-
-    assert isinstance(execution.structured_result, ReviewResult)
-    assert encode_review_result(execution.structured_result) == payload
-
-
-def test_correction_uses_implementation_parser(tmp_path):
-    payload = implementation_result(status="BLOCKED")
-    runner = FakeRunner(successful_process(), json.dumps(payload))
-
-    execution = execute(
-        prompt="correct",
-        repo_path=tmp_path,
-        sandbox=Sandbox.WORKSPACE_WRITE,
-        output_schema=tmp_path / "implementation.schema.json",
-        artifact_directory=tmp_path / "artifacts",
-        executable=EXISTING_EXECUTABLE,
-        runner=runner,
+@pytest.mark.parametrize(
+    ("runner", "expected"),
+    [
+        (
+            FakeRunner(error=OSError("permission denied")),
+            AgentFailureCategory.INVOCATION_START_FAILURE,
+        ),
+        (
+            FakeRunner(
+                error=CodexProcessTimedOut(CodexProcessTimeout("partial", "late", 60))
+            ),
+            AgentFailureCategory.TIMEOUT,
+        ),
+        (
+            FakeRunner(CodexProcessResult(2, "", "failed")),
+            AgentFailureCategory.NON_SUCCESSFUL_EXECUTION,
+        ),
+        (
+            FakeRunner(CodexProcessResult(2, "", "authentication failed")),
+            AgentFailureCategory.PROVIDER_REJECTION_OR_SERVICE_FAILURE,
+        ),
+        (
+            FakeRunner(CodexProcessResult(0, "", "")),
+            AgentFailureCategory.MISSING_RESULT,
+        ),
+        (
+            FakeRunner(CodexProcessResult(0, "", ""), "{invalid"),
+            AgentFailureCategory.INVALID_RESULT,
+        ),
+    ],
+)
+def test_failure_mapping_is_deterministic(
+    tmp_path: Path, runner: FakeRunner, expected: AgentFailureCategory
+) -> None:
+    execution = CodexCliAgentExecutor(SETTINGS, runner=runner).execute(
+        request(tmp_path)
     )
 
-    assert isinstance(execution.structured_result, ImplementationResult)
-    assert encode_implementation_result(execution.structured_result) == payload
+    assert execution.status is AgentExecutionStatus.FAILED
+    assert execution.failure_category is expected
+    assert execution.provider_metadata["native_failure_reason"]
+    assert (tmp_path / "artifacts" / "execution.json").is_file()
 
 
-def test_missing_typed_result_fails_clearly(tmp_path):
-    runner = FakeRunner(successful_process())
+def test_unavailable_executable_is_process_not_started(tmp_path: Path) -> None:
+    executor = CodexCliAgentExecutor(
+        CodexSettings(str(tmp_path / "missing"), "gpt-5.5", "xhigh"),
+        runner=FakeRunner(),
+    )
 
-    with pytest.raises(CodexExecutionFailure, match="did not write") as raised:
-        execute(
-            prompt="implement",
-            repo_path=tmp_path,
-            sandbox=Sandbox.WORKSPACE_WRITE,
-            output_schema=tmp_path / "implementation.schema.json",
-            artifact_directory=tmp_path / "artifacts",
-            executable=EXISTING_EXECUTABLE,
-            runner=runner,
+    execution = executor.execute(request(tmp_path))
+
+    assert execution.failure_category is AgentFailureCategory.PROVIDER_UNAVAILABLE
+    assert execution.invocation_start is InvocationStart.NOT_STARTED
+
+
+def test_project_configuration_rejection_precedes_process_start(tmp_path: Path) -> None:
+    project_config = tmp_path / ".codex" / "config.toml"
+    project_config.parent.mkdir()
+    project_config.write_text("model = 'untrusted'\n", encoding="utf-8")
+    runner = FakeRunner()
+
+    execution = CodexCliAgentExecutor(SETTINGS, runner=runner).execute(
+        request(tmp_path)
+    )
+
+    assert (
+        execution.failure_category
+        is AgentFailureCategory.CAPABILITY_OR_CONFIGURATION_FAILURE
+    )
+    assert execution.invocation_start is InvocationStart.NOT_STARTED
+    assert runner.calls == 0
+
+
+def test_workspace_write_requires_declared_capability(tmp_path: Path) -> None:
+    class ReadOnlyCodexAdapter(CodexCliAgentExecutor):
+        @property
+        def capabilities(self) -> frozenset[AgentCapability]:
+            return super().capabilities - {AgentCapability.WORKSPACE_WRITE_EXECUTION}
+
+    runner = FakeRunner()
+    executor = ReadOnlyCodexAdapter(SETTINGS, runner=runner)
+
+    execution = executor.execute(request(tmp_path))
+
+    assert (
+        execution.failure_category
+        is AgentFailureCategory.CAPABILITY_OR_CONFIGURATION_FAILURE
+    )
+    assert execution.invocation_start is InvocationStart.NOT_STARTED
+    assert runner.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("task_kind", "payload", "result_type"),
+    [
+        (AgentTaskKind.IMPLEMENTATION, implementation_payload(), ImplementationResult),
+        (AgentTaskKind.CORRECTION, implementation_payload(), ImplementationResult),
+        (AgentTaskKind.REVIEW, review_payload(), ReviewResult),
+    ],
+)
+def test_typed_results_cross_the_adapter_boundary(
+    tmp_path: Path,
+    task_kind: AgentTaskKind,
+    payload: dict[str, object],
+    result_type: type,
+) -> None:
+    runner = FakeRunner(
+        CodexProcessResult(0, "diagnostic event\n", "provider detail\n"),
+        json.dumps(payload),
+    )
+
+    execution = CodexCliAgentExecutor(SETTINGS, runner=runner).execute(
+        request(tmp_path, task_kind)
+    )
+
+    assert execution.successful
+    assert type(execution.result) is result_type
+    assert execution.invocation_start is InvocationStart.STARTED
+    assert (tmp_path / "artifacts" / "prompt.md").read_text(encoding="utf-8") == (
+        "Application-owned task prompt."
+    )
+    assert (tmp_path / "artifacts" / "events.jsonl").read_text(encoding="utf-8") == (
+        "diagnostic event\n"
+    )
+    assert (tmp_path / "artifacts" / "stderr.log").read_text(encoding="utf-8") == (
+        "provider detail\n"
+    )
+
+
+def test_review_request_is_read_only(tmp_path: Path) -> None:
+    runner = FakeRunner(CodexProcessResult(0, "", ""), json.dumps(review_payload()))
+    execution = CodexCliAgentExecutor(SETTINGS, runner=runner).execute(
+        request(tmp_path, AgentTaskKind.REVIEW)
+    )
+
+    assert execution.successful
+    assert runner.command is not None
+    assert (
+        runner.command.argv[runner.command.argv.index("--sandbox") + 1] == "read-only"
+    )
+    assert "sandbox_workspace_write.network_access=true" not in runner.command.argv
+
+
+def test_invocation_start_is_reported_before_runner_call(tmp_path: Path) -> None:
+    observations: list[str] = []
+
+    @dataclass
+    class ObservingRunner(FakeRunner):
+        def run(
+            self,
+            command: CodexCommand,
+            *,
+            stdin: str,
+            timeout_seconds: float | None,
+        ) -> CodexProcessResult:
+            observations.append("runner")
+            return super().run(
+                command,
+                stdin=stdin,
+                timeout_seconds=timeout_seconds,
+            )
+
+    tracked = request(tmp_path)
+    runner = ObservingRunner(
+        CodexProcessResult(0, "", ""),
+        json.dumps(implementation_payload()),
+    )
+
+    execution = CodexCliAgentExecutor(SETTINGS, runner=runner).execute(
+        tracked,
+        on_invocation_start=lambda: observations.append("start"),
+    )
+
+    assert execution.successful
+    assert observations == ["start", "runner"]
+
+
+@pytest.mark.parametrize(
+    "error", [OSError("attempt write failed"), FileNotFoundError("attempt missing")]
+)
+def test_invocation_start_observer_errors_are_not_mapped_as_provider_failures(
+    tmp_path: Path,
+    error: OSError,
+) -> None:
+    runner = FakeRunner(
+        CodexProcessResult(0, "", ""),
+        json.dumps(implementation_payload()),
+    )
+
+    def fail_to_record_start() -> None:
+        raise error
+
+    with pytest.raises(type(error), match=str(error)):
+        CodexCliAgentExecutor(SETTINGS, runner=runner).execute(
+            request(tmp_path),
+            on_invocation_start=fail_to_record_start,
         )
 
-    assert raised.value.kind == CodexFailureKind.MISSING_STRUCTURED_RESULT
-    assert raised.value.execution.process_started is True
-    assert raised.value.execution.process_exit_code == 0
+    assert runner.calls == 0
 
 
-def test_malformed_typed_result_json_fails_clearly(tmp_path):
-    runner = FakeRunner(successful_process(), "{not json")
+def test_backward_wall_clock_is_recorded_as_a_zero_duration(tmp_path: Path) -> None:
+    from datetime import UTC, datetime, timedelta
 
-    with pytest.raises(CodexExecutionFailure, match="not valid JSON") as raised:
-        execute(
-            prompt="implement",
-            repo_path=tmp_path,
-            sandbox=Sandbox.WORKSPACE_WRITE,
-            output_schema=tmp_path / "implementation.schema.json",
-            artifact_directory=tmp_path / "artifacts",
-            executable=EXISTING_EXECUTABLE,
-            runner=runner,
-        )
+    started = datetime(2026, 9, 21, 12, tzinfo=UTC)
+    times = iter((started, started - timedelta(seconds=1)))
+    runner = FakeRunner(
+        CodexProcessResult(0, "", ""),
+        json.dumps(implementation_payload()),
+    )
 
-    assert raised.value.kind == CodexFailureKind.INVALID_STRUCTURED_RESULT
-    assert raised.value.execution.structured_result_present is True
+    execution = CodexCliAgentExecutor(
+        SETTINGS,
+        runner=runner,
+        clock=lambda: next(times),
+    ).execute(request(tmp_path))
+
+    assert execution.started_at == started
+    assert execution.ended_at == started
+    assert execution.duration_seconds == 0
 
 
 @pytest.mark.parametrize(
@@ -282,233 +449,124 @@ def test_malformed_typed_result_json_fails_clearly(tmp_path):
         [],
         "not an object",
         {"status": "COMPLETED"},
-        implementation_result(status="NOT_A_STATUS"),
-        implementation_result(tests_run=[{"command": "pytest"}]),
-        implementation_result(summary=7),
-        implementation_result(unexpected="value"),
+        implementation_payload(status="NOT_A_STATUS"),
+        implementation_payload(tests_run=[{"command": "pytest"}]),
+        implementation_payload(summary=7),
+        implementation_payload(unexpected="value"),
     ],
 )
-def test_invalid_implementation_result_fields_fail(tmp_path, payload):
-    runner = FakeRunner(successful_process(), json.dumps(payload))
+def test_adapter_strictly_rejects_invalid_result_fields(
+    tmp_path: Path, payload: object
+) -> None:
+    runner = FakeRunner(CodexProcessResult(0, "", ""), json.dumps(payload))
 
-    with pytest.raises(CodexExecutionFailure) as raised:
-        execute(
-            prompt="implement",
-            repo_path=tmp_path,
-            sandbox=Sandbox.WORKSPACE_WRITE,
-            output_schema=tmp_path / "implementation.schema.json",
-            artifact_directory=tmp_path / "artifacts",
-            executable=EXISTING_EXECUTABLE,
-            runner=runner,
-        )
-
-    assert raised.value.kind == CodexFailureKind.INVALID_STRUCTURED_RESULT
-    assert raised.value.execution.result_json_path.is_file()
-
-
-def test_diagnostic_jsonl_is_persisted_without_affecting_result(tmp_path):
-    diagnostics = (
-        "not-json\n" + json.dumps({"type": "future.event", "shape": []}) + "\n"
+    execution = CodexCliAgentExecutor(SETTINGS, runner=runner).execute(
+        request(tmp_path)
     )
-    payload = implementation_result()
-    runner = FakeRunner(successful_process(stdout=diagnostics), json.dumps(payload))
 
-    execution = execute(
-        prompt="implement",
-        repo_path=tmp_path,
-        sandbox=Sandbox.WORKSPACE_WRITE,
-        output_schema=tmp_path / "implementation.schema.json",
-        artifact_directory=tmp_path / "artifacts",
-        executable=EXISTING_EXECUTABLE,
-        runner=runner,
+    assert execution.failure_category is AgentFailureCategory.INVALID_RESULT
+    assert (tmp_path / "artifacts" / "codex-result.json").is_file()
+
+
+def test_stale_typed_result_cannot_satisfy_a_new_execution(tmp_path: Path) -> None:
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    result_path = artifacts / "codex-result.json"
+    result_path.write_text(
+        json.dumps(implementation_payload(status="BLOCKED")),
+        encoding="utf-8",
+    )
+    runner = FakeRunner(CodexProcessResult(0, "", ""))
+
+    execution = CodexCliAgentExecutor(SETTINGS, runner=runner).execute(
+        request(tmp_path)
+    )
+
+    assert execution.failure_category is AgentFailureCategory.MISSING_RESULT
+    assert not result_path.exists()
+
+
+def test_canonical_result_wins_over_diagnostic_events(tmp_path: Path) -> None:
+    diagnostic = json.dumps(
+        {
+            "type": "turn.completed",
+            "result": implementation_payload(status="BLOCKED"),
+        }
+    )
+    canonical = implementation_payload(status="COMPLETED")
+    runner = FakeRunner(
+        CodexProcessResult(0, diagnostic + "\n", "progress\n"),
+        json.dumps(canonical),
+    )
+
+    execution = CodexCliAgentExecutor(SETTINGS, runner=runner).execute(
+        request(tmp_path)
     )
 
     assert execution.successful
-    assert execution.events_jsonl_path.read_text(encoding="utf-8") == diagnostics
-    assert execution.stderr_log_path.read_text(encoding="utf-8") == "progress\n"
+    assert isinstance(execution.result, ImplementationResult)
+    assert execution.result.status.value == "COMPLETED"
+    assert (tmp_path / "artifacts" / "events.jsonl").read_text(
+        encoding="utf-8"
+    ) == diagnostic + "\n"
 
 
-def test_canonical_typed_result_wins_over_plausible_jsonl_result(tmp_path):
-    diagnostics = (
-        json.dumps(
-            {
-                "type": "turn.completed",
-                "result": implementation_result(status="BLOCKED"),
-            }
-        )
-        + "\n"
-    )
-    canonical_result = implementation_result(status="COMPLETED")
-    runner = FakeRunner(
-        successful_process(stdout=diagnostics), json.dumps(canonical_result)
-    )
-
-    execution = execute(
-        prompt="implement",
-        repo_path=tmp_path,
-        sandbox=Sandbox.WORKSPACE_WRITE,
-        output_schema=tmp_path / "implementation.schema.json",
-        artifact_directory=tmp_path / "artifacts",
-        executable=EXISTING_EXECUTABLE,
-        runner=runner,
-    )
-
-    assert isinstance(execution.structured_result, ImplementationResult)
-    assert encode_implementation_result(execution.structured_result) == canonical_result
-    assert json.loads(execution.result_json_path.read_text(encoding="utf-8")) == (
-        canonical_result
-    )
-
-
-def test_stale_typed_result_cannot_satisfy_a_new_execution(tmp_path):
-    artifact_directory = tmp_path / "artifacts"
-    artifact_directory.mkdir()
-    (artifact_directory / "result.json").write_text(
-        json.dumps(implementation_result(status="BLOCKED")),
-        encoding="utf-8",
-    )
-    runner = FakeRunner(successful_process())
-
-    with pytest.raises(CodexExecutionFailure, match="did not write") as raised:
-        execute(
-            prompt="implement",
-            repo_path=tmp_path,
-            sandbox=Sandbox.WORKSPACE_WRITE,
-            output_schema=tmp_path / "implementation.schema.json",
-            artifact_directory=artifact_directory,
-            executable=EXISTING_EXECUTABLE,
-            runner=runner,
-        )
-
-    assert raised.value.kind == CodexFailureKind.MISSING_STRUCTURED_RESULT
-    assert not (artifact_directory / "result.json").exists()
-
-
-def test_non_zero_exit_still_fails_from_process_evidence(tmp_path):
-    runner = FakeRunner(
-        CodexProcessResult(returncode=2, stdout="diagnostic\n", stderr="auth failed\n"),
-        json.dumps(implementation_result()),
-    )
-
-    with pytest.raises(CodexExecutionFailure) as raised:
-        execute(
-            prompt="implement",
-            repo_path=tmp_path,
-            sandbox=Sandbox.WORKSPACE_WRITE,
-            output_schema=tmp_path / "implementation.schema.json",
-            artifact_directory=tmp_path / "artifacts",
-            executable=EXISTING_EXECUTABLE,
-            runner=runner,
-        )
-
-    assert raised.value.kind == CodexFailureKind.AUTHENTICATION_OR_SERVICE
-    assert raised.value.execution.process_started is True
-    assert raised.value.execution.process_exit_code == 2
-
-
-def test_process_start_failure_keeps_process_started_false(tmp_path):
-    with pytest.raises(CodexExecutionFailure) as raised:
-        execute(
-            prompt="implement",
-            repo_path=tmp_path,
-            sandbox=Sandbox.WORKSPACE_WRITE,
-            output_schema=tmp_path / "implementation.schema.json",
-            artifact_directory=tmp_path / "artifacts",
-            executable=EXISTING_EXECUTABLE,
-            runner=StartFailureRunner(),
-        )
-
-    assert raised.value.kind == CodexFailureKind.PROCESS_START_FAILED
-    assert raised.value.execution.process_started is False
-    assert raised.value.execution.process_exit_code is None
-
-
-def test_execution_rejects_target_codex_project_configuration(tmp_path):
-    repository = tmp_path / "repo"
-    repository.joinpath(".codex").mkdir(parents=True)
-    repository.joinpath(".codex", "config.toml").write_text(
-        "model = 'untrusted'\n",
-        encoding="utf-8",
-    )
-    runner = FakeRunner(successful_process(), json.dumps(implementation_result()))
-
-    with pytest.raises(CodexExecutionFailure) as raised:
-        execute(
-            prompt="implement",
-            repo_path=repository,
-            sandbox=Sandbox.WORKSPACE_WRITE,
-            output_schema=tmp_path / "implementation.schema.json",
-            artifact_directory=tmp_path / "artifacts",
-            executable=EXISTING_EXECUTABLE,
-            runner=runner,
-        )
-
-    assert raised.value.kind == CodexFailureKind.PROJECT_CONFIGURATION_REJECTED
-    assert runner.calls == 0
-
-
-def test_execute_resolves_bare_executable_from_path(monkeypatch, tmp_path):
-    repository = tmp_path / "repo"
-    repository.mkdir()
+def test_adapter_resolves_bare_executable_from_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     executable = write_path_executable(tmp_path / "tool-dir")
     prepend_executable_path(monkeypatch, executable.parent)
-    runner = FakeRunner(successful_process(), json.dumps(implementation_result()))
+    runner = FakeRunner(
+        CodexProcessResult(0, "", ""), json.dumps(implementation_payload())
+    )
+    settings = CodexSettings("codex", "gpt-5.5", "xhigh")
 
-    execute(
-        prompt="implement",
-        repo_path=repository,
-        sandbox=Sandbox.WORKSPACE_WRITE,
-        output_schema=tmp_path / "implementation.schema.json",
-        artifact_directory=tmp_path / "artifacts",
-        executable="codex",
-        runner=runner,
+    execution = CodexCliAgentExecutor(settings, runner=runner).execute(
+        request(tmp_path)
     )
 
+    assert execution.successful
     assert runner.command is not None
     assert runner.command.argv[0] == str(executable.resolve())
 
 
-def test_explicit_executable_does_not_use_path_lookup(monkeypatch, tmp_path):
-    repository = tmp_path / "repo"
-    repository.mkdir()
+def test_explicit_executable_does_not_use_path_lookup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     executable = write_path_executable(tmp_path / "tool-dir", name="codex-explicit")
-    runner = FakeRunner(successful_process(), json.dumps(implementation_result()))
+    runner = FakeRunner(
+        CodexProcessResult(0, "", ""), json.dumps(implementation_payload())
+    )
 
     def fail_which(_configured: str) -> str | None:
         raise AssertionError("explicit executable paths must not use PATH lookup")
 
     monkeypatch.setattr(executable_resolution.shutil, "which", fail_which)
+    settings = CodexSettings(str(executable), "gpt-5.5", "xhigh")
 
-    execute(
-        prompt="implement",
-        repo_path=repository,
-        sandbox=Sandbox.WORKSPACE_WRITE,
-        output_schema=tmp_path / "implementation.schema.json",
-        artifact_directory=tmp_path / "artifacts",
-        executable=str(executable),
-        runner=runner,
+    execution = CodexCliAgentExecutor(settings, runner=runner).execute(
+        request(tmp_path)
     )
 
+    assert execution.successful
     assert runner.command is not None
     assert runner.command.argv[0] == str(executable.resolve())
 
 
-def test_prompt_is_sent_over_stdin_and_uses_repository_cwd(tmp_path):
+def test_prompt_uses_stdin_repository_cwd_and_external_scratch(tmp_path: Path) -> None:
     repository = tmp_path / "repo with spaces"
     repository.mkdir()
-    runner = FakeRunner(successful_process(), json.dumps(implementation_result()))
+    runner = FakeRunner(
+        CodexProcessResult(0, "", ""), json.dumps(implementation_payload())
+    )
+    execution_request = request(repository)
 
-    execution = execute(
-        prompt="# Ticket\n\nImplement it.",
-        repo_path=repository,
-        sandbox=Sandbox.WORKSPACE_WRITE,
-        output_schema=tmp_path / "implementation.schema.json",
-        artifact_directory=tmp_path / "artifacts",
-        executable=EXISTING_EXECUTABLE,
-        runner=runner,
+    execution = CodexCliAgentExecutor(SETTINGS, runner=runner).execute(
+        execution_request
     )
 
-    assert runner.stdin == "# Ticket\n\nImplement it."
+    assert execution.successful
+    assert runner.stdin == "Application-owned task prompt."
     assert runner.command is not None
     assert runner.command.cwd == repository
     assert runner.command.environment is not None
@@ -520,10 +578,9 @@ def test_prompt_is_sent_over_stdin_and_uses_repository_cwd(tmp_path):
     }
     assert not scratch.is_relative_to(repository)
     assert not scratch.exists()
-    assert execution.successful
 
 
-def test_timeout_preserves_available_diagnostic_evidence(tmp_path):
+def test_timeout_preserves_partial_diagnostic_evidence(tmp_path: Path) -> None:
     runner = FakeRunner(
         error=CodexProcessTimedOut(
             CodexProcessTimeout(
@@ -533,44 +590,47 @@ def test_timeout_preserves_available_diagnostic_evidence(tmp_path):
             )
         )
     )
-
-    with pytest.raises(CodexExecutionFailure) as raised:
-        CodexExecutor(
-            executable=EXISTING_EXECUTABLE,
-            timeout_seconds=3,
-            runner=runner,
-        ).execute(
-            prompt="implement",
-            repo_path=tmp_path,
-            sandbox=Sandbox.WORKSPACE_WRITE,
-            output_schema=tmp_path / "implementation.schema.json",
-            artifact_directory=tmp_path / "artifacts",
-        )
-
-    assert raised.value.kind == CodexFailureKind.TIMEOUT
-    assert raised.value.execution.process_started is True
-    assert raised.value.execution.events_jsonl_path.read_text(encoding="utf-8") == (
-        '{"type":"turn.started"}\n'
-    )
-    assert raised.value.execution.stderr_log_path.read_text(encoding="utf-8") == (
-        "still working\n"
+    execution_request = request(tmp_path)
+    execution_request = AgentExecutionRequest(
+        task_kind=execution_request.task_kind,
+        repository_path=execution_request.repository_path,
+        repository_access=execution_request.repository_access,
+        prompt=execution_request.prompt,
+        result_contract=execution_request.result_contract,
+        artifact_directory=execution_request.artifact_directory,
+        policy=AgentExecutionPolicy(3, NetworkAccess.ALLOWED),
+        required_capabilities=execution_request.required_capabilities,
     )
 
+    execution = CodexCliAgentExecutor(SETTINGS, runner=runner).execute(
+        execution_request
+    )
 
-def test_subprocess_timeout_preserves_partial_output(monkeypatch, tmp_path):
-    def fake_run(*args, **kwargs):
-        raise codex_module.subprocess.TimeoutExpired(
+    assert execution.failure_category is AgentFailureCategory.TIMEOUT
+    assert (tmp_path / "artifacts" / "events.jsonl").read_text(
+        encoding="utf-8"
+    ) == '{"type":"turn.started"}\n'
+    assert (tmp_path / "artifacts" / "stderr.log").read_text(
+        encoding="utf-8"
+    ) == "still working\n"
+
+
+def test_subprocess_timeout_decodes_partial_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_run(*args: object, **kwargs: object) -> object:
+        raise process_module.subprocess.TimeoutExpired(
             cmd=args[0],
             timeout=kwargs["timeout"],
             output=b'{"type":"turn.started"}\n',
             stderr=b"partial stderr\n",
         )
 
-    monkeypatch.setattr(codex_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(process_module.subprocess, "run", fake_run)
 
     with pytest.raises(CodexProcessTimedOut) as raised:
         SubprocessCodexRunner().run(
-            CodexCommand(argv=("codex", "exec", "-"), cwd=tmp_path),
+            CodexCommand(("codex", "exec", "-"), tmp_path),
             stdin="prompt",
             timeout_seconds=5,
         )
@@ -580,10 +640,12 @@ def test_subprocess_timeout_preserves_partial_output(monkeypatch, tmp_path):
     assert raised.value.result.stderr == "partial stderr\n"
 
 
-def test_subprocess_runner_disables_shell_execution(monkeypatch, tmp_path):
+def test_subprocess_runner_uses_argv_and_disables_shell(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     captured: dict[str, object] = {}
 
-    def fake_run(*args, **kwargs):
+    def fake_run(*args: object, **kwargs: object) -> object:
         captured["args"] = args
         captured["kwargs"] = kwargs
 
@@ -594,17 +656,12 @@ def test_subprocess_runner_disables_shell_execution(monkeypatch, tmp_path):
 
         return Completed()
 
-    monkeypatch.setattr(codex_module.subprocess, "run", fake_run)
-
+    monkeypatch.setattr(process_module.subprocess, "run", fake_run)
     result = SubprocessCodexRunner().run(
         CodexCommand(
-            argv=("codex", "exec", "-"),
-            cwd=tmp_path,
-            environment={
-                "TEMP": "C:/scratch",
-                "TMP": "C:/scratch",
-                "TMPDIR": "C:/scratch",
-            },
+            ("codex", "exec", "-"),
+            tmp_path,
+            {"TEMP": "C:/scratch", "TMP": "C:/scratch", "TMPDIR": "C:/scratch"},
         ),
         stdin="prompt",
         timeout_seconds=10,
@@ -612,89 +669,48 @@ def test_subprocess_runner_disables_shell_execution(monkeypatch, tmp_path):
 
     assert result.returncode == 0
     assert captured["args"] == (("codex", "exec", "-"),)
-    assert isinstance(captured["kwargs"], dict)
-    assert captured["kwargs"]["cwd"] == tmp_path
-    assert captured["kwargs"]["input"] == b"prompt"
-    environment = captured["kwargs"]["env"]
-    assert isinstance(environment, dict)
-    assert environment["TEMP"] == "C:/scratch"
-    assert environment["TMP"] == "C:/scratch"
-    assert environment["TMPDIR"] == "C:/scratch"
-    assert captured["kwargs"]["shell"] is False
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["cwd"] == tmp_path
+    assert kwargs["input"] == b"prompt"
+    assert kwargs["shell"] is False
 
 
-def test_executor_rejects_a_scratch_directory_inside_the_repository(
-    monkeypatch, tmp_path
-):
+def test_adapter_rejects_scratch_inside_repository(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     repository = tmp_path / "repo"
     repository.mkdir()
-    scratch = repository / "pytest-tmp"
+    scratch = repository / "provider-scratch"
 
-    def create_repository_scratch(*, prefix):
+    def create_repository_scratch(*, prefix: str) -> str:
         del prefix
         scratch.mkdir()
         return str(scratch)
 
-    monkeypatch.setattr(codex_module.tempfile, "mkdtemp", create_repository_scratch)
-    runner = FakeRunner(successful_process(), json.dumps(implementation_result()))
+    monkeypatch.setattr(process_module.tempfile, "mkdtemp", create_repository_scratch)
+    runner = FakeRunner(
+        CodexProcessResult(0, "", ""), json.dumps(implementation_payload())
+    )
 
-    with pytest.raises(CodexExecutionFailure, match="outside the target repository"):
-        execute(
-            prompt="implement",
-            repo_path=repository,
-            sandbox=Sandbox.WORKSPACE_WRITE,
-            output_schema=tmp_path / "implementation.schema.json",
-            artifact_directory=tmp_path / "artifacts",
-            executable=EXISTING_EXECUTABLE,
-            runner=runner,
-        )
+    execution = CodexCliAgentExecutor(SETTINGS, runner=runner).execute(
+        request(repository)
+    )
 
+    assert execution.failure_category is AgentFailureCategory.INVOCATION_START_FAILURE
     assert runner.calls == 0
     assert not scratch.exists()
 
 
-def test_invalid_execution_config_fails_before_runner_starts(tmp_path):
-    runner = FakeRunner(successful_process(), json.dumps(implementation_result()))
+def test_invalid_settings_are_rejected_before_runner_starts(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        CodexProcessResult(0, "", ""), json.dumps(implementation_payload())
+    )
 
-    with pytest.raises(ConfigError, match="codex.reasoning_effort"):
-        execute(
-            prompt="implement",
-            repo_path=tmp_path,
-            sandbox=Sandbox.READ_ONLY,
-            output_schema=tmp_path / "implementation.schema.json",
-            artifact_directory=tmp_path / "artifacts",
-            executable=EXISTING_EXECUTABLE,
-            execution_config=CodexExecutionSettings(
-                model="gpt-5.5",
-                reasoning_effort="unsupported",
-            ),
+    with pytest.raises(CodexSettingsError, match="reasoning_effort"):
+        CodexCliAgentExecutor(
+            CodexSettings(EXISTING_EXECUTABLE, "gpt-5.5", "unsupported"),
             runner=runner,
         )
 
     assert runner.calls == 0
-
-
-def test_missing_executable_fails_before_runner_starts(monkeypatch, tmp_path):
-    monkeypatch.setattr(executable_resolution.shutil, "which", lambda _name: None)
-    runner = FakeRunner(successful_process(), json.dumps(implementation_result()))
-
-    with pytest.raises(CodexExecutionFailure) as raised:
-        execute(
-            prompt="implement",
-            repo_path=tmp_path,
-            sandbox=Sandbox.READ_ONLY,
-            output_schema=tmp_path / "implementation.schema.json",
-            artifact_directory=tmp_path / "artifacts",
-            executable="ticket-automation-missing-codex",
-            runner=runner,
-        )
-
-    assert runner.calls == 0
-    assert raised.value.kind == CodexFailureKind.EXECUTABLE_UNAVAILABLE
-
-
-def test_result_codecs_reject_unsupported_fields():
-    with pytest.raises(ResultValidationError, match="unsupported fields"):
-        decode_implementation_result(implementation_result(extra="no"))
-    with pytest.raises(ResultValidationError, match="unsupported fields"):
-        decode_review_result(review_result(extra="no"))

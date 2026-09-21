@@ -6,12 +6,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .attempts import AttemptRecord, update_attempt
-from .codex import (
-    CodexCommand,
-    CodexProcessResult,
-    CodexProcessRunner,
-    SubprocessCodexRunner,
-)
 from .git import GitRepository
 from .git_safety import WorkspaceSnapshot
 
@@ -69,37 +63,6 @@ class WritableAttempt:
             self.before_snapshot is not None
             and self.before_snapshot.inspection_complete
         )
-
-
-class _StartTrackingCodexRunner:
-    def __init__(
-        self,
-        runner: CodexProcessRunner | None,
-        writable_attempt: WritableAttempt,
-    ):
-        self._runner = runner or SubprocessCodexRunner()
-        self._writable_attempt = writable_attempt
-
-    def run(
-        self,
-        command: CodexCommand,
-        *,
-        stdin: str,
-        timeout_seconds: float | None,
-    ) -> CodexProcessResult:
-        self._writable_attempt.mark_process_started()
-        return self._runner.run(
-            command,
-            stdin=stdin,
-            timeout_seconds=timeout_seconds,
-        )
-
-
-def _track_writable_process_start(
-    runner: CodexProcessRunner | None,
-    writable_attempt: WritableAttempt,
-) -> CodexProcessRunner:
-    return _StartTrackingCodexRunner(runner, writable_attempt)
 
 
 @dataclass(frozen=True)

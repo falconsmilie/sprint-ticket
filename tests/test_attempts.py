@@ -7,10 +7,22 @@ from pathlib import Path
 
 import pytest
 
+from tests.fake_agent_executor import InMemoryAgentExecutor
 from tests.helpers import (
     create_git_repo,
     create_trusted_prepared_run,
+    make_agent_executor,
     make_config,
+)
+from ticket_automation.application.agent_execution import (
+    IMPLEMENTATION_RESULT_CONTRACT,
+    AgentExecutionPolicy,
+    AgentExecutionRequest,
+    AgentTaskKind,
+    ArtifactReference,
+    NetworkAccess,
+    RepositoryAccess,
+    required_execution_capabilities,
 )
 from ticket_automation.attempts import (
     AttemptError,
@@ -21,6 +33,10 @@ from ticket_automation.attempts import (
     load_attempt_records,
     start_attempt,
 )
+from ticket_automation.domain.task_results import (
+    ImplementationResult,
+    ImplementationStatus,
+)
 from ticket_automation.git import GitRepository
 from ticket_automation.models import (
     AttemptPhase,
@@ -29,7 +45,7 @@ from ticket_automation.models import (
     WorkflowState,
 )
 from ticket_automation.workflow import resume_ticket_lifecycle
-from ticket_automation.writable_worker import run_writable_codex
+from ticket_automation.writable_worker import run_writable_agent
 
 
 def fixed_clock() -> datetime:
@@ -237,18 +253,107 @@ def test_writable_worker_rejects_a_non_writable_phase(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match="is not writable"):
-        run_writable_codex(
+        request = AgentExecutionRequest(
+            task_kind=AgentTaskKind.IMPLEMENTATION,
+            repository_path=repository.path,
+            repository_access=RepositoryAccess.WORKSPACE_WRITE,
+            prompt="unused",
+            result_contract=IMPLEMENTATION_RESULT_CONTRACT,
+            artifact_directory=record.artifact_directory,
+            policy=AgentExecutionPolicy(60, NetworkAccess.ALLOWED),
+            required_capabilities=required_execution_capabilities(
+                RepositoryAccess.WORKSPACE_WRITE
+            ),
+        )
+        executor = InMemoryAgentExecutor(
+            {
+                AgentTaskKind.IMPLEMENTATION: ImplementationResult(
+                    ImplementationStatus.COMPLETED, "unused", (), (), ()
+                )
+            },
+            capabilities=required_execution_capabilities(
+                RepositoryAccess.WORKSPACE_WRITE
+            ),
+        )
+        run_writable_agent(
             repository=repository,
             run_dir=run_dir,
             operation="invalid-verification-write",
             phase=AttemptPhase.VERIFYING,
             attempt_record=record,
-            prompt="unused",
-            output_schema=tmp_path / "unused-schema.json",
-            artifact_directory=record.artifact_directory,
-            executable="unused",
-            execution_config=None,
+            executor=executor,
+            request=request,
         )
+
+
+def test_writable_worker_does_not_read_or_modify_provider_native_artifacts(
+    tmp_path: Path,
+) -> None:
+    repository = GitRepository(create_git_repo(tmp_path / "target"))
+    run_dir = tmp_path / "run"
+    record = start_attempt(
+        run_dir,
+        phase=AttemptPhase.IMPLEMENTING,
+        before_workspace_fingerprint="before",
+        clock=fixed_clock,
+    )
+    request = AgentExecutionRequest(
+        task_kind=AgentTaskKind.IMPLEMENTATION,
+        repository_path=repository.path,
+        repository_access=RepositoryAccess.WORKSPACE_WRITE,
+        prompt="Implement the ticket.",
+        result_contract=IMPLEMENTATION_RESULT_CONTRACT,
+        artifact_directory=record.artifact_directory,
+        policy=AgentExecutionPolicy(60, NetworkAccess.ALLOWED),
+        required_capabilities=required_execution_capabilities(
+            RepositoryAccess.WORKSPACE_WRITE
+        ),
+    )
+    inner = InMemoryAgentExecutor(
+        {
+            AgentTaskKind.IMPLEMENTATION: ImplementationResult(
+                ImplementationStatus.COMPLETED, "done", (), (), ()
+            )
+        },
+        capabilities=required_execution_capabilities(RepositoryAccess.WORKSPACE_WRITE),
+    )
+    provider_artifact = tmp_path / "provider-native.json"
+    original_provider_evidence = b'{"provider_owned": true}\n'
+    provider_artifact.write_bytes(original_provider_evidence)
+
+    class ProviderNativeEvidenceExecutor:
+        def execute(self, execution_request, **kwargs):
+            execution = inner.execute(execution_request, **kwargs)
+            return replace(
+                execution,
+                artifacts=(
+                    *execution.artifacts,
+                    ArtifactReference(
+                        "provider-native",
+                        provider_artifact,
+                        "application/json",
+                    ),
+                ),
+            )
+
+    invocation = run_writable_agent(
+        repository=repository,
+        run_dir=run_dir,
+        operation="implementation",
+        phase=AttemptPhase.IMPLEMENTING,
+        attempt_record=record,
+        executor=ProviderNativeEvidenceExecutor(),
+        request=request,
+    )
+
+    assert invocation.invocation_permitted
+    assert invocation.execution is not None
+    assert invocation.execution.successful
+    assert invocation.workspace_guard.artifact_path == (
+        record.artifact_directory / "workspace-guard.json"
+    )
+    assert invocation.workspace_guard.artifact_path.is_file()
+    assert provider_artifact.read_bytes() == original_provider_evidence
 
 
 def test_resume_requires_human_inspection_for_invalid_attempt_evidence(
@@ -273,6 +378,7 @@ def test_resume_requires_human_inspection_for_invalid_attempt_evidence(
         config,
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
+        agent_executor=make_agent_executor(config),
         clock=fixed_clock,
     )
 

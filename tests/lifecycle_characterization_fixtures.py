@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -8,6 +9,7 @@ from pathlib import Path
 from tests.helpers import create_git_repo, make_config
 from ticket_automation.attempts import AttemptRecord, load_attempt_records
 from ticket_automation.config import AppConfig
+from ticket_automation.providers.codex_cli import CodexProcessResult
 from ticket_automation.verification import VerificationProcessResult
 
 
@@ -56,11 +58,103 @@ def configure_fake_codex_actions(
     monkeypatch,
     directory: Path,
     *actions: str,
-) -> Path:
+) -> ScriptedCodexRunner:
     action_path = directory / "fake-codex-actions.json"
     action_path.write_text(json.dumps(actions), encoding="utf-8")
     monkeypatch.setenv("TA_FAKE_CODEX_ACTION_SEQUENCE", str(action_path))
-    return action_path
+    return ScriptedCodexRunner(action_path)
+
+
+@dataclass(frozen=True)
+class ScriptedCodexRunner:
+    action_path: Path
+
+    def run(self, command, *, stdin, timeout_seconds):
+        del stdin, timeout_seconds
+        actions = json.loads(self.action_path.read_text(encoding="utf-8"))
+        if not isinstance(actions, list) or not actions:
+            raise AssertionError("No scripted Codex result remains.")
+        action = actions.pop(0)
+        self.action_path.write_text(json.dumps(actions), encoding="utf-8")
+
+        if action == "fail-after-change":
+            command.cwd.joinpath("partial.txt").write_text(
+                "partial change\n", encoding="utf-8"
+            )
+            return CodexProcessResult(2, "", "fake codex failed\n")
+        if action == "fail":
+            return CodexProcessResult(2, "", "fake codex failed\n")
+        if action == "missing-result":
+            return CodexProcessResult(0, "", "")
+
+        output_path = Path(
+            command.argv[command.argv.index("--output-last-message") + 1]
+        )
+        if action == "malformed-result":
+            output_path.write_text("{malformed", encoding="utf-8")
+            return CodexProcessResult(0, "", "")
+
+        read_only = command.argv[command.argv.index("--sandbox") + 1] == "read-only"
+        if read_only:
+            result = _scripted_review_result(action)
+            if action == "review-pass-arm":
+                arm_path = os.environ.get("TA_FAKE_CODEX_ARM_FILE")
+                if not arm_path:
+                    raise AssertionError("review-pass-arm requires an arm file.")
+                Path(arm_path).write_text("armed\n", encoding="utf-8")
+        else:
+            result = _scripted_implementation_result(action)
+            if action in {"modify", "modify-correction"}:
+                target = "file.txt" if action == "modify" else "correction.txt"
+                command.cwd.joinpath(target).write_text(
+                    "implemented by fake codex\n", encoding="utf-8"
+                )
+        output_path.write_text(json.dumps(result), encoding="utf-8")
+        return CodexProcessResult(0, "", "")
+
+
+def _scripted_implementation_result(action: str) -> dict[str, object]:
+    status = "BLOCKED" if action == "blocked" else "COMPLETED"
+    return {
+        "status": status,
+        "summary": "fake implementation result",
+        "tests_run": [{"command": "fake validation", "result": "PASS"}],
+        "assumptions": [],
+        "known_issues": [] if status == "COMPLETED" else ["blocked by fake codex"],
+    }
+
+
+def _scripted_review_result(action: str) -> dict[str, object]:
+    corrections_required = action in {
+        "review-corrections",
+        "review-unsafe",
+        "review-inconsistent",
+    }
+    result: dict[str, object] = {
+        "verdict": "CORRECTIONS_REQUIRED" if corrections_required else "PASS",
+        "summary": "fake review result",
+        "findings": [],
+    }
+    if corrections_required:
+        result["findings"] = [
+            {
+                "id": "R1",
+                "disposition": "REQUIRED",
+                "scope_relation": (
+                    "REPOSITORY_AUTHORITY"
+                    if action == "review-unsafe"
+                    else "IMPLEMENTATION"
+                ),
+                "title": "Correct the implementation",
+                "description": "The implementation needs a correction.",
+                "evidence": "The deterministic fake review found the defect.",
+                "required_change": "Apply the correction.",
+                "acceptance_criteria": ["The corrected verification passes."],
+            }
+        ]
+    if action == "review-inconsistent":
+        result["verdict"] = "PASS"
+    return result
 
 
 @dataclass
@@ -77,9 +171,7 @@ class ScriptedVerificationRunner:
         return VerificationProcessResult(
             returncode=returncode,
             stdout=(
-                "verification passed\n"
-                if returncode == 0
-                else "verification failed\n"
+                "verification passed\n" if returncode == 0 else "verification failed\n"
             ),
             stderr="",
         )

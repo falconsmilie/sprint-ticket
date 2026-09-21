@@ -11,22 +11,24 @@ from ._verification_artifacts import (
     _read_verification_source_fingerprint,
     _VerificationArtifactError,
 )
+from .application.agent_execution import (
+    REVIEW_RESULT_CONTRACT,
+    AgentExecution,
+    AgentExecutionPolicy,
+    AgentExecutionRequest,
+    AgentExecutor,
+    AgentFailureCategory,
+    AgentTaskKind,
+    NetworkAccess,
+    RepositoryAccess,
+    required_execution_capabilities,
+)
 from .attempts import (
     attempt_result_path,
     finish_phase_attempt,
     latest_attempt,
     start_attempt,
     update_attempt,
-)
-from .codex import (
-    CodexExecution,
-    CodexExecutionFailure,
-    CodexProcessRunner,
-    Sandbox,
-    _CodexResultKind,
-)
-from .codex import (
-    _execute as _execute_codex,
 )
 from .config import AppConfig, VerificationCommand
 from .domain.task_results import (
@@ -43,7 +45,13 @@ from .git_safety import (
     WorkspaceSnapshot,
     workspace_safety_changes,
 )
-from .models import AttemptPhase, AttemptStatus, StageOutcome, WorkflowState
+from .models import (
+    ATTEMPT_RESULT_ARTIFACT_NAME,
+    AttemptPhase,
+    AttemptStatus,
+    StageOutcome,
+    WorkflowState,
+)
 from .resolved_config import config_from_resolved_run_config
 from .runs import (
     BASELINE_RECORD_FILE,
@@ -54,11 +62,15 @@ from .runs import (
     load_baseline_record,
     load_run_record,
 )
-from .task_result_codecs import decode_implementation_result, decode_review_result
+from .task_result_codecs import (
+    decode_implementation_result,
+    decode_review_result,
+    encode_review_result,
+)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _REVIEW_PROMPT_TEMPLATE = _PROJECT_ROOT / "prompts" / "review.md"
-_REVIEW_RESULT_SCHEMA = _PROJECT_ROOT / "schemas" / "review-result.schema.json"
+_AGENT_TIMEOUT_SECONDS = 60 * 60
 
 
 class ReviewError(RunError):
@@ -79,7 +91,7 @@ class ReviewStageResult:
     run_record: RunRecord
     outcome: StageOutcome
     artifact_directory: Path
-    codex_execution: CodexExecution | None
+    agent_execution: AgentExecution[ReviewResult] | None
     review_result: ReviewResult | None
     safety_violations: tuple[ReviewSafetyViolation, ...]
     processing_error: str | None
@@ -100,7 +112,7 @@ def run_review_stage(
     config: AppConfig,
     run_dir: Path | str,
     *,
-    codex_runner: CodexProcessRunner | None = None,
+    agent_executor: AgentExecutor,
     clock: Callable[[], datetime] | None = None,
 ) -> ReviewStageResult:
     run_path = Path(run_dir)
@@ -222,45 +234,54 @@ def run_review_stage(
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message="Review evidence could not be prepared safely.",
         )
-    try:
+
+    def mark_invocation_started() -> None:
         update_attempt(attempt_record, process_started=True)
-        execution = _execute_codex(
-            prompt=prompt,
-            repo_path=repository.path,
-            sandbox=Sandbox.READ_ONLY,
-            output_schema=_REVIEW_RESULT_SCHEMA,
-            artifact_directory=artifact_directory,
-            executable=config.codex.executable,
-            execution_config=config.codex.execution,
-            runner=codex_runner,
-            _result_kind=_CodexResultKind.REVIEW,
-        )
-    except CodexExecutionFailure as error:
+
+    request = AgentExecutionRequest(
+        task_kind=AgentTaskKind.REVIEW,
+        repository_path=repository.path,
+        repository_access=RepositoryAccess.READ_ONLY,
+        prompt=prompt,
+        result_contract=REVIEW_RESULT_CONTRACT,
+        artifact_directory=artifact_directory,
+        policy=AgentExecutionPolicy(
+            timeout_seconds=_AGENT_TIMEOUT_SECONDS,
+            network_access=NetworkAccess.DENIED,
+        ),
+        required_capabilities=required_execution_capabilities(
+            RepositoryAccess.READ_ONLY
+        ),
+    )
+    execution = agent_executor.execute(
+        request,
+        on_invocation_start=mark_invocation_started,
+    )
+    if not execution.successful:
         safety_violations = _inspect_review_invariants(
             repository,
             run_record,
             expected_snapshot=repository_snapshot,
         )
-        consistency_error = _review_consistency_error(error.execution)
         if safety_violations:
             outcome = StageOutcome.HUMAN_REQUIRED
             processing_error = None
             message = (
-                "Codex review failed and repository safety invariants were violated."
+                "Agent review failed and repository safety invariants were violated."
             )
-        elif consistency_error is not None:
+        elif execution.failure_category is AgentFailureCategory.INVALID_RESULT:
             outcome = StageOutcome.HUMAN_REQUIRED
-            processing_error = consistency_error
-            message = f"Review result is logically contradictory: {consistency_error}"
+            processing_error = execution.failure_message
+            message = execution.failure_message or "Agent review result was invalid."
         else:
             outcome = StageOutcome.FAILED
             processing_error = None
-            message = error.execution.failure_message or str(error)
+            message = execution.failure_message or "Agent review failed."
         return _finish(
             run_record=run_record,
             run_dir=run_path,
             artifact_directory=artifact_directory,
-            execution=error.execution,
+            execution=execution,
             review_result=None,
             safety_violations=safety_violations,
             processing_error=processing_error,
@@ -268,7 +289,7 @@ def run_review_stage(
             controller_message=message,
         )
 
-    review_result = _require_review_result(execution.structured_result)
+    review_result = _require_review_result(execution.result)
     safety_violations = _inspect_review_invariants(
         repository,
         run_record,
@@ -328,7 +349,7 @@ def _finish_valid_review_result(
     run_record: RunRecord,
     run_dir: Path,
     artifact_directory: Path,
-    execution: CodexExecution | None,
+    execution: AgentExecution[ReviewResult] | None,
     review_result: ReviewResult,
 ) -> ReviewStageResult:
     if review_result.verdict == ReviewVerdict.PASS:
@@ -376,13 +397,19 @@ def _finish(
     run_record: RunRecord,
     run_dir: Path,
     artifact_directory: Path,
-    execution: CodexExecution | None,
+    execution: AgentExecution[ReviewResult] | None,
     review_result: ReviewResult | None,
     safety_violations: tuple[ReviewSafetyViolation, ...],
     processing_error: str | None,
     outcome: StageOutcome,
     controller_message: str,
 ) -> ReviewStageResult:
+    _write_review_result(
+        artifact_directory,
+        review_result,
+        outcome=outcome,
+        controller_message=controller_message,
+    )
     after_fingerprint: str | None = None
     try:
         after_fingerprint = WorkspaceSnapshot.capture(
@@ -395,19 +422,39 @@ def _finish(
         phase=AttemptPhase.REVIEWING,
         stage_outcome=outcome,
         after_workspace_fingerprint=after_fingerprint,
-        process_started=(None if execution is None else execution.process_started),
-        execution_path=(None if execution is None else execution.execution_json_path),
+        process_started=(None if execution is None else execution.invocation_started),
+        execution_path=None,
     )
     return ReviewStageResult(
         run_dir=run_dir,
         run_record=run_record,
         outcome=outcome,
         artifact_directory=artifact_directory,
-        codex_execution=execution,
+        agent_execution=execution,
         review_result=review_result,
         safety_violations=safety_violations,
         processing_error=processing_error,
         controller_message=controller_message,
+    )
+
+
+def _write_review_result(
+    artifact_directory: Path,
+    result: ReviewResult | None,
+    *,
+    outcome: StageOutcome,
+    controller_message: str,
+) -> None:
+    path = artifact_directory / ATTEMPT_RESULT_ARTIFACT_NAME
+    payload = (
+        encode_review_result(result)
+        if result is not None
+        else {"status": outcome.value, "message": controller_message}
+    )
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
     )
 
 
@@ -513,17 +560,6 @@ def _read_implementation_summary(run_path: Path) -> str:
     except ResultValidationError:
         return "No implementation summary is available."
     return result.summary
-
-
-def _review_consistency_error(execution: CodexExecution) -> str | None:
-    try:
-        value = json.loads(execution.result_json_path.read_text(encoding="utf-8"))
-        decode_review_result(value)
-    except ReviewResultConsistencyError as error:
-        return str(error)
-    except (OSError, json.JSONDecodeError, ResultValidationError):
-        return None
-    return None
 
 
 def _require_review_result(value: Any) -> ReviewResult:

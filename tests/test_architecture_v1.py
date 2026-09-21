@@ -7,7 +7,19 @@ from pathlib import Path
 
 import pytest
 
-from tests.helpers import GIT, create_git_repo, create_trusted_prepared_run, make_config
+from tests.fake_agent_executor import InMemoryAgentExecutor
+from tests.helpers import (
+    GIT,
+    create_git_repo,
+    create_trusted_prepared_run,
+    make_agent_executor,
+    make_config,
+)
+from ticket_automation.application.agent_execution import (
+    AgentTaskKind,
+    RepositoryAccess,
+    required_execution_capabilities,
+)
 from ticket_automation.attempts import (
     attempt_result_path,
     latest_writable_attempt,
@@ -15,11 +27,17 @@ from ticket_automation.attempts import (
     start_attempt,
     update_attempt,
 )
-from ticket_automation.codex import CodexProcessResult
+from ticket_automation.domain.task_results import (
+    ImplementationResult,
+    ImplementationStatus,
+    ReviewResult,
+    ReviewVerdict,
+)
 from ticket_automation.git import GitRepository
 from ticket_automation.git_safety import WorkspaceSnapshot
 from ticket_automation.implementation import run_implementation_stage
 from ticket_automation.models import AttemptPhase, StopCategory, WorkflowState
+from ticket_automation.providers.codex_cli import CodexProcessResult
 from ticket_automation.reporting import run_report_stage
 from ticket_automation.review import run_review_stage
 from ticket_automation.runs import create_run_snapshot, load_run_record, save_run_record
@@ -62,6 +80,26 @@ class FailOnceVerificationRunner:
         )
 
 
+class WorkspaceChangingExecutor:
+    def __init__(self, inner: InMemoryAgentExecutor) -> None:
+        self.inner = inner
+
+    def execute(self, request, *, on_invocation_start=None):
+        def start() -> None:
+            if on_invocation_start is not None:
+                on_invocation_start()
+            if request.task_kind is AgentTaskKind.IMPLEMENTATION:
+                request.repository_path.joinpath("file.txt").write_text(
+                    "implemented\n", encoding="utf-8"
+                )
+            elif request.task_kind is AgentTaskKind.CORRECTION:
+                request.repository_path.joinpath("correction.txt").write_text(
+                    "corrected\n", encoding="utf-8"
+                )
+
+        return self.inner.execute(request, on_invocation_start=start)
+
+
 @dataclass
 class CompletingCodexRunner:
     calls: int = 0
@@ -101,14 +139,17 @@ def _ticket(tmp_path: Path) -> Path:
 @pytest.mark.skipif(GIT is None, reason="git executable is required")
 def test_lifecycle_writes_only_numbered_attempt_evidence(tmp_path, monkeypatch):
     repo = create_git_repo(tmp_path / "target")
+    config = make_config(repo)
     runner = PassingVerificationRunner()
 
     result = run_ticket_lifecycle(
-        make_config(repo),
+        config,
         _ticket(tmp_path),
         runs_dir=tmp_path / "runs",
         verification_runner=runner,
-        codex_runner=CompletingCodexRunner(),
+        agent_executor=make_agent_executor(
+            config, process_runner=CompletingCodexRunner()
+        ),
         clock=fixed_clock,
     )
 
@@ -136,7 +177,9 @@ def test_lifecycle_writes_only_numbered_attempt_evidence(tmp_path, monkeypatch):
     assert (implementation / "stderr.log").is_file()
     assert (implementation / "result.json").is_file()
     execution_metadata = json.loads((implementation / "execution.json").read_text())
-    assert execution_metadata["workspace_guard"]["new_environments"] == []
+    assert "workspace_guard" not in execution_metadata
+    guard_metadata = json.loads((implementation / "workspace-guard.json").read_text())
+    assert guard_metadata["new_environments"] == []
     assert "workspace_guard" not in attempts[1].metadata
     verification = attempts[2].artifact_directory
     verification_result = json.loads((verification / "result.json").read_text())
@@ -148,9 +191,7 @@ def test_lifecycle_writes_only_numbered_attempt_evidence(tmp_path, monkeypatch):
     assert writable is not None
     assert writable.after_workspace_fingerprint is not None
     final_workspace = WorkspaceSnapshot.capture(GitRepository(repo))
-    assert final_workspace.matches_fingerprint(
-        writable.after_workspace_fingerprint
-    )
+    assert final_workspace.matches_fingerprint(writable.after_workspace_fingerprint)
     assert not any(
         (result.run_dir / name).exists()
         for name in (
@@ -184,7 +225,9 @@ def test_resume_reruns_safe_verification_as_a_new_attempt(tmp_path, monkeypatch)
     implementation = run_implementation_stage(
         config,
         snapshot.run_dir,
-        codex_runner=CompletingCodexRunner(),
+        agent_executor=make_agent_executor(
+            config, process_runner=CompletingCodexRunner()
+        ),
         clock=fixed_clock,
     )
     assert implementation.successful
@@ -214,7 +257,9 @@ def test_resume_reruns_safe_verification_as_a_new_attempt(tmp_path, monkeypatch)
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
         verification_runner=PassingVerificationRunner(),
-        codex_runner=CompletingCodexRunner(),
+        agent_executor=make_agent_executor(
+            config, process_runner=CompletingCodexRunner()
+        ),
         clock=fixed_clock,
     )
 
@@ -231,7 +276,9 @@ def test_resume_reruns_safe_verification_as_a_new_attempt(tmp_path, monkeypatch)
     for relative_directory, evidence in completed_evidence.items():
         directory = snapshot.run_dir / relative_directory
         current_paths = {
-            path.relative_to(directory) for path in directory.rglob("*") if path.is_file()
+            path.relative_to(directory)
+            for path in directory.rglob("*")
+            if path.is_file()
         }
         assert current_paths == set(evidence)
         assert all(
@@ -269,14 +316,14 @@ def test_interrupted_writable_state_requires_human_inspection(tmp_path):
         config,
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
+        agent_executor=make_agent_executor(config),
         clock=fixed_clock,
     )
 
     assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
     assert result.run_record.stop_reason is not None
     assert (
-        result.run_record.stop_reason.category
-        == StopCategory.HUMAN_JUDGMENT_REQUIRED
+        result.run_record.stop_reason.category == StopCategory.HUMAN_JUDGMENT_REQUIRED
     )
     persisted_attempts = load_attempt_records(result.run_dir)
     assert persisted_attempts[-1] == attempt
@@ -289,12 +336,15 @@ def test_interrupted_writable_state_requires_human_inspection(tmp_path):
 @pytest.mark.skipif(GIT is None, reason="git executable is required")
 def test_reporting_renders_without_changing_controller_state(tmp_path, monkeypatch):
     repo = create_git_repo(tmp_path / "target")
+    config = make_config(repo)
     result = run_ticket_lifecycle(
-        make_config(repo),
+        config,
         _ticket(tmp_path),
         runs_dir=tmp_path / "runs",
         verification_runner=PassingVerificationRunner(),
-        codex_runner=CompletingCodexRunner(),
+        agent_executor=make_agent_executor(
+            config, process_runner=CompletingCodexRunner()
+        ),
         clock=fixed_clock,
     )
     before = load_run_record(result.run_dir / "run.json")
@@ -309,9 +359,10 @@ def test_reporting_renders_without_changing_controller_state(tmp_path, monkeypat
 @pytest.mark.skipif(GIT is None, reason="git executable is required")
 def test_resume_restarts_preparation_in_a_new_attempt(tmp_path):
     repository = create_git_repo(tmp_path / "target")
+    config = make_config(repository)
     ticket = _ticket(tmp_path)
     snapshot = create_run_snapshot(
-        make_config(repository),
+        config,
         ticket,
         runs_dir=tmp_path / "runs",
         clock=fixed_clock,
@@ -324,11 +375,13 @@ def test_resume_restarts_preparation_in_a_new_attempt(tmp_path):
     )
 
     result = resume_ticket_lifecycle(
-        make_config(repository),
+        config,
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
         verification_runner=PassingVerificationRunner(),
-        codex_runner=CompletingCodexRunner(),
+        agent_executor=make_agent_executor(
+            config, process_runner=CompletingCodexRunner()
+        ),
         clock=fixed_clock,
     )
 
@@ -359,7 +412,9 @@ def test_resume_restarts_review_in_a_new_attempt(tmp_path):
     implementation = run_implementation_stage(
         config,
         snapshot.run_dir,
-        codex_runner=CompletingCodexRunner(),
+        agent_executor=make_agent_executor(
+            config, process_runner=CompletingCodexRunner()
+        ),
         clock=fixed_clock,
     )
     verifying = implementation.run_record.transition_to(
@@ -390,7 +445,9 @@ def test_resume_restarts_review_in_a_new_attempt(tmp_path):
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
         verification_runner=PassingVerificationRunner(),
-        codex_runner=CompletingCodexRunner(),
+        agent_executor=make_agent_executor(
+            config, process_runner=CompletingCodexRunner()
+        ),
         clock=fixed_clock,
     )
 
@@ -421,7 +478,9 @@ def test_resume_restarts_reporting_in_a_new_attempt(tmp_path):
     implementation = run_implementation_stage(
         config,
         snapshot.run_dir,
-        codex_runner=CompletingCodexRunner(),
+        agent_executor=make_agent_executor(
+            config, process_runner=CompletingCodexRunner()
+        ),
         clock=fixed_clock,
     )
     verifying = implementation.run_record.transition_to(
@@ -443,7 +502,9 @@ def test_resume_restarts_reporting_in_a_new_attempt(tmp_path):
     review = run_review_stage(
         config,
         snapshot.run_dir,
-        codex_runner=CompletingCodexRunner(),
+        agent_executor=make_agent_executor(
+            config, process_runner=CompletingCodexRunner()
+        ),
         clock=fixed_clock,
     )
     reporting = review.run_record.transition_to(
@@ -463,7 +524,9 @@ def test_resume_restarts_reporting_in_a_new_attempt(tmp_path):
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
         verification_runner=PassingVerificationRunner(),
-        codex_runner=CompletingCodexRunner(),
+        agent_executor=make_agent_executor(
+            config, process_runner=CompletingCodexRunner()
+        ),
         clock=fixed_clock,
     )
 
@@ -479,6 +542,7 @@ def test_resume_restarts_reporting_in_a_new_attempt(tmp_path):
 @pytest.mark.skipif(GIT is None, reason="git executable is required")
 def test_rendering_failure_cannot_reclassify_an_accepted_handoff(tmp_path, monkeypatch):
     repository = create_git_repo(tmp_path / "target")
+    config = make_config(repository)
     original_write_text = Path.write_text
 
     def fail_report_write(path, data, *args, **kwargs):
@@ -488,11 +552,13 @@ def test_rendering_failure_cannot_reclassify_an_accepted_handoff(tmp_path, monke
 
     monkeypatch.setattr(Path, "write_text", fail_report_write)
     result = run_ticket_lifecycle(
-        make_config(repository),
+        config,
         _ticket(tmp_path),
         runs_dir=tmp_path / "runs",
         verification_runner=PassingVerificationRunner(),
-        codex_runner=CompletingCodexRunner(),
+        agent_executor=make_agent_executor(
+            config, process_runner=CompletingCodexRunner()
+        ),
         clock=fixed_clock,
     )
 
@@ -508,6 +574,7 @@ def test_rendering_failure_cannot_reclassify_an_accepted_handoff(tmp_path, monke
 @pytest.mark.skipif(GIT is None, reason="git executable is required")
 def test_terminal_report_describes_a_failed_baseline_attempt(tmp_path):
     repository = create_git_repo(tmp_path / "target")
+    config = make_config(repository)
 
     class FailingBaselineRunner:
         def run(self, command, *, timeout_seconds):
@@ -515,9 +582,10 @@ def test_terminal_report_describes_a_failed_baseline_attempt(tmp_path):
             return VerificationProcessResult(returncode=1, stdout="failed", stderr="")
 
     result = run_ticket_lifecycle(
-        make_config(repository),
+        config,
         _ticket(tmp_path),
         runs_dir=tmp_path / "runs",
+        agent_executor=make_agent_executor(config),
         verification_runner=FailingBaselineRunner(),
         clock=fixed_clock,
     )
@@ -530,14 +598,44 @@ def test_terminal_report_describes_a_failed_baseline_attempt(tmp_path):
 @pytest.mark.skipif(GIT is None, reason="git executable is required")
 def test_one_correction_round_preserves_the_ordinary_lifecycle(tmp_path):
     repository = create_git_repo(tmp_path / "target")
+    config = make_config(repository)
     verification = FailOnceVerificationRunner()
+    capabilities = required_execution_capabilities(
+        RepositoryAccess.READ_ONLY
+    ) | required_execution_capabilities(RepositoryAccess.WORKSPACE_WRITE)
+    executor = WorkspaceChangingExecutor(
+        InMemoryAgentExecutor(
+            {
+                AgentTaskKind.IMPLEMENTATION: ImplementationResult(
+                    ImplementationStatus.COMPLETED,
+                    "implemented",
+                    (),
+                    (),
+                    (),
+                ),
+                AgentTaskKind.CORRECTION: ImplementationResult(
+                    ImplementationStatus.COMPLETED,
+                    "corrected",
+                    (),
+                    (),
+                    (),
+                ),
+                AgentTaskKind.REVIEW: ReviewResult(
+                    ReviewVerdict.PASS,
+                    "review passed",
+                    (),
+                ),
+            },
+            capabilities=capabilities,
+        )
+    )
 
     result = run_ticket_lifecycle(
-        make_config(repository),
+        config,
         _ticket(tmp_path),
         runs_dir=tmp_path / "runs",
         verification_runner=verification,
-        codex_runner=CompletingCodexRunner(),
+        agent_executor=executor,
         clock=fixed_clock,
     )
 
@@ -555,9 +653,7 @@ def test_one_correction_round_preserves_the_ordinary_lifecycle(tmp_path):
         "REPORTING",
     ]
     failed_verification = next(
-        item
-        for item in attempts
-        if item.phase == "VERIFYING" and item.sequence == 3
+        item for item in attempts if item.phase == "VERIFYING" and item.sequence == 3
     )
     result_path = attempt_result_path(result.run_dir, failed_verification)
     verification_evidence = json.loads(result_path.read_text(encoding="utf-8"))
@@ -571,3 +667,22 @@ def test_one_correction_round_preserves_the_ordinary_lifecycle(tmp_path):
         if path.name != "prompt.md"
     )
     assert len(correction_tickets) == 1
+    stage_executions = (
+        result.implementation_result.agent_execution,
+        result.correction_results[0].agent_execution,
+        result.review_results[0].agent_execution,
+    )
+    provider_specific_names = {
+        "execution-details",
+        "events",
+        "standard-error",
+        "structured-result",
+    }
+    assert all(execution is not None for execution in stage_executions)
+    assert all(
+        provider_specific_names.isdisjoint(
+            artifact.name for artifact in execution.artifacts
+        )
+        for execution in stage_executions
+        if execution is not None
+    )

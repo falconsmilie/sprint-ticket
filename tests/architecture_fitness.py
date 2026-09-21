@@ -147,21 +147,6 @@ def _provider_debt(
 
 
 ARCHITECTURE_DEBT = (
-    _provider_debt(
-        "ticket_automation.corrections",
-        "CodexExecution",
-        "Migrate correction execution to the application-owned agent port.",
-    ),
-    _provider_debt(
-        "ticket_automation.corrections",
-        "CodexFailureKind",
-        "Map correction failures through provider-neutral categories.",
-    ),
-    _provider_debt(
-        "ticket_automation.corrections",
-        "CodexProcessRunner",
-        "Inject the application-owned agent port into correction execution.",
-    ),
     _private_debt(
         "ticket_automation.corrections",
         "ticket_automation._verification_artifacts",
@@ -189,21 +174,6 @@ ARCHITECTURE_DEBT = (
         "_baseline_verification_evidence_problem",
         "TA-EVID-001",
         "Move verification evidence access behind its public codec contract.",
-    ),
-    _provider_debt(
-        "ticket_automation.implementation",
-        "CodexExecution",
-        "Migrate implementation execution to the application-owned agent port.",
-    ),
-    _provider_debt(
-        "ticket_automation.implementation",
-        "CodexFailureKind",
-        "Map implementation failures through provider-neutral categories.",
-    ),
-    _provider_debt(
-        "ticket_automation.implementation",
-        "CodexProcessRunner",
-        "Inject the application-owned agent port into implementation execution.",
     ),
     _private_debt(
         "ticket_automation.resolved_config",
@@ -225,50 +195,6 @@ ARCHITECTURE_DEBT = (
         "_VerificationArtifactError",
         "TA-EVID-001",
         "Move verification evidence errors into the public codec contract.",
-    ),
-    _provider_debt(
-        "ticket_automation.review",
-        "CodexExecution",
-        "Migrate review execution to the application-owned agent port.",
-    ),
-    _provider_debt(
-        "ticket_automation.review",
-        "CodexExecutionFailure",
-        "Map review failures through provider-neutral categories.",
-    ),
-    _provider_debt(
-        "ticket_automation.review",
-        "CodexProcessRunner",
-        "Inject the application-owned agent port into review execution.",
-    ),
-    _provider_debt(
-        "ticket_automation.review",
-        "Sandbox",
-        "Replace provider sandbox values with neutral repository access.",
-    ),
-    _provider_debt(
-        "ticket_automation.review",
-        "_CodexResultKind",
-        "Keep Codex result interpretation inside the Codex adapter.",
-    ),
-    _provider_debt(
-        "ticket_automation.review",
-        "_execute",
-        "Call the application-owned agent port instead of Codex internals.",
-    ),
-    _private_debt(
-        "ticket_automation.review",
-        "ticket_automation.codex",
-        "_CodexResultKind",
-        "TA-AGENT-002",
-        "Keep Codex result parsing private to the Codex adapter.",
-    ),
-    _private_debt(
-        "ticket_automation.review",
-        "ticket_automation.codex",
-        "_execute",
-        "TA-AGENT-002",
-        "Call the application agent port instead of Codex execution internals.",
     ),
     _private_debt(
         "ticket_automation.runs",
@@ -326,56 +252,6 @@ ARCHITECTURE_DEBT = (
         "TA-LIFE-002",
         "Invoke verification through the split lifecycle stage API.",
     ),
-    _provider_debt(
-        "ticket_automation.workflow",
-        "CodexProcessRunner",
-        "Compose the agent executor outside lifecycle orchestration.",
-    ),
-    _provider_debt(
-        "ticket_automation.writable_attempts",
-        "CodexCommand",
-        "Move Codex command evidence into the provider adapter.",
-    ),
-    _provider_debt(
-        "ticket_automation.writable_attempts",
-        "CodexProcessResult",
-        "Move Codex process evidence into the provider adapter.",
-    ),
-    _provider_debt(
-        "ticket_automation.writable_attempts",
-        "CodexProcessRunner",
-        "Use the provider-neutral executor at the writable boundary.",
-    ),
-    _provider_debt(
-        "ticket_automation.writable_attempts",
-        "SubprocessCodexRunner",
-        "Keep subprocess construction inside the Codex adapter.",
-    ),
-    _provider_debt(
-        "ticket_automation.writable_worker",
-        "CodexExecution",
-        "Use provider-neutral execution results in writable orchestration.",
-    ),
-    _provider_debt(
-        "ticket_automation.writable_worker",
-        "CodexExecutionFailure",
-        "Use provider-neutral failure categories in writable orchestration.",
-    ),
-    _provider_debt(
-        "ticket_automation.writable_worker",
-        "CodexProcessRunner",
-        "Use the provider-neutral executor at the writable boundary.",
-    ),
-    _provider_debt(
-        "ticket_automation.writable_worker",
-        "Sandbox",
-        "Replace provider sandbox values with neutral repository access.",
-    ),
-    _provider_debt(
-        "ticket_automation.writable_worker",
-        "execute",
-        "Call the application-owned agent port instead of the Codex adapter directly.",
-    ),
     _private_debt(
         "ticket_automation.writable_worker",
         "ticket_automation.workspace_guard",
@@ -396,13 +272,6 @@ ARCHITECTURE_DEBT = (
         "_capture_writable_attempt",
         "TA-WRITE-001",
         "Consolidate writable attempt capture behind the guarded operation.",
-    ),
-    _private_debt(
-        "ticket_automation.writable_worker",
-        "ticket_automation.writable_attempts",
-        "_track_writable_process_start",
-        "TA-WRITE-001",
-        "Consolidate writable process tracking behind the guarded operation.",
     ),
 )
 
@@ -564,6 +433,7 @@ def _import_violations(edge: ImportEdge) -> list[Violation]:
         ]
         if application_targets and not any(
             _matches_module(target, f"{PACKAGE}.application.ports")
+            or _matches_module(target, f"{PACKAGE}.application.agent_execution")
             for target in application_targets
         ):
             rule = (

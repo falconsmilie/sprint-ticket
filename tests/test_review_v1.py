@@ -8,10 +8,17 @@ import ticket_automation.review as review_module
 from tests.helpers import (
     create_git_repo,
     create_trusted_prepared_run,
+    make_agent_executor,
     make_config,
 )
+from ticket_automation.application.agent_execution import (
+    AgentExecution,
+    AgentExecutionStatus,
+    AgentFailureCategory,
+    InvocationStart,
+    ProviderId,
+)
 from ticket_automation.attempts import latest_attempt
-from ticket_automation.codex import CodexProcessResult
 from ticket_automation.implementation import run_implementation_stage
 from ticket_automation.models import (
     AttemptPhase,
@@ -19,6 +26,7 @@ from ticket_automation.models import (
     StageOutcome,
     WorkflowState,
 )
+from ticket_automation.providers.codex_cli import CodexProcessResult
 from ticket_automation.review import run_review_stage
 from ticket_automation.runs import save_run_record
 from ticket_automation.verification import (
@@ -112,7 +120,9 @@ def test_review_snapshot_failure_is_recorded_as_human_required(
     implementation = run_implementation_stage(
         config,
         snapshot.run_dir,
-        codex_runner=CompletingCodexRunner(),
+        agent_executor=make_agent_executor(
+            config, process_runner=CompletingCodexRunner()
+        ),
         clock=fixed_clock,
     )
     verifying = implementation.run_record.transition_to(
@@ -141,10 +151,91 @@ def test_review_snapshot_failure_is_recorded_as_human_required(
         "capture",
         staticmethod(fail_capture),
     )
-    result = run_review_stage(config, snapshot.run_dir, clock=fixed_clock)
+    result = run_review_stage(
+        config,
+        snapshot.run_dir,
+        agent_executor=make_agent_executor(config),
+        clock=fixed_clock,
+    )
 
     attempt = latest_attempt(snapshot.run_dir, phases=(AttemptPhase.REVIEWING,))
     assert result.outcome is StageOutcome.HUMAN_REQUIRED
     assert attempt is not None
     assert attempt.process_started is False
+    assert attempt.status is AttemptStatus.HUMAN_REQUIRED
+
+
+def test_invalid_review_result_without_provider_artifacts_requires_human(
+    tmp_path: Path,
+) -> None:
+    repository = create_git_repo(tmp_path / "target")
+    config = make_config(repository)
+    ticket = tmp_path / "TA-ARCH-009.md"
+    ticket.write_text("# Ticket\n", encoding="utf-8")
+    snapshot = create_trusted_prepared_run(
+        config,
+        ticket,
+        runs_dir=tmp_path / "runs",
+        clock=fixed_clock,
+    )
+    implementing = snapshot.run_record.transition_to(
+        WorkflowState.IMPLEMENTING,
+        updated_timestamp="2026-09-14T10:16:00Z",
+    )
+    save_run_record(implementing, snapshot.run_dir / "run.json")
+    implementation = run_implementation_stage(
+        config,
+        snapshot.run_dir,
+        agent_executor=make_agent_executor(
+            config, process_runner=CompletingCodexRunner()
+        ),
+        clock=fixed_clock,
+    )
+    verifying = implementation.run_record.transition_to(
+        WorkflowState.VERIFYING,
+        updated_timestamp="2026-09-14T10:17:00Z",
+    )
+    save_run_record(verifying, snapshot.run_dir / "run.json")
+    verification = run_verification_stage(
+        config,
+        snapshot.run_dir,
+        process_runner=PassingVerificationRunner(),
+        clock=fixed_clock,
+    )
+    reviewing = verification.run_record.transition_to(
+        WorkflowState.REVIEWING,
+        updated_timestamp="2026-09-14T10:18:00Z",
+    )
+    save_run_record(reviewing, snapshot.run_dir / "run.json")
+
+    class InvalidResultExecutor:
+        def execute(self, request, *, on_invocation_start=None):
+            if on_invocation_start is not None:
+                on_invocation_start()
+            now = fixed_clock()
+            return AgentExecution(
+                provider_id=ProviderId("test-provider"),
+                task_kind=request.task_kind,
+                status=AgentExecutionStatus.FAILED,
+                invocation_start=InvocationStart.STARTED,
+                started_at=now,
+                ended_at=now,
+                duration_seconds=0,
+                failure_category=AgentFailureCategory.INVALID_RESULT,
+                failure_message="Invalid review result.",
+            )
+
+    result = run_review_stage(
+        config,
+        snapshot.run_dir,
+        agent_executor=InvalidResultExecutor(),
+        clock=fixed_clock,
+    )
+
+    attempt = latest_attempt(snapshot.run_dir, phases=(AttemptPhase.REVIEWING,))
+    assert result.outcome is StageOutcome.HUMAN_REQUIRED
+    assert result.controller_message == "Invalid review result."
+    assert result.processing_error == "Invalid review result."
+    assert attempt is not None
+    assert attempt.process_started is True
     assert attempt.status is AttemptStatus.HUMAN_REQUIRED

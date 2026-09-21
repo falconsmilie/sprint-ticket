@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from tests.helpers import GIT, run_git
+from tests.helpers import GIT, make_agent_executor, run_git
 from tests.lifecycle_characterization_fixtures import (
     ScriptedVerificationRunner,
     TickingClock,
@@ -114,7 +114,7 @@ def test_writable_implementation_stop_matrix(
 ):
     workspace = build_lifecycle_workspace(tmp_path)
     baseline = WorkspaceSnapshot.capture(GitRepository(workspace.repository))
-    configure_fake_codex_actions(monkeypatch, tmp_path, case.action)
+    codex_runner = configure_fake_codex_actions(monkeypatch, tmp_path, case.action)
     verification_runner = ScriptedVerificationRunner([0])
     if case.remove_executable:
         original_run = verification_runner.run
@@ -130,6 +130,9 @@ def test_writable_implementation_stop_matrix(
         workspace.config,
         workspace.ticket,
         runs_dir=workspace.runs_dir,
+        agent_executor=make_agent_executor(
+            workspace.config, process_runner=codex_runner
+        ),
         verification_runner=verification_runner,
         clock=TickingClock(),
     )
@@ -146,8 +149,7 @@ def test_writable_implementation_stop_matrix(
     assert writable.before_workspace_fingerprint is not None
     assert writable.after_workspace_fingerprint is not None
     assert (
-        writable.before_workspace_fingerprint
-        != writable.after_workspace_fingerprint
+        writable.before_workspace_fingerprint != writable.after_workspace_fingerprint
     ) is case.workspace_changed
     current = WorkspaceSnapshot.capture(GitRepository(workspace.repository))
     assert (current.fingerprint != baseline.fingerprint) is case.workspace_changed
@@ -156,7 +158,7 @@ def test_writable_implementation_stop_matrix(
 
 def test_required_review_finding_creates_correction_work(tmp_path, monkeypatch):
     workspace = build_lifecycle_workspace(tmp_path)
-    configure_fake_codex_actions(
+    codex_runner = configure_fake_codex_actions(
         monkeypatch,
         tmp_path,
         "modify",
@@ -169,6 +171,9 @@ def test_required_review_finding_creates_correction_work(tmp_path, monkeypatch):
         workspace.config,
         workspace.ticket,
         runs_dir=workspace.runs_dir,
+        agent_executor=make_agent_executor(
+            workspace.config, process_runner=codex_runner
+        ),
         verification_runner=ScriptedVerificationRunner([0, 0, 0]),
         clock=TickingClock(),
     )
@@ -222,7 +227,7 @@ def test_review_finding_outside_correction_scope_remains_human_required(
     tmp_path, monkeypatch
 ):
     workspace = build_lifecycle_workspace(tmp_path)
-    configure_fake_codex_actions(
+    codex_runner = configure_fake_codex_actions(
         monkeypatch,
         tmp_path,
         "modify",
@@ -233,6 +238,9 @@ def test_review_finding_outside_correction_scope_remains_human_required(
         workspace.config,
         workspace.ticket,
         runs_dir=workspace.runs_dir,
+        agent_executor=make_agent_executor(
+            workspace.config, process_runner=codex_runner
+        ),
         verification_runner=ScriptedVerificationRunner([0, 0]),
         clock=TickingClock(),
     )
@@ -255,7 +263,7 @@ def test_review_finding_outside_correction_scope_remains_human_required(
 
 def test_inconsistent_review_result_requires_human_review(tmp_path, monkeypatch):
     workspace = build_lifecycle_workspace(tmp_path)
-    configure_fake_codex_actions(
+    codex_runner = configure_fake_codex_actions(
         monkeypatch,
         tmp_path,
         "modify",
@@ -266,6 +274,9 @@ def test_inconsistent_review_result_requires_human_review(tmp_path, monkeypatch)
         workspace.config,
         workspace.ticket,
         runs_dir=workspace.runs_dir,
+        agent_executor=make_agent_executor(
+            workspace.config, process_runner=codex_runner
+        ),
         verification_runner=ScriptedVerificationRunner([0, 0]),
         clock=TickingClock(),
     )
@@ -273,8 +284,7 @@ def test_inconsistent_review_result_requires_human_review(tmp_path, monkeypatch)
     assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
     assert result.run_record.stop_reason is not None
     assert (
-        result.run_record.stop_reason.category
-        == StopCategory.HUMAN_JUDGMENT_REQUIRED
+        result.run_record.stop_reason.category == StopCategory.HUMAN_JUDGMENT_REQUIRED
     )
     assert_attempt_ledger(
         result.run_dir,
@@ -289,7 +299,7 @@ def test_inconsistent_review_result_requires_human_review(tmp_path, monkeypatch)
 
 def test_correction_limit_exhaustion_stops_conservatively(tmp_path, monkeypatch):
     workspace = build_lifecycle_workspace(tmp_path, max_correction_rounds=1)
-    configure_fake_codex_actions(
+    codex_runner = configure_fake_codex_actions(
         monkeypatch,
         tmp_path,
         "modify",
@@ -300,6 +310,9 @@ def test_correction_limit_exhaustion_stops_conservatively(tmp_path, monkeypatch)
         workspace.config,
         workspace.ticket,
         runs_dir=workspace.runs_dir,
+        agent_executor=make_agent_executor(
+            workspace.config, process_runner=codex_runner
+        ),
         verification_runner=ScriptedVerificationRunner([0, 1, 1]),
         clock=TickingClock(),
     )
@@ -307,8 +320,7 @@ def test_correction_limit_exhaustion_stops_conservatively(tmp_path, monkeypatch)
     assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
     assert result.run_record.stop_reason is not None
     assert (
-        result.run_record.stop_reason.category
-        == StopCategory.HUMAN_JUDGMENT_REQUIRED
+        result.run_record.stop_reason.category == StopCategory.HUMAN_JUDGMENT_REQUIRED
     )
     assert result.run_record.current_correction_round == 1
     attempts = assert_attempt_ledger(
@@ -342,7 +354,7 @@ def test_correction_limit_exhaustion_stops_conservatively(tmp_path, monkeypatch)
 )
 def test_final_handoff_rejects_repository_drift(tmp_path, monkeypatch, drift):
     workspace = build_lifecycle_workspace(tmp_path)
-    action_path = configure_fake_codex_actions(
+    codex_runner = configure_fake_codex_actions(
         monkeypatch,
         tmp_path,
         "modify",
@@ -391,11 +403,14 @@ def test_final_handoff_rejects_repository_drift(tmp_path, monkeypatch, drift):
         workspace.config,
         workspace.ticket,
         runs_dir=workspace.runs_dir,
+        agent_executor=make_agent_executor(
+            workspace.config, process_runner=codex_runner
+        ),
         verification_runner=ScriptedVerificationRunner([0, 0]),
         clock=TickingClock(),
     )
 
-    assert json.loads(action_path.read_text(encoding="utf-8")) == []
+    assert json.loads(codex_runner.action_path.read_text(encoding="utf-8")) == []
     assert drift_applied
     assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
     assert result.run_record.stop_reason is not None

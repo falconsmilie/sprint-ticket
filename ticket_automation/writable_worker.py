@@ -1,20 +1,20 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Generic, TypeVar
 
-from .attempts import AttemptRecord, update_attempt
-from .codex import (
-    CodexExecution,
-    CodexExecutionFailure,
-    CodexProcessRunner,
-    Sandbox,
+from .application.agent_execution import (
+    AgentExecution,
+    AgentExecutionRequest,
+    AgentExecutor,
+    InvocationStart,
+    RepositoryAccess,
 )
-from .codex import execute as execute_codex
+from .attempts import AttemptRecord, update_attempt
+from .domain.task_results import TaskResult
 from .git import GitRepository
 from .git_safety import WorkspaceSnapshot
 from .models import PHASE_DEFINITIONS, AttemptPhase
@@ -25,24 +25,25 @@ from .workspace_guard import (
     _format_workspace_environment_inspection_failure,
     capture_workspace_environment_snapshot,
     format_workspace_hygiene_violation,
+    write_workspace_guard_inspection,
 )
 from .writable_attempts import (
     WritableAttempt,
     _capture_writable_attempt,
-    _track_writable_process_start,
 )
+
+ResultT = TypeVar("ResultT", bound=TaskResult)
 
 
 @dataclass(frozen=True)
-class WritableCodexInvocation:
-    """All safety evidence captured around exactly one writable Codex call."""
+class WritableAgentInvocation(Generic[ResultT]):
+    """All safety evidence captured around one writable provider call."""
 
     attempt: WritableAttempt
     workspace_guard: WorkspaceGuardInspection
     before_workspace: WorkspaceSnapshot | None
     after_workspace: WorkspaceSnapshot | None
-    execution: CodexExecution | None
-    failure: CodexExecutionFailure | None
+    execution: AgentExecution[ResultT] | None
     invocation_permitted: bool
 
     @property
@@ -56,22 +57,18 @@ class WritableCodexInvocation:
         )
 
 
-def run_writable_codex(
+def run_writable_agent(
     *,
     repository: GitRepository,
     run_dir: Path | str,
     operation: str,
     phase: AttemptPhase,
     attempt_record: AttemptRecord,
-    prompt: str,
-    output_schema: Path | str,
-    artifact_directory: Path | str,
-    executable: str,
-    execution_config: Any,
-    runner: CodexProcessRunner | None = None,
+    executor: AgentExecutor,
+    request: AgentExecutionRequest[ResultT],
     clock: Callable[[], datetime] | None = None,
-) -> WritableCodexInvocation:
-    """Run one workspace-write Codex invocation behind the common guard.
+) -> WritableAgentInvocation[ResultT]:
+    """Run one workspace-write provider invocation behind the common guard.
 
     The deterministic environment policy is deliberately narrow: it compares
     credible Python virtual-environment and Conda roots inside the target
@@ -83,6 +80,14 @@ def run_writable_codex(
         raise TypeError("phase must be an AttemptPhase value.")
     if not PHASE_DEFINITIONS[phase].writes_target_repository:
         raise ValueError(f"Attempt phase {phase.value} is not writable.")
+    if request.repository_access is not RepositoryAccess.WORKSPACE_WRITE:
+        raise ValueError(
+            "Writable execution requires workspace-write repository access."
+        )
+    if request.repository_path.resolve() != repository.path.resolve():
+        raise ValueError(
+            "Execution request repository does not match the guarded repository."
+        )
     environment_before = _capture_environment_snapshot(repository)
     before_workspace, before_error = _capture_workspace_snapshot(repository)
     environment_before = _with_workspace_inspection_errors(
@@ -107,36 +112,28 @@ def run_writable_codex(
         guard = _persist_guard_evidence_if_needed(
             attempt,
             guard,
-            execution=None,
         )
-        return WritableCodexInvocation(
+        return WritableAgentInvocation(
             attempt=attempt,
             workspace_guard=guard,
             before_workspace=before_workspace,
             after_workspace=None,
             execution=None,
-            failure=None,
             invocation_permitted=False,
         )
 
-    execution: CodexExecution | None = None
-    failure: CodexExecutionFailure | None = None
+    execution: AgentExecution[ResultT] | None = None
     after_workspace: WorkspaceSnapshot | None = None
     try:
-        try:
-            execution = execute_codex(
-                prompt=prompt,
-                repo_path=repository.path,
-                sandbox=Sandbox.WORKSPACE_WRITE,
-                output_schema=output_schema,
-                artifact_directory=artifact_directory,
-                executable=executable,
-                execution_config=execution_config,
-                runner=_track_writable_process_start(runner, attempt),
+        completed_execution = executor.execute(
+            request,
+            on_invocation_start=attempt.mark_process_started,
+        )
+        execution = completed_execution
+        if completed_execution.invocation_start is not InvocationStart.UNKNOWN:
+            attempt.record_process_started(
+                completed_execution.invocation_start is InvocationStart.STARTED
             )
-        except CodexExecutionFailure as error:
-            attempt.record_process_started(error.execution.process_started)
-            failure = error
     finally:
         after_workspace, after_error = _capture_workspace_snapshot(repository)
         environment_after = _capture_environment_snapshot(repository)
@@ -165,15 +162,13 @@ def run_writable_codex(
         guard = _persist_guard_evidence_if_needed(
             attempt,
             guard,
-            execution=execution,
         )
-    return WritableCodexInvocation(
+    return WritableAgentInvocation(
         attempt=attempt,
         workspace_guard=guard,
         before_workspace=before_workspace,
         after_workspace=after_workspace,
         execution=execution,
-        failure=failure,
         invocation_permitted=True,
     )
 
@@ -229,39 +224,20 @@ def _with_workspace_inspection_errors(
 def _persist_guard_evidence_if_needed(
     attempt: WritableAttempt,
     inspection: WorkspaceGuardInspection,
-    *,
-    execution: CodexExecution | None,
 ) -> WorkspaceGuardInspection:
-    """Keep workspace-guard evidence with the writable execution metadata."""
+    """Persist application-owned guard evidence without editing provider artifacts."""
 
-    path = (
-        attempt.record.artifact_directory / "execution.json"
-        if execution is None
-        else execution.execution_json_path
+    path = attempt.record.artifact_directory / "workspace-guard.json"
+    persisted = replace(
+        inspection,
+        artifact_path=path,
     )
-    try:
-        data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
-    except (OSError, json.JSONDecodeError) as error:
-        raise RuntimeError(
-            f"Could not update writable execution metadata: {error}"
-        ) from error
-    if not isinstance(data, dict):
-        raise TypeError("Writable execution metadata must be a JSON object.")
-    if execution is None:
-        data = {
-            "schema_version": 1,
-            "format": "ticket_automation.writable_execution",
-            "process_started": False,
-            **data,
-        }
-        attempt.record = update_attempt(attempt.record, execution_path="execution.json")
-    data["workspace_guard"] = inspection.to_dict()
-    path.write_text(
-        json.dumps(data, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-        newline="\n",
+    write_workspace_guard_inspection(persisted)
+    attempt.record = update_attempt(
+        attempt.record,
+        execution_path=path.relative_to(attempt.record.artifact_directory).as_posix(),
     )
-    return inspection
+    return persisted
 
 
 def _format_writable_guard_stop(
@@ -290,6 +266,6 @@ def _format_writable_guard_stop(
 
 
 __all__ = [
-    "WritableCodexInvocation",
-    "run_writable_codex",
+    "WritableAgentInvocation",
+    "run_writable_agent",
 ]

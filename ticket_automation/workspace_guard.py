@@ -188,11 +188,6 @@ def write_workspace_guard_inspection(
 ) -> None:
     if inspection.artifact_path is None:
         raise ValueError("A workspace-guard artifact path is required for persistence.")
-    if not inspection.requires_human:
-        raise ValueError(
-            "A standalone workspace-guard artifact is only permitted for an "
-            "inspection failure or a prohibited environment."
-        )
     _atomic_write_json(inspection.artifact_path, inspection.to_dict())
 
 

@@ -21,7 +21,16 @@ from .config import (
     VerificationSettings,
     validate_codex_execution_settings,
 )
-from .executable_resolution import resolve_executable
+from .providers.codex_cli.executable import resolve_executable
+from .providers.codex_cli.validation import (
+    CodexCliValidationError,
+)
+from .providers.codex_cli.validation import (
+    cli_version as _provider_cli_version,
+)
+from .providers.codex_cli.validation import (
+    supports_ephemeral as _provider_supports_ephemeral,
+)
 
 RESOLVED_RUN_CONFIG_SCHEMA_VERSION = 1
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -279,43 +288,15 @@ def config_from_resolved_run_config(resolved: ResolvedRunConfig) -> AppConfig:
 
 def codex_cli_version(executable: Path | str) -> str:
     try:
-        completed = subprocess.run(
-            [str(executable), "--version"],
-            cwd=_PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise ResolvedRunConfigError(
-            f"Could not determine Codex CLI version: {error}"
-        ) from error
-    output = (completed.stdout or completed.stderr).strip()
-    if completed.returncode != 0 or not output:
-        raise ResolvedRunConfigError(
-            "Could not determine Codex CLI version from the resolved executable."
-        )
-    return " ".join(output.splitlines()[0].split())
+        return _provider_cli_version(executable, cwd=_PROJECT_ROOT)
+    except CodexCliValidationError as error:
+        raise ResolvedRunConfigError(str(error)) from error
 
 
 def _codex_cli_supports_ephemeral(executable: Path | str) -> bool:
     """Return whether this Codex executable advertises ephemeral exec support."""
 
-    try:
-        completed = subprocess.run(
-            [str(executable), "exec", "--help"],
-            cwd=_PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return completed.returncode == 0 and "--ephemeral" in (
-        (completed.stdout or "") + (completed.stderr or "")
-    )
+    return _provider_supports_ephemeral(executable, cwd=_PROJECT_ROOT)
 
 
 def _policy_asset_sha256() -> dict[str, str]:

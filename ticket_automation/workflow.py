@@ -13,6 +13,7 @@ from ._verification_artifacts import (
     _verification_commands_fingerprint,
     _VerificationArtifactError,
 )
+from .application.agent_execution import AgentExecutor
 from .attempts import (
     AttemptError,
     AttemptRecord,
@@ -24,7 +25,6 @@ from .attempts import (
     start_attempt,
 )
 from .audit import diff_including_untracked
-from .codex import CodexProcessRunner
 from .config import AppConfig
 from .correction_planner import plan_pending_correction
 from .corrections import (
@@ -131,7 +131,7 @@ def run_ticket_lifecycle(
     ticket_path: Path | str,
     *,
     runs_dir: Path | str,
-    codex_runner: CodexProcessRunner | None = None,
+    agent_executor: AgentExecutor,
     verification_runner: VerificationProcessRunner | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> LifecycleResult:
@@ -146,7 +146,7 @@ def run_ticket_lifecycle(
             ticket_path,
             runs_dir=runs_dir,
             repository_lock=repository_lock,
-            codex_runner=codex_runner,
+            agent_executor=agent_executor,
             verification_runner=verification_runner,
             clock=clock,
         )
@@ -158,7 +158,7 @@ def _run_ticket_lifecycle_locked(
     *,
     runs_dir: Path | str,
     repository_lock: RepositoryRunLock,
-    codex_runner: CodexProcessRunner | None,
+    agent_executor: AgentExecutor,
     verification_runner: VerificationProcessRunner | None,
     clock: Callable[[], datetime] | None,
 ) -> LifecycleResult:
@@ -192,7 +192,7 @@ def _run_ticket_lifecycle_locked(
             verification_results=verification_results,
             review_results=review_results,
             correction_results=correction_results,
-            codex_runner=codex_runner,
+            agent_executor=agent_executor,
             verification_runner=verification_runner,
             repository_lock=repository_lock,
             clock=clock,
@@ -244,7 +244,7 @@ def resume_ticket_lifecycle(
     run_id: str,
     *,
     runs_dir: Path | str,
-    codex_runner: CodexProcessRunner | None = None,
+    agent_executor: AgentExecutor,
     verification_runner: VerificationProcessRunner | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> LifecycleResult:
@@ -270,7 +270,7 @@ def resume_ticket_lifecycle(
             preflight_result,
             run_record,
             repository_lock=repository_lock,
-            codex_runner=codex_runner,
+            agent_executor=agent_executor,
             verification_runner=verification_runner,
             clock=clock,
         )
@@ -283,7 +283,7 @@ def _resume_ticket_lifecycle_locked(
     run_record: RunRecord,
     *,
     repository_lock: RepositoryRunLock,
-    codex_runner: CodexProcessRunner | None,
+    agent_executor: AgentExecutor,
     verification_runner: VerificationProcessRunner | None,
     clock: Callable[[], datetime] | None,
 ) -> LifecycleResult:
@@ -380,7 +380,7 @@ def _resume_ticket_lifecycle_locked(
             implementation_result = run_implementation_stage(
                 config,
                 run_dir,
-                codex_runner=codex_runner,
+                agent_executor=agent_executor,
                 clock=clock,
             )
             run_record = _persist_stage_outcome(
@@ -406,7 +406,7 @@ def _resume_ticket_lifecycle_locked(
             verification_results=verification_results,
             review_results=review_results,
             correction_results=correction_results,
-            codex_runner=codex_runner,
+            agent_executor=agent_executor,
             verification_runner=verification_runner,
             repository_lock=repository_lock,
             clock=clock,
@@ -522,7 +522,7 @@ def _drive_lifecycle(
     verification_results: list[VerificationStageResult],
     review_results: list[ReviewStageResult],
     correction_results: list[CorrectionStageResult],
-    codex_runner: CodexProcessRunner | None,
+    agent_executor: AgentExecutor,
     verification_runner: VerificationProcessRunner | None,
     repository_lock: RepositoryRunLock,
     clock: Callable[[], datetime] | None,
@@ -542,7 +542,7 @@ def _drive_lifecycle(
             implementation_result = run_implementation_stage(
                 config,
                 run_dir,
-                codex_runner=codex_runner,
+                agent_executor=agent_executor,
                 clock=clock,
             )
             run_record = _persist_stage_outcome(
@@ -584,7 +584,7 @@ def _drive_lifecycle(
             review = run_review_stage(
                 config,
                 run_dir,
-                codex_runner=codex_runner,
+                agent_executor=agent_executor,
                 clock=clock,
             )
             run_record = _persist_stage_outcome(
@@ -626,7 +626,7 @@ def _drive_lifecycle(
                 config,
                 run_dir,
                 cause_set=cause_set,
-                codex_runner=codex_runner,
+                agent_executor=agent_executor,
                 clock=clock,
             )
             run_record = _persist_stage_outcome(
@@ -1034,8 +1034,8 @@ def _implementation_stop_category(
     if result.outcome != StageOutcome.HUMAN_REQUIRED:
         return None
     if (
-        result.codex_execution is not None
-        and result.codex_execution.failure_kind is not None
+        result.agent_execution is not None
+        and result.agent_execution.failure_category is not None
     ):
         return StopCategory.REPOSITORY_UNCERTAIN
     if result.safety_violations or (
@@ -1053,8 +1053,8 @@ def _correction_stop_category(
     if result.outcome != StageOutcome.HUMAN_REQUIRED:
         return None
     if (
-        result.codex_execution is not None
-        and result.codex_execution.failure_kind is not None
+        result.agent_execution is not None
+        and result.agent_execution.failure_category is not None
     ):
         return StopCategory.REPOSITORY_UNCERTAIN
     if result.safety_violations or (

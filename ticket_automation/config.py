@@ -6,14 +6,22 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-DEFAULT_CODEX_MODEL = "gpt-5.5"
-DEFAULT_CODEX_REASONING_EFFORT = "xhigh"
+from .providers.codex_cli.settings import (
+    DEFAULT_CODEX_MODEL,
+    DEFAULT_CODEX_REASONING_EFFORT,
+    SUPPORTED_CODEX_REASONING_EFFORTS,
+    CodexExecutionOverrides,
+    CodexExecutionSettings,
+    CodexSettings,
+    CodexSettingsError,
+)
+from .providers.codex_cli.settings import (
+    validate_codex_execution_settings as _validate_codex_execution_settings,
+)
+
 DEFAULT_MAX_CORRECTION_ROUNDS = 1
 IMPLEMENTATION_SANDBOX_POLICY = "workspace-write"
 REVIEW_SANDBOX_POLICY = "read-only"
-SUPPORTED_CODEX_REASONING_EFFORTS = frozenset(
-    {"none", "minimal", "low", "medium", "high", "xhigh"}
-)
 SECRET_FIELD_MARKERS = ("secret", "password", "token", "api_key", "apikey")
 
 
@@ -31,32 +39,6 @@ class ProjectSettings:
 @dataclass(frozen=True)
 class RunnerSettings:
     max_correction_rounds: int
-
-
-@dataclass(frozen=True)
-class CodexExecutionSettings:
-    model: str
-    reasoning_effort: str
-
-
-@dataclass(frozen=True)
-class CodexExecutionOverrides:
-    model: str | None = None
-    reasoning_effort: str | None = None
-
-
-@dataclass(frozen=True)
-class CodexSettings:
-    executable: str
-    model: str
-    reasoning_effort: str
-
-    @property
-    def execution(self) -> CodexExecutionSettings:
-        return CodexExecutionSettings(
-            model=self.model,
-            reasoning_effort=self.reasoning_effort,
-        )
 
 
 @dataclass(frozen=True)
@@ -191,12 +173,10 @@ def resolve_codex_execution_config(
 def validate_codex_execution_settings(
     execution: CodexExecutionSettings,
 ) -> CodexExecutionSettings:
-    return _codex_execution_settings(
-        execution.model,
-        execution.reasoning_effort,
-        model_name="codex.model",
-        reasoning_name="codex.reasoning_effort",
-    )
+    try:
+        return _validate_codex_execution_settings(execution)
+    except CodexSettingsError as error:
+        raise ConfigError(str(error)) from error
 
 
 def format_config_summary(config: AppConfig) -> str:

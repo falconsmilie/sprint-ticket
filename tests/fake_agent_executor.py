@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import json
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import TypeVar, cast
 
@@ -13,10 +14,15 @@ from ticket_automation.application.agent_execution import (
     AgentExecutionStatus,
     AgentFailureCategory,
     AgentTaskKind,
+    ArtifactReference,
     InvocationStart,
     ProviderId,
 )
 from ticket_automation.domain.task_results import TaskResult
+from ticket_automation.task_result_codecs import (
+    encode_implementation_result,
+    encode_review_result,
+)
 
 _IN_MEMORY_PROVIDER = ProviderId("in-memory")
 ResultT = TypeVar("ResultT", bound=TaskResult)
@@ -36,12 +42,16 @@ class InMemoryAgentExecutor:
         self.requests: list[AgentExecutionRequest[TaskResult]] = []
 
     def execute(
-        self, request: AgentExecutionRequest[ResultT]
+        self,
+        request: AgentExecutionRequest[ResultT],
+        *,
+        on_invocation_start: Callable[[], None] | None = None,
     ) -> AgentExecution[ResultT]:
         missing = request.missing_capabilities(self._capabilities)
         if missing:
             now = datetime.now(UTC)
             names = ", ".join(sorted(capability.value for capability in missing))
+            artifacts = _artifacts(request)
             return AgentExecution(
                 provider_id=self._provider_id,
                 task_kind=request.task_kind,
@@ -54,6 +64,7 @@ class InMemoryAgentExecutor:
                     AgentFailureCategory.CAPABILITY_OR_CONFIGURATION_FAILURE
                 ),
                 failure_message=f"Unsupported required capabilities: {names}.",
+                artifacts=artifacts,
                 provider_metadata={
                     "missing_capabilities": tuple(
                         sorted(capability.value for capability in missing)
@@ -65,7 +76,10 @@ class InMemoryAgentExecutor:
             raise TypeError(
                 "Scripted result does not satisfy the requested result contract."
             )
+        if on_invocation_start is not None:
+            on_invocation_start()
         self.requests.append(request)
+        artifacts = _artifacts(request, result)
         now = datetime.now(UTC)
         return AgentExecution(
             provider_id=self._provider_id,
@@ -76,7 +90,35 @@ class InMemoryAgentExecutor:
             ended_at=now,
             duration_seconds=0,
             result=cast(ResultT, result),
+            artifacts=artifacts,
         )
+
+
+def _artifacts(
+    request: AgentExecutionRequest[TaskResult],
+    result: TaskResult | None = None,
+) -> tuple[ArtifactReference, ...]:
+    directory = request.artifact_directory
+    paths = {
+        "request-copy": directory / "request.txt",
+        "in-memory-log": directory / "memory.log",
+        "in-memory-details": directory / "memory-execution.json",
+        "typed-output": directory / "memory-result.json",
+    }
+    directory.mkdir(parents=True, exist_ok=True)
+    paths["request-copy"].write_text(request.prompt, encoding="utf-8")
+    paths["in-memory-log"].write_text("", encoding="utf-8")
+    paths["in-memory-details"].write_text("{}\n", encoding="utf-8")
+    names = ["request-copy", "in-memory-log", "in-memory-details"]
+    if result is not None:
+        encoder = (
+            encode_review_result
+            if request.task_kind is AgentTaskKind.REVIEW
+            else encode_implementation_result
+        )
+        paths["typed-output"].write_text(json.dumps(encoder(result)), encoding="utf-8")
+        names.append("typed-output")
+    return tuple(ArtifactReference(name, paths[name]) for name in names)
 
 
 __all__ = ["InMemoryAgentExecutor"]

@@ -1,3 +1,5 @@
+"""Provider-neutral executable path resolution."""
+
 from __future__ import annotations
 
 import os
@@ -18,25 +20,15 @@ def resolve_executable(
 ) -> Path | None:
     if not configured:
         raise ValueError("Executable must be a non-empty string.")
-
     if _has_path_part(configured):
         candidate = Path(configured)
         if not candidate.is_absolute():
-            # A target repository is untrusted input. A relative executable is
-            # meaningful only when it has the TicketAutomation configuration
-            # directory that supplied it; never fall back to a process or target
-            # repository working directory.
             if config_dir is None:
                 return None
             candidate = Path(config_dir) / candidate
-        if candidate.is_file():
-            return candidate.resolve()
-        return None
-
+        return candidate.resolve() if candidate.is_file() else None
     resolved = shutil.which(configured)
-    if resolved is None:
-        return None
-    return Path(resolved).resolve()
+    return None if resolved is None else Path(resolved).resolve()
 
 
 def _has_path_part(configured: str) -> bool:

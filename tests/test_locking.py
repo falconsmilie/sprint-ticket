@@ -11,8 +11,13 @@ from pathlib import Path
 
 import pytest
 
-from tests.helpers import GIT, PROJECT_ROOT, create_git_repo, make_config
-from ticket_automation.codex import CodexCommand, CodexProcessResult
+from tests.helpers import (
+    GIT,
+    PROJECT_ROOT,
+    create_git_repo,
+    make_agent_executor,
+    make_config,
+)
 from ticket_automation.config import VerificationCommand
 from ticket_automation.locking import (
     RepositoryLockError,
@@ -20,6 +25,7 @@ from ticket_automation.locking import (
     active_repository_locks,
 )
 from ticket_automation.models import WorkflowState
+from ticket_automation.providers.codex_cli import CodexCommand, CodexProcessResult
 from ticket_automation.runs import RunPreflightError, create_run_snapshot
 from ticket_automation.verification import (
     VerificationProcessCommand,
@@ -150,7 +156,9 @@ def test_second_run_against_same_repository_is_blocked(tmp_path):
                 config,
                 ticket,
                 runs_dir=runs_dir,
-                codex_runner=SequencedCodexRunner([]),
+                agent_executor=make_agent_executor(
+                    config, process_runner=SequencedCodexRunner([])
+                ),
                 verification_runner=PassingVerificationRunner(),
                 clock=fixed_clock,
             )
@@ -176,7 +184,9 @@ def test_second_resume_against_same_repository_is_blocked(tmp_path):
                 config,
                 snapshot.run_record.run_id,
                 runs_dir=runs_dir,
-                codex_runner=SequencedCodexRunner([]),
+                agent_executor=make_agent_executor(
+                    config, process_runner=SequencedCodexRunner([])
+                ),
                 verification_runner=PassingVerificationRunner(),
                 clock=fixed_clock,
             )
@@ -223,7 +233,9 @@ def test_same_repository_is_blocked_across_distinct_run_roots(tmp_path):
                 config,
                 ticket,
                 runs_dir=second_runs_dir,
-                codex_runner=SequencedCodexRunner([]),
+                agent_executor=make_agent_executor(
+                    config, process_runner=SequencedCodexRunner([])
+                ),
                 verification_runner=PassingVerificationRunner(),
                 clock=fixed_clock,
             )
@@ -246,14 +258,17 @@ def test_different_repositories_can_run_independently(tmp_path):
             config_b,
             ticket_b,
             runs_dir=runs_dir,
-            codex_runner=SequencedCodexRunner(
-                [
-                    CodexStep(
-                        result=implementation_result(),
-                        mutation=write_file("implemented in repo b\n"),
-                    ),
-                    CodexStep(result=review_result()),
-                ]
+            agent_executor=make_agent_executor(
+                config_b,
+                process_runner=SequencedCodexRunner(
+                    [
+                        CodexStep(
+                            result=implementation_result(),
+                            mutation=write_file("implemented in repo b\n"),
+                        ),
+                        CodexStep(result=review_result()),
+                    ]
+                ),
             ),
             verification_runner=PassingVerificationRunner(),
             clock=fixed_clock,
@@ -276,14 +291,17 @@ def test_lock_releases_after_ready_for_human(tmp_path):
         config,
         ticket,
         runs_dir=runs_dir,
-        codex_runner=SequencedCodexRunner(
-            [
-                CodexStep(
-                    result=implementation_result(),
-                    mutation=write_file("implemented\n"),
-                ),
-                CodexStep(result=review_result()),
-            ]
+        agent_executor=make_agent_executor(
+            config,
+            process_runner=SequencedCodexRunner(
+                [
+                    CodexStep(
+                        result=implementation_result(),
+                        mutation=write_file("implemented\n"),
+                    ),
+                    CodexStep(result=review_result()),
+                ]
+            ),
         ),
         verification_runner=PassingVerificationRunner(),
         clock=fixed_clock,
@@ -302,7 +320,12 @@ def test_lock_releases_after_human_required(tmp_path):
         config,
         ticket,
         runs_dir=runs_dir,
-        codex_runner=SequencedCodexRunner([CodexStep(result=implementation_result())]),
+        agent_executor=make_agent_executor(
+            config,
+            process_runner=SequencedCodexRunner(
+                [CodexStep(result=implementation_result())]
+            ),
+        ),
         verification_runner=PassingVerificationRunner(),
         clock=fixed_clock,
     )
@@ -321,8 +344,11 @@ def test_lock_releases_after_failed(tmp_path):
         config,
         ticket,
         runs_dir=runs_dir,
-        codex_runner=SequencedCodexRunner(
-            [CodexStep(error=FileNotFoundError("missing codex"))]
+        agent_executor=make_agent_executor(
+            config,
+            process_runner=SequencedCodexRunner(
+                [CodexStep(error=FileNotFoundError("missing codex"))]
+            ),
         ),
         verification_runner=PassingVerificationRunner(),
         clock=fixed_clock,
@@ -343,7 +369,9 @@ def test_lock_releases_after_preflight_failure(tmp_path):
             config,
             ticket,
             runs_dir=runs_dir,
-            codex_runner=SequencedCodexRunner([]),
+            agent_executor=make_agent_executor(
+                config, process_runner=SequencedCodexRunner([])
+            ),
             verification_runner=PassingVerificationRunner(),
             clock=fixed_clock,
         )

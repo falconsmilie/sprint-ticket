@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -13,6 +14,18 @@ from ._verification_artifacts import (
     _read_verification_source_fingerprint,
     _VerificationArtifactError,
 )
+from .application.agent_execution import (
+    CORRECTION_RESULT_CONTRACT,
+    AgentExecution,
+    AgentExecutionPolicy,
+    AgentExecutionRequest,
+    AgentExecutor,
+    AgentFailureCategory,
+    AgentTaskKind,
+    NetworkAccess,
+    RepositoryAccess,
+    required_execution_capabilities,
+)
 from .attempts import (
     finish_phase_attempt,
     start_attempt,
@@ -21,11 +34,6 @@ from .audit import (
     changed_files_including_untracked as _changed_files_including_untracked,
 )
 from .audit import diff_stats_including_untracked as _diff_stats_including_untracked
-from .codex import (
-    CodexExecution,
-    CodexFailureKind,
-    CodexProcessRunner,
-)
 from .config import AppConfig, VerificationCommand
 from .domain.task_results import (
     ImplementationResult,
@@ -38,7 +46,13 @@ from .git_safety import (
     WorkspaceSnapshot,
     workspace_safety_changes,
 )
-from .models import AttemptPhase, StageOutcome, StopCategory, WorkflowState
+from .models import (
+    ATTEMPT_RESULT_ARTIFACT_NAME,
+    AttemptPhase,
+    StageOutcome,
+    StopCategory,
+    WorkflowState,
+)
 from .resolved_config import config_from_resolved_run_config
 from .runs import (
     BASELINE_RECORD_FILE,
@@ -49,6 +63,7 @@ from .runs import (
     load_baseline_record,
     load_run_record,
 )
+from .task_result_codecs import encode_implementation_result
 from .workspace_guard import WorkspaceGuardInspection
 from .writable_attempts import WritableAttempt
 
@@ -58,9 +73,7 @@ CORRECTION_TICKET_SUFFIX = "CORR"
 CORRECTION_TICKET_EXCERPT_CHARS = 1200
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _CORRECTION_PROMPT_TEMPLATE = _PROJECT_ROOT / "prompts" / "correct.md"
-_CORRECTION_RESULT_SCHEMA = (
-    _PROJECT_ROOT / "schemas" / "implementation-result.schema.json"
-)
+_AGENT_TIMEOUT_SECONDS = 60 * 60
 
 
 class CorrectionError(RunError):
@@ -188,7 +201,7 @@ class CorrectionStageResult:
     correction_round: int
     ticket_path: Path | None
     artifact_directory: Path
-    codex_execution: CodexExecution | None
+    agent_execution: AgentExecution[ImplementationResult] | None
     agent_result: ImplementationResult | None
     safety_violations: tuple[CorrectionSafetyViolation, ...]
     correction_causes: tuple[CorrectionCause, ...]
@@ -213,7 +226,7 @@ def run_correction_stage(
     run_dir: Path | str,
     *,
     cause_set: CorrectionCauseSet,
-    codex_runner: CodexProcessRunner | None = None,
+    agent_executor: AgentExecutor,
     clock: Callable[[], datetime] | None = None,
 ) -> CorrectionStageResult:
     run_path = Path(run_dir)
@@ -347,18 +360,29 @@ def run_correction_stage(
             correction_round=correction_round,
         ),
     )
-    writable_invocation = writable_worker.run_writable_codex(
+    request = AgentExecutionRequest(
+        task_kind=AgentTaskKind.CORRECTION,
+        repository_path=repository.path,
+        repository_access=RepositoryAccess.WORKSPACE_WRITE,
+        prompt=prompt,
+        result_contract=CORRECTION_RESULT_CONTRACT,
+        artifact_directory=artifact_directory,
+        policy=AgentExecutionPolicy(
+            timeout_seconds=_AGENT_TIMEOUT_SECONDS,
+            network_access=NetworkAccess.ALLOWED,
+        ),
+        required_capabilities=required_execution_capabilities(
+            RepositoryAccess.WORKSPACE_WRITE
+        ),
+    )
+    writable_invocation = writable_worker.run_writable_agent(
         repository=repository,
         run_dir=run_path,
         operation=f"correction-round-{correction_round}",
         phase=AttemptPhase.CORRECTING,
         attempt_record=attempt_record,
-        prompt=prompt,
-        output_schema=_CORRECTION_RESULT_SCHEMA,
-        artifact_directory=artifact_directory,
-        executable=config.codex.executable,
-        execution_config=config.codex.execution,
-        runner=codex_runner,
+        executor=agent_executor,
+        request=request,
         clock=clock,
     )
     workspace_guard = writable_invocation.workspace_guard
@@ -384,14 +408,17 @@ def run_correction_stage(
             advance_correction_round=False,
         )
 
-    if writable_invocation.failure is not None:
-        error = writable_invocation.failure
+    if (
+        writable_invocation.execution is not None
+        and not writable_invocation.execution.successful
+    ):
+        execution = writable_invocation.execution
         failed_audit = _audit_failed_writable_invocation(
             repository,
             run_path,
             active_record,
             round_number=correction_round,
-            execution=error.execution,
+            execution=execution,
             writable_attempt=writable_invocation.attempt,
             after_workspace=writable_invocation.after_workspace,
             workspace_guard=workspace_guard,
@@ -399,17 +426,17 @@ def run_correction_stage(
         decision = classify_writable_failure(
             repository,
             attempt=writable_invocation.attempt,
-            message=error.execution.failure_message or str(error),
+            message=execution.failure_message or "Agent execution failed.",
             category_if_safe=StopCategory.EXTERNAL_TOOL_FAILURE,
             retryable_if_safe=True,
-            malformed_result=error.kind
+            malformed_result=execution.failure_category
             in {
-                CodexFailureKind.MISSING_STRUCTURED_RESULT,
-                CodexFailureKind.INVALID_STRUCTURED_RESULT,
+                AgentFailureCategory.MISSING_RESULT,
+                AgentFailureCategory.INVALID_RESULT,
             },
-            untrusted_completion=error.kind
+            untrusted_completion=execution.failure_category
             in {
-                CodexFailureKind.TIMEOUT,
+                AgentFailureCategory.TIMEOUT,
             },
         )
         outcome = (
@@ -423,7 +450,7 @@ def run_correction_stage(
         message = (
             _failed_writable_message(
                 operation=f"correction round {correction_round}",
-                execution=error.execution,
+                execution=execution,
                 audit=failed_audit,
                 run_dir=run_path,
             )
@@ -436,7 +463,7 @@ def run_correction_stage(
             correction_round=correction_round,
             ticket_path=ticket_path,
             artifact_directory=artifact_directory,
-            execution=error.execution,
+            execution=execution,
             agent_result=None,
             safety_violations=failed_audit.safety_violations,
             correction_causes=selected_causes,
@@ -448,8 +475,8 @@ def run_correction_stage(
 
     execution = writable_invocation.execution
     if execution is None:
-        raise CorrectionError("Writable Codex boundary returned no execution result.")
-    agent_result = _require_agent_result(execution.structured_result)
+        raise CorrectionError("Writable agent boundary returned no execution result.")
+    agent_result = _require_agent_result(execution.result)
     if writable_invocation.after_workspace is None:
         return _finish(
             run_record=active_record,
@@ -614,10 +641,8 @@ def format_correction_result(result: CorrectionStageResult) -> str:
     ]
     if result.ticket_path is not None:
         rows.append(f"Correction ticket: {result.ticket_path}")
-    if result.codex_execution is not None and not result.codex_execution.successful:
-        rows.append(f"Codex execution: {result.codex_execution.execution_json_path}")
-        rows.append(f"Codex events: {result.codex_execution.events_jsonl_path}")
-        rows.append(f"Codex stderr: {result.codex_execution.stderr_log_path}")
+    if result.agent_execution is not None and not result.agent_execution.successful:
+        rows.extend(_format_agent_artifacts(result.agent_execution))
     if result.workspace_guard is not None and result.workspace_guard.requires_human:
         if result.workspace_guard.artifact_path is not None:
             rows.append(f"Workspace guard: {result.workspace_guard.artifact_path}")
@@ -649,7 +674,7 @@ def _finish(
     correction_round: int,
     ticket_path: Path | None,
     artifact_directory: Path,
-    execution: CodexExecution | None,
+    execution: AgentExecution[ImplementationResult] | None,
     agent_result: ImplementationResult | None,
     safety_violations: tuple[CorrectionSafetyViolation, ...],
     correction_causes: tuple[CorrectionCause, ...],
@@ -658,6 +683,12 @@ def _finish(
     controller_message: str,
     advance_correction_round: bool = True,
 ) -> CorrectionStageResult:
+    _write_agent_result(
+        artifact_directory,
+        agent_result,
+        outcome=outcome,
+        controller_message=controller_message,
+    )
     after_fingerprint: str | None = None
     try:
         after_fingerprint = WorkspaceSnapshot.capture(
@@ -670,8 +701,8 @@ def _finish(
         phase=AttemptPhase.CORRECTING,
         stage_outcome=outcome,
         after_workspace_fingerprint=after_fingerprint,
-        process_started=(None if execution is None else execution.process_started),
-        execution_path=(None if execution is None else execution.execution_json_path),
+        process_started=(None if execution is None else execution.invocation_started),
+        execution_path=None,
     )
     return CorrectionStageResult(
         run_dir=run_dir,
@@ -681,12 +712,32 @@ def _finish(
         correction_round=correction_round,
         ticket_path=ticket_path,
         artifact_directory=artifact_directory,
-        codex_execution=execution,
+        agent_execution=execution,
         agent_result=agent_result,
         safety_violations=safety_violations,
         correction_causes=correction_causes,
         workspace_guard=workspace_guard,
         controller_message=controller_message,
+    )
+
+
+def _write_agent_result(
+    artifact_directory: Path,
+    result: ImplementationResult | None,
+    *,
+    outcome: StageOutcome,
+    controller_message: str,
+) -> None:
+    path = artifact_directory / ATTEMPT_RESULT_ARTIFACT_NAME
+    payload = (
+        encode_implementation_result(result)
+        if result is not None
+        else {"status": outcome.value, "message": controller_message}
+    )
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
     )
 
 
@@ -978,7 +1029,7 @@ def _audit_failed_writable_invocation(
     run_record: RunRecord,
     *,
     round_number: int,
-    execution: CodexExecution,
+    execution: AgentExecution[ImplementationResult],
     writable_attempt: WritableAttempt,
     after_workspace: WorkspaceSnapshot | None,
     workspace_guard: WorkspaceGuardInspection | None,
@@ -990,7 +1041,7 @@ def _audit_failed_writable_invocation(
                 name="workspace-inspection",
                 expected="complete post-call canonical workspace snapshot",
                 actual="unavailable",
-                message="Could not inspect the workspace after writable Codex execution.",
+                message="Could not inspect the workspace after writable agent execution.",
             )
         )
     else:
@@ -1012,7 +1063,7 @@ def _audit_failed_writable_invocation(
                 expected="baseline-relative source diff inspection succeeds",
                 actual=str(error),
                 message=(
-                    "Could not inspect source changes after failed writable Codex "
+                    "Could not inspect source changes after failed writable agent "
                     "invocation."
                 ),
             )
@@ -1029,13 +1080,13 @@ def _audit_failed_writable_invocation(
                 actual=_format_files(changed_files),
                 message=(
                     "Baseline-relative source changes exist after failed writable "
-                    "Codex invocation."
+                    "agent invocation."
                 ),
             )
         )
 
     human_required = (
-        execution.process_started
+        execution.invocation_started is not False
         or bool(violations)
         or bool(workspace_guard is not None and workspace_guard.requires_human)
     )
@@ -1060,29 +1111,27 @@ def _workspace_changed_since_writable_attempt(
 def _failed_writable_message(
     *,
     operation: str,
-    execution: CodexExecution,
+    execution: AgentExecution[ImplementationResult],
     audit: _FailedWritableAudit,
     run_dir: Path,
 ) -> str:
     rows = [
         (
-            "The writable Codex invocation did not complete successfully and may "
+            "The writable agent invocation did not complete successfully and may "
             "have left partial source changes. Automation has stopped for human "
             "inspection."
         ),
         (
-            "Codex failure: "
-            f"{_format_optional_failure_kind(execution)}: "
+            "Agent failure: "
+            f"{_format_failure_category(execution)}: "
             f"{execution.failure_message or 'unknown failure'}"
         ),
         f"Last operation: {operation}",
-        f"Process started: {_yes_no(execution.process_started)}",
-        f"Execution metadata: {execution.execution_json_path}",
-        f"Events: {execution.events_jsonl_path}",
-        f"Stderr: {execution.stderr_log_path}",
+        f"Process started: {_yes_no(execution.invocation_started is not False)}",
         f"Git safety: {_format_failure_safety(audit.safety_violations)}",
         f"Changed files relative to baseline: {_format_files(audit.changed_files)}",
     ]
+    rows.extend(_format_agent_artifacts(execution))
     if audit.workspace_guard is not None and audit.workspace_guard.requires_human:
         rows.append(
             writable_worker._format_writable_guard_stop(
@@ -1106,8 +1155,23 @@ def _format_failure_safety(
     )
 
 
-def _format_optional_failure_kind(execution: CodexExecution) -> str:
-    return "UNKNOWN" if execution.failure_kind is None else execution.failure_kind.value
+def _format_failure_category(execution: AgentExecution[ImplementationResult]) -> str:
+    return (
+        "UNKNOWN"
+        if execution.failure_category is None
+        else execution.failure_category.value
+    )
+
+
+def _format_agent_artifacts(
+    execution: AgentExecution[ImplementationResult],
+) -> list[str]:
+    if not execution.artifacts:
+        return ["Agent artifacts: none"]
+    return [
+        "Agent artifacts:",
+        *(f"  - {artifact.name}: {artifact.path}" for artifact in execution.artifacts),
+    ]
 
 
 def _worktree_changed_files(

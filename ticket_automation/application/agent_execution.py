@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -141,12 +141,14 @@ class AgentResultContract(Generic[ResultT_co]):
         return type(result) is self.result_type
 
 
-IMPLEMENTATION_RESULT_CONTRACT = AgentResultContract(
-    AgentTaskKind.IMPLEMENTATION, ImplementationResult
+IMPLEMENTATION_RESULT_CONTRACT: AgentResultContract[ImplementationResult] = (
+    AgentResultContract(AgentTaskKind.IMPLEMENTATION, ImplementationResult)
 )
-REVIEW_RESULT_CONTRACT = AgentResultContract(AgentTaskKind.REVIEW, ReviewResult)
-CORRECTION_RESULT_CONTRACT = AgentResultContract(
-    AgentTaskKind.CORRECTION, ImplementationResult
+REVIEW_RESULT_CONTRACT: AgentResultContract[ReviewResult] = AgentResultContract(
+    AgentTaskKind.REVIEW, ReviewResult
+)
+CORRECTION_RESULT_CONTRACT: AgentResultContract[ImplementationResult] = (
+    AgentResultContract(AgentTaskKind.CORRECTION, ImplementationResult)
 )
 
 
@@ -360,8 +362,27 @@ class AgentExecution(Generic[ResultT_co]):
 
 class AgentExecutor(Protocol):
     def execute(
-        self, request: AgentExecutionRequest[ResultT]
+        self,
+        request: AgentExecutionRequest[ResultT],
+        *,
+        on_invocation_start: Callable[[], None] | None = None,
     ) -> AgentExecution[ResultT]: ...
+
+
+def required_execution_capabilities(
+    access: RepositoryAccess,
+) -> frozenset[AgentCapability]:
+    """Return the application requirements shared by all agent-backed stages."""
+
+    return frozenset(
+        {
+            _capability_for_access(access),
+            AgentCapability.STRUCTURED_RESULT,
+            AgentCapability.ISOLATED_INVOCATION,
+            AgentCapability.DIAGNOSTIC_ARTIFACT_CAPTURE,
+            AgentCapability.NETWORK_POLICY_CONTROL,
+        }
+    )
 
 
 def _capability_for_access(access: RepositoryAccess) -> AgentCapability:
@@ -440,4 +461,5 @@ __all__ = [
     "ProviderMetadataScalar",
     "ProviderMetadataValue",
     "RepositoryAccess",
+    "required_execution_capabilities",
 ]

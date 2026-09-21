@@ -21,6 +21,7 @@ from ticket_automation.config import (
     VerificationCommand,
     VerificationSettings,
 )
+from ticket_automation.providers.codex_cli import CodexCliAgentExecutor
 
 if TYPE_CHECKING:
     from ticket_automation.runs import RunCreationResult
@@ -316,6 +317,22 @@ def make_config(
         ),
         source_files=(),
         configuration_directory=repo.parent,
+    )
+
+
+class _UnexpectedCodexRunner:
+    def run(self, command, *, stdin, timeout_seconds):
+        del command, stdin, timeout_seconds
+        raise AssertionError("This test did not inject a Codex process result.")
+
+
+def make_agent_executor(config: AppConfig, *, process_runner=None):
+    """Compose the configured adapter for characterization tests."""
+
+    return CodexCliAgentExecutor(
+        config.codex,
+        configuration_directory=config.configuration_directory,
+        runner=process_runner or _UnexpectedCodexRunner(),
     )
 
 

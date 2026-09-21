@@ -68,7 +68,11 @@ def _review_result() -> ReviewResult:
     return ReviewResult(verdict=ReviewVerdict.PASS, summary="Approved", findings=())
 
 
-def _request(task_kind: AgentTaskKind) -> AgentExecutionRequest[TaskResult]:
+def _request(
+    task_kind: AgentTaskKind,
+    *,
+    artifact_directory: Path | None = None,
+) -> AgentExecutionRequest[TaskResult]:
     if task_kind is AgentTaskKind.REVIEW:
         access = RepositoryAccess.READ_ONLY
         contract = REVIEW_RESULT_CONTRACT
@@ -87,7 +91,7 @@ def _request(task_kind: AgentTaskKind) -> AgentExecutionRequest[TaskResult]:
         repository_access=access,
         prompt="Perform the requested work.",
         result_contract=contract,
-        artifact_directory=Path("artifacts") / task_kind.value,
+        artifact_directory=(artifact_directory or Path("artifacts") / task_kind.value),
         policy=AgentExecutionPolicy(
             timeout_seconds=60,
             network_access=NetworkAccess.DENIED,
@@ -225,8 +229,12 @@ def test_artifact_reference_rejects_invalid_values(changes: dict[str, object]):
 @pytest.mark.parametrize("missing", sorted(_WRITE_CAPABILITIES, key=str))
 def test_capability_mismatch_is_explicit_and_precedes_fake_invocation(
     missing: AgentCapability,
+    tmp_path: Path,
 ):
-    request = _request(AgentTaskKind.IMPLEMENTATION)
+    request = _request(
+        AgentTaskKind.IMPLEMENTATION,
+        artifact_directory=tmp_path / "artifacts",
+    )
     available = _WRITE_CAPABILITIES - {missing}
     executor = InMemoryAgentExecutor(
         {AgentTaskKind.IMPLEMENTATION: _implementation_result()},
@@ -253,7 +261,7 @@ def test_capability_mismatch_is_explicit_and_precedes_fake_invocation(
     ],
 )
 def test_in_memory_executor_demonstrates_each_task_kind(
-    task_kind: AgentTaskKind, expected_type: type[TaskResult]
+    task_kind: AgentTaskKind, expected_type: type[TaskResult], tmp_path: Path
 ):
     results: dict[AgentTaskKind, TaskResult] = {
         AgentTaskKind.IMPLEMENTATION: _implementation_result(),
@@ -265,12 +273,36 @@ def test_in_memory_executor_demonstrates_each_task_kind(
         capabilities=_READ_CAPABILITIES | _WRITE_CAPABILITIES,
     )
 
-    execution = executor.execute(_request(task_kind))
+    execution = executor.execute(
+        _request(task_kind, artifact_directory=tmp_path / task_kind.value)
+    )
 
     assert execution.successful
     assert type(execution.result) is expected_type
     assert execution.task_kind is task_kind
     assert execution.invocation_started is True
+
+
+def test_in_memory_executor_writes_every_referenced_artifact(tmp_path: Path):
+    request = _request(
+        AgentTaskKind.IMPLEMENTATION,
+        artifact_directory=tmp_path / "artifacts",
+    )
+    executor = InMemoryAgentExecutor(
+        {AgentTaskKind.IMPLEMENTATION: _implementation_result()},
+        capabilities=_WRITE_CAPABILITIES,
+    )
+
+    execution = executor.execute(request)
+
+    assert execution.artifacts
+    assert all(artifact.path.is_file() for artifact in execution.artifacts)
+    assert {artifact.name for artifact in execution.artifacts} == {
+        "request-copy",
+        "in-memory-log",
+        "in-memory-details",
+        "typed-output",
+    }
 
 
 def test_success_rejects_result_task_mismatch():

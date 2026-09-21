@@ -13,6 +13,7 @@ from .config import (
 )
 from .locking import RepositoryLockError, active_repository_locks
 from .preflight import format_preflight_result, run_preflight
+from .providers.codex_cli import CodexCliAgentExecutor
 from .resolved_config import config_from_resolved_run_config
 from .runs import (
     RUNS_DIR_NAME,
@@ -134,6 +135,10 @@ def _handle_run(args: argparse.Namespace) -> int:
             config,
             args.ticket,
             runs_dir=runs_dir,
+            agent_executor=CodexCliAgentExecutor(
+                config.codex,
+                configuration_directory=config.configuration_directory,
+            ),
         )
     except TicketInputError as error:
         print(f"Ticket input error: {error}", file=sys.stderr)
@@ -168,10 +173,15 @@ def _handle_resume(args: argparse.Namespace) -> int:
     runs_dir = args.config_dir / RUNS_DIR_NAME
     try:
         run_record = load_run_record(runs_dir / args.run_id / "run.json")
+        config = config_from_resolved_run_config(run_record.resolved_config)
         result = resume_ticket_lifecycle(
-            config_from_resolved_run_config(run_record.resolved_config),
+            config,
             args.run_id,
             runs_dir=runs_dir,
+            agent_executor=CodexCliAgentExecutor(
+                config.codex,
+                configuration_directory=config.configuration_directory,
+            ),
         )
     except RunError as error:
         print(f"Run error: {error}", file=sys.stderr)
