@@ -7,13 +7,20 @@ from pathlib import Path
 
 import pytest
 
-import ticket_automation.workflow as workflow_module
 from tests.helpers import GIT, create_git_repo, create_trusted_prepared_run, make_config
-from ticket_automation.attempts import load_attempt_records, start_attempt
+from ticket_automation.attempts import (
+    attempt_result_path,
+    latest_writable_attempt,
+    load_attempt_records,
+    start_attempt,
+    update_attempt,
+)
 from ticket_automation.codex import CodexProcessResult
+from ticket_automation.git import GitRepository
+from ticket_automation.git_safety import WorkspaceSnapshot
 from ticket_automation.implementation import run_implementation_stage
-from ticket_automation.models import WorkflowState
-from ticket_automation.reporting import ReportError, run_report_stage
+from ticket_automation.models import StopCategory, WorkflowState
+from ticket_automation.reporting import run_report_stage
 from ticket_automation.review import run_review_stage
 from ticket_automation.runs import create_run_snapshot, load_run_record, save_run_record
 from ticket_automation.verification import (
@@ -106,6 +113,7 @@ def test_lifecycle_writes_only_numbered_attempt_evidence(tmp_path, monkeypatch):
     )
 
     assert result.run_record.state == WorkflowState.READY_FOR_HUMAN
+    assert result.run_record.stop_reason is None
     assert runner.calls == 2
     attempts = load_attempt_records(result.run_dir)
     assert [(item.sequence, item.phase, item.status) for item in attempts] == [
@@ -136,6 +144,13 @@ def test_lifecycle_writes_only_numbered_attempt_evidence(tmp_path, monkeypatch):
     assert not list(verification.glob("*.log"))
     assert (result.run_dir / "final.patch").is_file()
     assert (result.run_dir / "report.md").is_file()
+    writable = latest_writable_attempt(result.run_dir)
+    assert writable is not None
+    assert writable.after_workspace_fingerprint is not None
+    final_workspace = WorkspaceSnapshot.capture(GitRepository(repo))
+    assert final_workspace.matches_fingerprint(
+        writable.after_workspace_fingerprint
+    )
     assert not any(
         (result.run_dir / name).exists()
         for name in (
@@ -185,6 +200,14 @@ def test_resume_reruns_safe_verification_as_a_new_attempt(tmp_path, monkeypatch)
         process_runner=first_verification,
         clock=fixed_clock,
     ).successful
+    completed_evidence = {
+        attempt.artifact_directory.relative_to(snapshot.run_dir): {
+            path.relative_to(attempt.artifact_directory): path.read_bytes()
+            for path in attempt.artifact_directory.rglob("*")
+            if path.is_file()
+        }
+        for attempt in load_attempt_records(snapshot.run_dir)
+    }
 
     resumed = resume_ticket_lifecycle(
         config,
@@ -203,6 +226,18 @@ def test_resume_reruns_safe_verification_as_a_new_attempt(tmp_path, monkeypatch)
     ]
     assert len(verification_attempts) == 2
     assert all(item.status == "COMPLETED" for item in verification_attempts)
+    attempts = load_attempt_records(snapshot.run_dir)
+    assert [item.sequence for item in attempts] == list(range(1, len(attempts) + 1))
+    for relative_directory, evidence in completed_evidence.items():
+        directory = snapshot.run_dir / relative_directory
+        current_paths = {
+            path.relative_to(directory) for path in directory.rglob("*") if path.is_file()
+        }
+        assert current_paths == set(evidence)
+        assert all(
+            directory.joinpath(relative_path).read_bytes() == contents
+            for relative_path, contents in evidence.items()
+        )
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required")
@@ -220,6 +255,15 @@ def test_interrupted_writable_state_requires_human_inspection(tmp_path):
         updated_timestamp="2026-09-14T10:16:00Z",
     )
     save_run_record(interrupted, snapshot.run_dir / "run.json")
+    before = WorkspaceSnapshot.capture(GitRepository(repo))
+    attempt = start_attempt(
+        snapshot.run_dir,
+        phase=WorkflowState.IMPLEMENTING.value,
+        before_workspace_fingerprint=before.fingerprint,
+        clock=fixed_clock,
+    )
+    attempt = update_attempt(attempt, process_started=True)
+    repo.joinpath("partial.txt").write_text("partial work\n", encoding="utf-8")
 
     result = resume_ticket_lifecycle(
         config,
@@ -229,9 +273,16 @@ def test_interrupted_writable_state_requires_human_inspection(tmp_path):
     )
 
     assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.run_record.stop_reason is not None
     assert (
-        "Writable implementation was interrupted" in result.run_record.terminal_reason
+        result.run_record.stop_reason.category
+        == StopCategory.HUMAN_JUDGMENT_REQUIRED
     )
+    persisted_attempts = load_attempt_records(result.run_dir)
+    assert persisted_attempts[-1] == attempt
+    assert persisted_attempts[-1].status == "STARTED"
+    assert persisted_attempts[-1].process_started is True
+    assert repo.joinpath("partial.txt").is_file()
     assert (result.run_dir / "report.md").is_file()
 
 
@@ -428,12 +479,14 @@ def test_resume_restarts_reporting_in_a_new_attempt(tmp_path):
 @pytest.mark.skipif(GIT is None, reason="git executable is required")
 def test_rendering_failure_cannot_reclassify_an_accepted_handoff(tmp_path, monkeypatch):
     repository = create_git_repo(tmp_path / "target")
+    original_write_text = Path.write_text
 
-    def fail_renderer(run_dir):
-        del run_dir
-        raise ReportError("disk unavailable")
+    def fail_report_write(path, data, *args, **kwargs):
+        if path.name == "report.md":
+            raise OSError("disk unavailable")
+        return original_write_text(path, data, *args, **kwargs)
 
-    monkeypatch.setattr(workflow_module, "run_report_stage", fail_renderer)
+    monkeypatch.setattr(Path, "write_text", fail_report_write)
     result = run_ticket_lifecycle(
         make_config(repository),
         _ticket(tmp_path),
@@ -444,6 +497,11 @@ def test_rendering_failure_cannot_reclassify_an_accepted_handoff(tmp_path, monke
     )
 
     assert result.run_record.state == WorkflowState.READY_FOR_HUMAN
+    assert result.report_result is None
+    assert load_run_record(result.run_dir / "run.json").state == (
+        WorkflowState.READY_FOR_HUMAN
+    )
+    assert load_attempt_records(result.run_dir)[-1].status == "COMPLETED"
     assert (result.run_dir / "final.patch").is_file()
 
 
@@ -486,7 +544,8 @@ def test_one_correction_round_preserves_the_ordinary_lifecycle(tmp_path):
     assert result.run_record.state == WorkflowState.READY_FOR_HUMAN
     assert result.run_record.current_correction_round == 1
     assert verification.calls == 3
-    assert [item.phase for item in load_attempt_records(result.run_dir)] == [
+    attempts = load_attempt_records(result.run_dir)
+    assert [item.phase for item in attempts] == [
         "PREPARING",
         "IMPLEMENTING",
         "VERIFYING",
@@ -495,3 +554,21 @@ def test_one_correction_round_preserves_the_ordinary_lifecycle(tmp_path):
         "REVIEWING",
         "REPORTING",
     ]
+    failed_verification = next(
+        item
+        for item in attempts
+        if item.phase == "VERIFYING" and item.sequence == 3
+    )
+    result_path = attempt_result_path(result.run_dir, failed_verification)
+    assert result_path is not None
+    verification_evidence = json.loads(result_path.read_text(encoding="utf-8"))
+    assert [
+        reason["kind"] for reason in verification_evidence["correction_reasons"]
+    ] == ["VerificationFailure"]
+    correction_attempt = next(item for item in attempts if item.phase == "CORRECTING")
+    correction_tickets = tuple(
+        path
+        for path in correction_attempt.artifact_directory.glob("*.md")
+        if path.name != "prompt.md"
+    )
+    assert len(correction_tickets) == 1

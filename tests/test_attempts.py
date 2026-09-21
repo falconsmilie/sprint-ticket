@@ -64,6 +64,22 @@ def test_trusted_attempt_record_resolves_only_its_own_artifacts(tmp_path: Path) 
     )
 
 
+def test_trusted_attempt_record_cannot_resolve_artifacts_for_another_run(
+    tmp_path: Path,
+) -> None:
+    first_run = tmp_path / "first-run"
+    second_run = tmp_path / "second-run"
+    record = start_attempt(
+        first_run,
+        phase="VERIFYING",
+        before_workspace_fingerprint="before",
+        clock=fixed_clock,
+    )
+
+    with pytest.raises(AttemptError, match="does not belong"):
+        attempt_result_path(second_run, record)
+
+
 def test_tampered_attempt_path_is_rejected_before_result_can_escape(
     tmp_path: Path,
 ) -> None:

@@ -48,7 +48,24 @@ def implementation_result(status: str) -> dict[str, object]:
     }
 
 
-def review_result() -> dict[str, object]:
+def review_result(*, corrections_required: bool = False) -> dict[str, object]:
+    if corrections_required:
+        return {
+            "verdict": "CORRECTIONS_REQUIRED",
+            "summary": "fake review requires one correction",
+            "findings": [
+                {
+                    "id": "R1",
+                    "disposition": "REQUIRED",
+                    "scope_relation": "IMPLEMENTATION",
+                    "title": "Correct the implementation",
+                    "description": "The implementation needs a correction.",
+                    "evidence": "The deterministic fake review found the defect.",
+                    "required_change": "Apply the correction.",
+                    "acceptance_criteria": ["The corrected verification passes."],
+                }
+            ],
+        }
     return {
         "verdict": "PASS",
         "summary": "fake review accepted the implementation",
@@ -98,15 +115,45 @@ if record_path:
     record["calls"].append({"argv": sys.argv[1:], "prompt": prompt})
     path.write_text(json.dumps(record, indent=2), encoding="utf-8")
 
-action = os.environ.get("TA_FAKE_CODEX_ACTION", "modify")
+action_sequence_path = os.environ.get("TA_FAKE_CODEX_ACTION_SEQUENCE")
+if action_sequence_path:
+    path = pathlib.Path(action_sequence_path)
+    actions = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(actions, list) or not actions:
+        sys.stderr.write("fake codex action sequence is exhausted\n")
+        raise SystemExit(2)
+    action = actions.pop(0)
+    path.write_text(json.dumps(actions), encoding="utf-8")
+else:
+    action = os.environ.get("TA_FAKE_CODEX_ACTION", "modify")
+
 if action == "fail":
     sys.stderr.write("fake codex failed\n")
     raise SystemExit(2)
+if action == "fail-after-change":
+    pathlib.Path("partial.txt").write_text("partial change\n", encoding="utf-8")
+    sys.stderr.write("fake codex failed after changing the workspace\n")
+    raise SystemExit(2)
+if action == "missing-result":
+    raise SystemExit(0)
+if action == "malformed-result":
+    output_path = pathlib.Path(
+        sys.argv[sys.argv.index("--output-last-message") + 1]
+    )
+    output_path.write_text("{malformed", encoding="utf-8")
+    raise SystemExit(0)
 
 if "--sandbox" in sys.argv and sys.argv[sys.argv.index("--sandbox") + 1] == "read-only":
-    emit_result(review_result())
-elif action == "modify":
-    pathlib.Path("file.txt").write_text("implemented by fake codex\n", encoding="utf-8")
+    emit_result(review_result(corrections_required=action == "review-corrections"))
+    if action == "review-pass-arm":
+        arm_path = os.environ.get("TA_FAKE_CODEX_ARM_FILE")
+        if not arm_path:
+            sys.stderr.write("review-pass-arm requires TA_FAKE_CODEX_ARM_FILE\n")
+            raise SystemExit(2)
+        pathlib.Path(arm_path).write_text("armed\n", encoding="utf-8")
+elif action in {"modify", "modify-correction"}:
+    target = "file.txt" if action == "modify" else "correction.txt"
+    pathlib.Path(target).write_text("implemented by fake codex\n", encoding="utf-8")
     emit_result(implementation_result("COMPLETED"))
 elif action == "untracked":
     pathlib.Path("added.txt").write_text("new file from fake codex\n", encoding="utf-8")
