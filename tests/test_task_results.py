@@ -19,6 +19,7 @@ from ticket_automation.domain.task_results import (
     ReviewResult,
     ReviewVerdict,
 )
+from ticket_automation.models import AttemptPhase, AttemptStatus
 from ticket_automation.reporting import latest_review_result
 from ticket_automation.task_result_codecs import (
     decode_implementation_result,
@@ -344,7 +345,7 @@ def test_review_codec_rejects_absent_nested_finding_fields() -> None:
 def test_reporting_returns_a_typed_review_result(tmp_path: Path) -> None:
     attempt = start_attempt(
         tmp_path,
-        phase="REVIEWING",
+        phase=AttemptPhase.REVIEWING,
         before_workspace_fingerprint="before",
     )
     attempt.artifact_directory.joinpath("result.json").write_text(
@@ -353,7 +354,7 @@ def test_reporting_returns_a_typed_review_result(tmp_path: Path) -> None:
     )
     complete_attempt(
         attempt,
-        status="COMPLETED",
+        status=AttemptStatus.COMPLETED,
         after_workspace_fingerprint="after",
     )
 
@@ -377,7 +378,7 @@ def test_reporting_does_not_hide_invalid_review_evidence(
 ) -> None:
     attempt = start_attempt(
         tmp_path,
-        phase="REVIEWING",
+        phase=AttemptPhase.REVIEWING,
         before_workspace_fingerprint="before",
     )
     attempt.artifact_directory.joinpath("result.json").write_text(
@@ -386,7 +387,7 @@ def test_reporting_does_not_hide_invalid_review_evidence(
     )
     complete_attempt(
         attempt,
-        status="HUMAN_REQUIRED",
+        status=AttemptStatus.HUMAN_REQUIRED,
         after_workspace_fingerprint="after",
     )
 

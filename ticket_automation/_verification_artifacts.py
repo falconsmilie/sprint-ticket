@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from .attempts import AttemptError, attempt_result_path, latest_attempt
 from .config import VerificationCommand
+from .models import AttemptPhase, AttemptStatus
 
 if TYPE_CHECKING:
     from .runs import BaselineRecord, RunRecord
@@ -32,8 +33,8 @@ def _read_verification_source_fingerprint(
     try:
         record = latest_attempt(
             run_path,
-            phases=("VERIFYING",),
-            statuses=("COMPLETED",),
+            phases=(AttemptPhase.VERIFYING,),
+            statuses=(AttemptStatus.COMPLETED,),
         )
         if record is None:
             raise _VerificationArtifactError(
@@ -81,8 +82,8 @@ def _baseline_verification_evidence_problem(
     try:
         record = latest_attempt(
             run_path,
-            phases=("PREPARING",),
-            statuses=("COMPLETED",),
+            phases=(AttemptPhase.PREPARING,),
+            statuses=(AttemptStatus.COMPLETED,),
         )
         if record is None:
             return "No completed clean-baseline verification attempt exists."
@@ -106,8 +107,6 @@ def _baseline_verification_evidence_problem(
 
 def _read_result(run_path: Path, record: Any) -> dict[str, Any]:
     path = attempt_result_path(run_path, record)
-    if path is None:
-        raise _VerificationArtifactError("Verification attempt has no result path.")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:

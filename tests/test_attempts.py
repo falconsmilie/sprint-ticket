@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -15,11 +16,20 @@ from ticket_automation.attempts import (
     AttemptError,
     attempt_result_path,
     complete_attempt,
+    finish_phase_attempt,
+    latest_attempt,
     load_attempt_records,
     start_attempt,
 )
-from ticket_automation.models import WorkflowState
+from ticket_automation.git import GitRepository
+from ticket_automation.models import (
+    AttemptPhase,
+    AttemptStatus,
+    StageOutcome,
+    WorkflowState,
+)
 from ticket_automation.workflow import resume_ticket_lifecycle
+from ticket_automation.writable_worker import run_writable_codex
 
 
 def fixed_clock() -> datetime:
@@ -32,7 +42,7 @@ def test_attempt_creation_skips_an_orphaned_crash_directory(tmp_path: Path) -> N
 
     record = start_attempt(
         tmp_path,
-        phase="VERIFYING",
+        phase=AttemptPhase.VERIFYING,
         before_workspace_fingerprint="before",
         clock=fixed_clock,
     )
@@ -45,13 +55,13 @@ def test_attempt_creation_skips_an_orphaned_crash_directory(tmp_path: Path) -> N
 def test_trusted_attempt_record_resolves_only_its_own_artifacts(tmp_path: Path) -> None:
     started = start_attempt(
         tmp_path,
-        phase="VERIFYING",
+        phase=AttemptPhase.VERIFYING,
         before_workspace_fingerprint="before",
         clock=fixed_clock,
     )
     completed = complete_attempt(
         started,
-        status="COMPLETED",
+        status=AttemptStatus.COMPLETED,
         after_workspace_fingerprint="after",
         clock=fixed_clock,
     )
@@ -71,7 +81,7 @@ def test_trusted_attempt_record_cannot_resolve_artifacts_for_another_run(
     second_run = tmp_path / "second-run"
     record = start_attempt(
         first_run,
-        phase="VERIFYING",
+        phase=AttemptPhase.VERIFYING,
         before_workspace_fingerprint="before",
         clock=fixed_clock,
     )
@@ -85,7 +95,7 @@ def test_tampered_attempt_path_is_rejected_before_result_can_escape(
 ) -> None:
     record = start_attempt(
         tmp_path,
-        phase="VERIFYING",
+        phase=AttemptPhase.VERIFYING,
         before_workspace_fingerprint="before",
         clock=fixed_clock,
     )
@@ -95,6 +105,150 @@ def test_tampered_attempt_path_is_rejected_before_result_can_escape(
 
     with pytest.raises(AttemptError, match="result_path"):
         load_attempt_records(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "unknown"),
+    [("phase", "verification"), ("status", "DONE")],
+)
+def test_unknown_persisted_lifecycle_values_are_rejected(
+    tmp_path: Path,
+    field: str,
+    unknown: str,
+) -> None:
+    record = start_attempt(
+        tmp_path,
+        phase=AttemptPhase.VERIFYING,
+        before_workspace_fingerprint="before",
+        clock=fixed_clock,
+    )
+    data = json.loads(record.path.read_text(encoding="utf-8"))
+    data[field] = unknown
+    record.path.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(AttemptError, match=rf"{field} is unsupported"):
+        load_attempt_records(tmp_path)
+
+
+@pytest.mark.parametrize("result_path", [None, "other-result.json"])
+def test_persisted_result_path_must_match_the_phase_catalog(
+    tmp_path: Path,
+    result_path: object,
+) -> None:
+    record = start_attempt(
+        tmp_path,
+        phase=AttemptPhase.VERIFYING,
+        before_workspace_fingerprint="before",
+        clock=fixed_clock,
+    )
+    data = json.loads(record.path.read_text(encoding="utf-8"))
+    data["result_path"] = result_path
+    record.path.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(AttemptError, match="result_path"):
+        load_attempt_records(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("phase", "VERIFYING"), ("status", "STARTED"), ("result_path", None)],
+)
+def test_attempt_record_rejects_invalid_trusted_construction(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    record = start_attempt(
+        tmp_path,
+        phase=AttemptPhase.VERIFYING,
+        before_workspace_fingerprint="before",
+        clock=fixed_clock,
+    )
+
+    with pytest.raises(AttemptError):
+        replace(record, **{field: value})
+
+
+def test_attempt_queries_reject_raw_phase_and_status_filters(tmp_path: Path) -> None:
+    start_attempt(
+        tmp_path,
+        phase=AttemptPhase.VERIFYING,
+        before_workspace_fingerprint="before",
+        clock=fixed_clock,
+    )
+
+    with pytest.raises(AttemptError, match="phase filter"):
+        latest_attempt(tmp_path, phases=("VERIFYING",))  # type: ignore[arg-type]
+    with pytest.raises(AttemptError, match="status filter"):
+        latest_attempt(tmp_path, statuses=("STARTED",))  # type: ignore[arg-type]
+
+
+def test_attempt_commands_reject_raw_phase_and_status_values(tmp_path: Path) -> None:
+    invalid_run_dir = tmp_path / "invalid"
+    with pytest.raises(AttemptError, match="AttemptPhase"):
+        start_attempt(
+            invalid_run_dir,
+            phase="VERIFYING",  # type: ignore[arg-type]
+            before_workspace_fingerprint="before",
+            clock=fixed_clock,
+        )
+    assert not invalid_run_dir.exists()
+
+    record = start_attempt(
+        tmp_path / "valid",
+        phase=AttemptPhase.VERIFYING,
+        before_workspace_fingerprint="before",
+        clock=fixed_clock,
+    )
+    with pytest.raises(AttemptError, match="status"):
+        complete_attempt(
+            record,
+            status="COMPLETED",  # type: ignore[arg-type]
+            after_workspace_fingerprint="after",
+            clock=fixed_clock,
+        )
+    assert load_attempt_records(tmp_path / "valid") == (record,)
+
+
+def test_finish_phase_attempt_rejects_raw_stage_outcome(tmp_path: Path) -> None:
+    start_attempt(
+        tmp_path,
+        phase=AttemptPhase.VERIFYING,
+        before_workspace_fingerprint="before",
+        clock=fixed_clock,
+    )
+
+    with pytest.raises(AttemptError, match="StageOutcome"):
+        finish_phase_attempt(
+            tmp_path,
+            phase=AttemptPhase.VERIFYING,
+            stage_outcome=StageOutcome.COMPLETED.value,  # type: ignore[arg-type]
+        )
+
+
+def test_writable_worker_rejects_a_non_writable_phase(tmp_path: Path) -> None:
+    repository = GitRepository(create_git_repo(tmp_path / "target"))
+    run_dir = tmp_path / "run"
+    record = start_attempt(
+        run_dir,
+        phase=AttemptPhase.VERIFYING,
+        before_workspace_fingerprint="before",
+        clock=fixed_clock,
+    )
+
+    with pytest.raises(ValueError, match="is not writable"):
+        run_writable_codex(
+            repository=repository,
+            run_dir=run_dir,
+            operation="invalid-verification-write",
+            phase=AttemptPhase.VERIFYING,
+            attempt_record=record,
+            prompt="unused",
+            output_schema=tmp_path / "unused-schema.json",
+            artifact_directory=record.artifact_directory,
+            executable="unused",
+            execution_config=None,
+        )
 
 
 def test_resume_requires_human_inspection_for_invalid_attempt_evidence(

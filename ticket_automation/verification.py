@@ -15,11 +15,11 @@ from ._verification_artifacts import (
     VERIFICATION_ROUND_FORMAT,
     VERIFICATION_SCHEMA_VERSION,
 )
-from .attempts import finish_phase_attempt, start_attempt
+from .attempts import attempt_result_path, finish_phase_attempt, start_attempt
 from .config import AppConfig, VerificationCommand
 from .git import GitRepository
 from .git_safety import WorkspaceChange, WorkspaceSnapshot, workspace_safety_changes
-from .models import StageOutcome, WorkflowState
+from .models import AttemptPhase, StageOutcome, WorkflowState
 from .process_output import decode_human_output
 from .resolved_config import config_from_resolved_run_config
 from .runs import (
@@ -383,11 +383,11 @@ def _run_baseline_verification_stage(
         )
     attempt = start_attempt(
         run_path,
-        phase=WorkflowState.PREPARING.value,
+        phase=AttemptPhase.PREPARING,
         before_workspace_fingerprint=before,
         clock=clock,
     )
-    result_path = attempt.artifact_directory / "result.json"
+    result_path = attempt_result_path(run_path, attempt)
     if violations:
         round_result = _controller_error_round(result_path, 0, violations, clock=clock)
     else:
@@ -406,7 +406,7 @@ def _run_baseline_verification_stage(
     return _finish_stage(
         run_path,
         run_record,
-        attempt_phase=WorkflowState.PREPARING.value,
+        attempt_phase=AttemptPhase.PREPARING,
         artifact_directory=attempt.artifact_directory,
         round_result=round_result,
         baseline=True,
@@ -447,11 +447,11 @@ def run_verification_stage(
         )
     attempt = start_attempt(
         run_path,
-        phase=WorkflowState.VERIFYING.value,
+        phase=AttemptPhase.VERIFYING,
         before_workspace_fingerprint=before,
         clock=clock,
     )
-    result_path = attempt.artifact_directory / "result.json"
+    result_path = attempt_result_path(run_path, attempt)
     if violations:
         round_result = _controller_error_round(
             result_path, selected_round, violations, clock=clock
@@ -472,7 +472,7 @@ def run_verification_stage(
     return _finish_stage(
         run_path,
         run_record,
-        attempt_phase=WorkflowState.VERIFYING.value,
+        attempt_phase=AttemptPhase.VERIFYING,
         artifact_directory=attempt.artifact_directory,
         round_result=round_result,
         baseline=False,
@@ -521,7 +521,7 @@ def _finish_stage(
     run_path: Path,
     run_record: RunRecord,
     *,
-    attempt_phase: str,
+    attempt_phase: AttemptPhase,
     artifact_directory: Path,
     round_result: VerificationRound,
     baseline: bool,
@@ -553,7 +553,7 @@ def _finish_stage(
     finish_phase_attempt(
         run_path,
         phase=attempt_phase,
-        stage_outcome=outcome.value,
+        stage_outcome=outcome,
         after_workspace_fingerprint=after,
         process_started=_round_process_started(round_result.commands),
     )

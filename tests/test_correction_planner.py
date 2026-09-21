@@ -28,6 +28,7 @@ from ticket_automation.domain.task_results import (
     ReviewResult,
     ReviewVerdict,
 )
+from ticket_automation.models import AttemptPhase, AttemptStatus
 from ticket_automation.task_result_codecs import encode_review_result
 from ticket_automation.verification import VerificationError, VerificationFailure
 
@@ -61,7 +62,12 @@ def _failure(tmp_path: Path, *, exit_code: int | None = 1) -> VerificationFailur
     )
 
 
-def _completed_attempt(run_dir: Path, *, phase: str, payload: object) -> None:
+def _completed_attempt(
+    run_dir: Path,
+    *,
+    phase: AttemptPhase,
+    payload: object,
+) -> None:
     attempt = start_attempt(
         run_dir,
         phase=phase,
@@ -73,7 +79,7 @@ def _completed_attempt(run_dir: Path, *, phase: str, payload: object) -> None:
     )
     complete_attempt(
         attempt,
-        status="COMPLETED",
+        status=AttemptStatus.COMPLETED,
         after_workspace_fingerprint="after",
     )
 
@@ -287,7 +293,7 @@ def test_plan_pending_correction_reconstructs_owned_verification_failure(
     failure = _failure(tmp_path, exit_code=None)
     _completed_attempt(
         tmp_path,
-        phase="VERIFYING",
+        phase=AttemptPhase.VERIFYING,
         payload={"status": "FAIL", "correction_reasons": [failure.to_dict()]},
     )
 
@@ -304,7 +310,7 @@ def test_plan_pending_correction_maps_persisted_review_result(tmp_path: Path) ->
     )
     _completed_attempt(
         tmp_path,
-        phase="REVIEWING",
+        phase=AttemptPhase.REVIEWING,
         payload=encode_review_result(result),
     )
 
@@ -316,7 +322,7 @@ def test_plan_pending_correction_rejects_malformed_review_evidence(
 ) -> None:
     _completed_attempt(
         tmp_path,
-        phase="REVIEWING",
+        phase=AttemptPhase.REVIEWING,
         payload={
             "verdict": "CORRECTIONS_REQUIRED",
             "summary": "A correction is required.",
@@ -357,7 +363,7 @@ def test_plan_pending_correction_rejects_malformed_verification_evidence(
     tmp_path: Path,
     payload: object,
 ) -> None:
-    _completed_attempt(tmp_path, phase="VERIFYING", payload=payload)
+    _completed_attempt(tmp_path, phase=AttemptPhase.VERIFYING, payload=payload)
 
     with pytest.raises(CorrectionError):
         plan_pending_correction(tmp_path)

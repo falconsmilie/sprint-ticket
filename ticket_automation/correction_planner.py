@@ -15,7 +15,7 @@ from .corrections import (
     VerificationCorrectionCause,
 )
 from .domain.task_results import ReviewResult, ReviewVerdict
-from .models import WorkflowState
+from .models import AttemptPhase, AttemptStatus
 from .task_result_codecs import decode_review_result
 from .verification import VerificationError, VerificationFailure
 
@@ -103,13 +103,13 @@ def _load_latest_verification_failures(
 ) -> tuple[VerificationFailure, ...]:
     attempt = latest_attempt(
         run_path,
-        phases=(WorkflowState.VERIFYING.value,),
-        statuses=("COMPLETED",),
+        phases=(AttemptPhase.VERIFYING,),
+        statuses=(AttemptStatus.COMPLETED,),
     )
     if attempt is None:
         return ()
     result_path = attempt_result_path(run_path, attempt)
-    if result_path is None or not result_path.is_file():
+    if not result_path.is_file():
         return ()
     data = _read_json_object(result_path)
     if data.get("status") != "FAIL":
@@ -135,13 +135,13 @@ def _load_latest_verification_failures(
 def _load_latest_review_result(run_path: Path) -> ReviewResult | None:
     attempt = latest_attempt(
         run_path,
-        phases=(WorkflowState.REVIEWING.value,),
-        statuses=("COMPLETED",),
+        phases=(AttemptPhase.REVIEWING,),
+        statuses=(AttemptStatus.COMPLETED,),
     )
     if attempt is None:
         return None
     result_path = attempt_result_path(run_path, attempt)
-    if result_path is None or not result_path.is_file():
+    if not result_path.is_file():
         return None
     try:
         return decode_review_result(_read_json_object(result_path))

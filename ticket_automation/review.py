@@ -43,7 +43,7 @@ from .git_safety import (
     WorkspaceSnapshot,
     workspace_safety_changes,
 )
-from .models import StageOutcome, WorkflowState
+from .models import AttemptPhase, AttemptStatus, StageOutcome, WorkflowState
 from .resolved_config import config_from_resolved_run_config
 from .runs import (
     BASELINE_RECORD_FILE,
@@ -135,7 +135,7 @@ def run_review_stage(
         )
     attempt_record = start_attempt(
         run_path,
-        phase=WorkflowState.REVIEWING.value,
+        phase=AttemptPhase.REVIEWING,
         before_workspace_fingerprint=before_workspace_fingerprint,
         clock=clock,
     )
@@ -392,8 +392,8 @@ def _finish(
         pass
     finish_phase_attempt(
         run_dir,
-        phase=WorkflowState.REVIEWING.value,
-        stage_outcome=outcome.value,
+        phase=AttemptPhase.REVIEWING,
+        stage_outcome=outcome,
         after_workspace_fingerprint=after_fingerprint,
         process_started=(None if execution is None else execution.process_started),
         execution_path=(None if execution is None else execution.execution_json_path),
@@ -456,14 +456,12 @@ def _read_verification_results(run_path: Path, run_record: RunRecord) -> str:
     del run_record
     attempt = latest_attempt(
         run_path,
-        phases=(WorkflowState.VERIFYING.value,),
-        statuses=("COMPLETED",),
+        phases=(AttemptPhase.VERIFYING,),
+        statuses=(AttemptStatus.COMPLETED,),
     )
     if attempt is None:
         raise ReviewError("Missing deterministic verification results.")
     verification_path = attempt_result_path(run_path, attempt)
-    if verification_path is None:
-        raise ReviewError("Verification attempt has no typed result path.")
     try:
         data = json.loads(verification_path.read_text(encoding="utf-8"))
     except FileNotFoundError as error:
@@ -494,12 +492,12 @@ def _require_passing_verification_round(data: Any, path: Path) -> None:
 def _read_implementation_summary(run_path: Path) -> str:
     attempt = latest_attempt(
         run_path,
-        phases=(WorkflowState.IMPLEMENTING.value,),
-        statuses=("COMPLETED",),
+        phases=(AttemptPhase.IMPLEMENTING,),
+        statuses=(AttemptStatus.COMPLETED,),
     )
-    result_path = None if attempt is None else attempt_result_path(run_path, attempt)
-    if result_path is None:
+    if attempt is None:
         return "No implementation summary is available."
+    result_path = attempt_result_path(run_path, attempt)
     try:
         data = json.loads(result_path.read_text(encoding="utf-8"))
     except FileNotFoundError:

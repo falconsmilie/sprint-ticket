@@ -17,43 +17,40 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from .models import (
+    PHASE_DEFINITIONS,
+    AttemptPhase,
+    AttemptStatus,
+    StageOutcome,
+)
+
 ATTEMPTS_DIR_NAME = "attempts"
 ATTEMPT_RECORD_FILE = "attempt.json"
 ATTEMPT_RECORD_FORMAT = "ticket_automation.attempt"
 ATTEMPT_RECORD_SCHEMA_VERSION = 1
 
 _ATTEMPT_DIRECTORY_PATTERN = re.compile(r"^(0*[1-9][0-9]*)-(.+)$")
-_PHASES = frozenset(
-    {
-        "PREPARING",
-        "IMPLEMENTING",
-        "VERIFYING",
-        "REVIEWING",
-        "CORRECTING",
-        "REPORTING",
-    }
-)
-_STATUSES = frozenset({"STARTED", "COMPLETED", "HUMAN_REQUIRED", "FAILED"})
-
-WRITABLE_PHASES = frozenset({"IMPLEMENTING", "CORRECTING"})
 
 
 @dataclass(frozen=True)
 class AttemptRecord:
     sequence: int
-    phase: str
-    status: str
+    phase: AttemptPhase
+    status: AttemptStatus
     before_workspace_fingerprint: str | None
     after_workspace_fingerprint: str | None
     process_started: bool
     started_at: str
     ended_at: str | None
-    result_path: str | None
+    result_path: str
     execution_path: str | None
     metadata: dict[str, Any]
     artifact_directory: Path
     schema_version: int = ATTEMPT_RECORD_SCHEMA_VERSION
     format: str = ATTEMPT_RECORD_FORMAT
+
+    def __post_init__(self) -> None:
+        _validate_record(self)
 
     @property
     def path(self) -> Path:
@@ -61,15 +58,15 @@ class AttemptRecord:
 
     @property
     def completed(self) -> bool:
-        return self.status == "COMPLETED"
+        return self.status is AttemptStatus.COMPLETED
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
             "format": self.format,
             "sequence": self.sequence,
-            "phase": self.phase,
-            "status": self.status,
+            "phase": self.phase.value,
+            "status": self.status.value,
             "before_workspace_fingerprint": self.before_workspace_fingerprint,
             "after_workspace_fingerprint": self.after_workspace_fingerprint,
             "process_started": self.process_started,
@@ -88,9 +85,8 @@ class AttemptError(RuntimeError):
 def start_attempt(
     run_dir: Path | str,
     *,
-    phase: str,
+    phase: AttemptPhase,
     before_workspace_fingerprint: str | None,
-    result_path: str | None = "result.json",
     execution_path: str | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> AttemptRecord:
@@ -102,6 +98,7 @@ def start_attempt(
     directory still reserves its sequence number as diagnostic history.
     """
 
+    _validate_phase_value(phase, field="phase")
     run_path = Path(run_dir)
     attempts_root = run_path / ATTEMPTS_DIR_NAME
     attempts_root.mkdir(parents=True, exist_ok=True)
@@ -115,22 +112,22 @@ def start_attempt(
                 suffix=".tmp",
             )
         )
-        record = AttemptRecord(
-            sequence=sequence,
-            phase=phase,
-            status="STARTED",
-            before_workspace_fingerprint=before_workspace_fingerprint,
-            after_workspace_fingerprint=None,
-            process_started=False,
-            started_at=_timestamp(clock),
-            ended_at=None,
-            result_path=result_path,
-            execution_path=execution_path,
-            metadata={},
-            artifact_directory=directory,
-        )
+        record: AttemptRecord
         try:
-            _validate_record(record)
+            record = AttemptRecord(
+                sequence=sequence,
+                phase=phase,
+                status=AttemptStatus.STARTED,
+                before_workspace_fingerprint=before_workspace_fingerprint,
+                after_workspace_fingerprint=None,
+                process_started=False,
+                started_at=_timestamp(clock),
+                ended_at=None,
+                result_path=PHASE_DEFINITIONS[phase].result_artifact_name,
+                execution_path=execution_path,
+                metadata={},
+                artifact_directory=directory,
+            )
             _atomic_write_json(
                 temporary_directory / ATTEMPT_RECORD_FILE, record.to_dict()
             )
@@ -153,11 +150,10 @@ def save_attempt(record: AttemptRecord) -> None:
 def update_attempt(
     record: AttemptRecord,
     *,
-    status: str | None = None,
+    status: AttemptStatus | None = None,
     before_workspace_fingerprint: str | None = None,
     after_workspace_fingerprint: str | None = None,
     process_started: bool | None = None,
-    result_path: str | None = None,
     execution_path: str | None = None,
     metadata: dict[str, Any] | None = None,
     ended: bool = False,
@@ -179,7 +175,6 @@ def update_attempt(
         process_started=(
             record.process_started if process_started is None else process_started
         ),
-        result_path=record.result_path if result_path is None else result_path,
         execution_path=(
             record.execution_path if execution_path is None else execution_path
         ),
@@ -193,10 +188,9 @@ def update_attempt(
 def complete_attempt(
     record: AttemptRecord,
     *,
-    status: str,
+    status: AttemptStatus,
     after_workspace_fingerprint: str | None,
     process_started: bool | None = None,
-    result_path: str | None = None,
     execution_path: str | None = None,
     metadata: dict[str, Any] | None = None,
     clock: Callable[[], datetime] | None = None,
@@ -206,7 +200,6 @@ def complete_attempt(
         status=status,
         after_workspace_fingerprint=after_workspace_fingerprint,
         process_started=process_started,
-        result_path=result_path,
         execution_path=execution_path,
         metadata=metadata,
         ended=True,
@@ -244,11 +237,11 @@ def load_attempt_records(run_dir: Path | str) -> tuple[AttemptRecord, ...]:
 def latest_attempt(
     run_dir: Path | str,
     *,
-    phases: Iterable[str] | None = None,
-    statuses: Iterable[str] | None = None,
+    phases: Iterable[AttemptPhase] | None = None,
+    statuses: Iterable[AttemptStatus] | None = None,
 ) -> AttemptRecord | None:
-    phase_set = None if phases is None else frozenset(phases)
-    status_set = None if statuses is None else frozenset(statuses)
+    phase_set = None if phases is None else _phase_filter(phases)
+    status_set = None if statuses is None else _status_filter(statuses)
     for record in reversed(load_attempt_records(run_dir)):
         if phase_set is not None and record.phase not in phase_set:
             continue
@@ -261,16 +254,20 @@ def latest_attempt(
 def latest_writable_attempt(run_dir: Path | str) -> AttemptRecord | None:
     return latest_attempt(
         run_dir,
-        phases=WRITABLE_PHASES,
-        statuses=("COMPLETED",),
+        phases=(
+            phase
+            for phase, definition in PHASE_DEFINITIONS.items()
+            if definition.writes_target_repository
+        ),
+        statuses=(AttemptStatus.COMPLETED,),
     )
 
 
 def finish_phase_attempt(
     run_dir: Path | str,
     *,
-    phase: str,
-    stage_outcome: str,
+    phase: AttemptPhase,
+    stage_outcome: StageOutcome,
     after_workspace_fingerprint: str | None = None,
     process_started: bool | None = None,
     execution_path: Path | None = None,
@@ -279,15 +276,22 @@ def finish_phase_attempt(
 ) -> AttemptRecord | None:
     """Close the current phase record without giving it controller authority."""
 
-    record = latest_attempt(run_dir, phases=(phase,), statuses=("STARTED",))
+    _validate_phase_value(phase, field="phase")
+    if not isinstance(stage_outcome, StageOutcome):
+        raise AttemptError("stage_outcome must be a StageOutcome value.")
+    record = latest_attempt(
+        run_dir,
+        phases=(phase,),
+        statuses=(AttemptStatus.STARTED,),
+    )
     if record is None:
         return None
     status = {
-        "COMPLETED": "COMPLETED",
-        "CORRECTION_REQUIRED": "COMPLETED",
-        "HUMAN_REQUIRED": "HUMAN_REQUIRED",
-        "FAILED": "FAILED",
-    }.get(stage_outcome, "FAILED")
+        StageOutcome.COMPLETED: AttemptStatus.COMPLETED,
+        StageOutcome.CORRECTION_REQUIRED: AttemptStatus.COMPLETED,
+        StageOutcome.HUMAN_REQUIRED: AttemptStatus.HUMAN_REQUIRED,
+        StageOutcome.FAILED: AttemptStatus.FAILED,
+    }[stage_outcome]
     relative_execution_path = None
     if execution_path is not None:
         try:
@@ -309,9 +313,7 @@ def finish_phase_attempt(
     )
 
 
-def attempt_result_path(run_dir: Path | str, record: AttemptRecord) -> Path | None:
-    if record.result_path is None:
-        return None
+def attempt_result_path(run_dir: Path | str, record: AttemptRecord) -> Path:
     return _attempt_artifact_path(run_dir, record, record.result_path)
 
 
@@ -350,9 +352,7 @@ def _load_attempt(path: Path) -> AttemptRecord:
             process_started=_required_bool(data, "process_started"),
             started_at=_required_timestamp(data, "started_at"),
             ended_at=_nullable_timestamp(data.get("ended_at")),
-            result_path=_nullable_relative_artifact_path(
-                data.get("result_path"), "result_path"
-            ),
+            result_path=_required_relative_artifact_path(data, "result_path"),
             execution_path=_nullable_relative_artifact_path(
                 data.get("execution_path"), "execution_path"
             ),
@@ -361,7 +361,6 @@ def _load_attempt(path: Path) -> AttemptRecord:
             schema_version=data.get("schema_version"),
             format=data.get("format"),
         )
-        _validate_record(record)
         return record
     except (KeyError, TypeError, ValueError, AttemptError) as error:
         raise AttemptError(f"Invalid attempt record {path}: {error}") from error
@@ -389,19 +388,19 @@ def _validate_record(record: AttemptRecord) -> None:
         or record.sequence < 1
     ):
         raise AttemptError("Attempt sequence must be a positive integer.")
-    if record.phase not in _PHASES:
+    if not isinstance(record.phase, AttemptPhase):
         raise AttemptError(f"Attempt phase is unsupported: {record.phase!r}.")
-    if record.status not in _STATUSES:
+    if not isinstance(record.status, AttemptStatus):
         raise AttemptError(f"Attempt status is unsupported: {record.status!r}.")
     if not isinstance(record.process_started, bool):
         raise AttemptError("Attempt process_started must be a boolean.")
     _validate_timestamp(record.started_at, field="started_at")
     if record.ended_at is None:
-        if record.status != "STARTED":
+        if record.status is not AttemptStatus.STARTED:
             raise AttemptError("Completed attempt records must have ended_at.")
     else:
         _validate_timestamp(record.ended_at, field="ended_at")
-        if record.status == "STARTED":
+        if record.status is AttemptStatus.STARTED:
             raise AttemptError("Started attempt records cannot have ended_at.")
     _validate_nullable_string(
         record.before_workspace_fingerprint, "before_workspace_fingerprint"
@@ -409,8 +408,9 @@ def _validate_record(record: AttemptRecord) -> None:
     _validate_nullable_string(
         record.after_workspace_fingerprint, "after_workspace_fingerprint"
     )
-    if record.result_path is not None:
-        _validate_relative_artifact_path(record.result_path, field="result_path")
+    _validate_relative_artifact_path(record.result_path, field="result_path")
+    if record.result_path != PHASE_DEFINITIONS[record.phase].result_artifact_name:
+        raise AttemptError("Attempt result_path does not match its phase definition.")
     if record.execution_path is not None:
         _validate_relative_artifact_path(record.execution_path, field="execution_path")
     if not isinstance(record.metadata, dict):
@@ -423,16 +423,28 @@ def _directory_name(record: AttemptRecord) -> str:
     return f"{record.sequence:03d}-{_phase_slug(record.phase)}"
 
 
-def _phase_slug(phase: str) -> str:
-    names = {
-        "PREPARING": "preparation",
-        "IMPLEMENTING": "implementation",
-        "VERIFYING": "verification",
-        "REVIEWING": "review",
-        "CORRECTING": "correction",
-        "REPORTING": "reporting",
-    }
-    return names.get(phase, re.sub(r"[^a-z0-9]+", "-", phase.lower()).strip("-"))
+def _phase_slug(phase: AttemptPhase) -> str:
+    _validate_phase_value(phase, field="phase")
+    return PHASE_DEFINITIONS[phase].slug
+
+
+def _validate_phase_value(phase: object, *, field: str) -> None:
+    if not isinstance(phase, AttemptPhase):
+        raise AttemptError(f"{field} must be an AttemptPhase value.")
+
+
+def _phase_filter(phases: Iterable[AttemptPhase]) -> frozenset[AttemptPhase]:
+    values = frozenset(phases)
+    for phase in values:
+        _validate_phase_value(phase, field="phase filter")
+    return values
+
+
+def _status_filter(statuses: Iterable[AttemptStatus]) -> frozenset[AttemptStatus]:
+    values = frozenset(statuses)
+    if any(not isinstance(status, AttemptStatus) for status in values):
+        raise AttemptError("status filter must contain only AttemptStatus values.")
+    return values
 
 
 def _timestamp(clock: Callable[[], datetime] | None) -> str:
@@ -449,18 +461,20 @@ def _required_positive_int(data: dict[str, Any], key: str) -> int:
     return value
 
 
-def _required_phase(data: dict[str, Any]) -> str:
+def _required_phase(data: dict[str, Any]) -> AttemptPhase:
     value = _required_string(data, "phase")
-    if value not in _PHASES:
-        raise ValueError(f"phase is unsupported: {value!r}")
-    return value
+    try:
+        return AttemptPhase(value)
+    except ValueError as error:
+        raise ValueError(f"phase is unsupported: {value!r}") from error
 
 
-def _required_status(data: dict[str, Any]) -> str:
+def _required_status(data: dict[str, Any]) -> AttemptStatus:
     value = _required_string(data, "status")
-    if value not in _STATUSES:
-        raise ValueError(f"status is unsupported: {value!r}")
-    return value
+    try:
+        return AttemptStatus(value)
+    except ValueError as error:
+        raise ValueError(f"status is unsupported: {value!r}") from error
 
 
 def _required_bool(data: dict[str, Any], key: str) -> bool:
@@ -519,6 +533,12 @@ def _nullable_relative_artifact_path(value: object, field: str) -> str | None:
         return None
     if not isinstance(value, str):
         raise TypeError(f"{field} must be a string or null")
+    _validate_relative_artifact_path(value, field=field)
+    return value
+
+
+def _required_relative_artifact_path(data: dict[str, Any], field: str) -> str:
+    value = _required_string(data, field)
     _validate_relative_artifact_path(value, field=field)
     return value
 
@@ -586,7 +606,6 @@ def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
 __all__ = [
     "ATTEMPTS_DIR_NAME",
     "ATTEMPT_RECORD_FILE",
-    "WRITABLE_PHASES",
     "AttemptError",
     "AttemptRecord",
     "attempt_result_path",

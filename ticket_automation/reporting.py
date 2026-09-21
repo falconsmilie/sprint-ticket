@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .attempts import (
+    AttemptRecord,
     attempt_result_path,
     latest_attempt,
     latest_writable_attempt,
@@ -30,7 +31,12 @@ from .domain.task_results import (
 )
 from .git import GitCommandError, GitRepository
 from .git_safety import WorkspaceSnapshot
-from .models import StageOutcome, WorkflowState
+from .models import (
+    PHASE_DEFINITIONS,
+    ResultArtifactRole,
+    StageOutcome,
+    WorkflowState,
+)
 from .runs import RUN_RECORD_FILE, RunError, RunRecord, load_run_record
 from .task_result_codecs import decode_implementation_result, decode_review_result
 
@@ -150,8 +156,14 @@ def collect_report_context(
     )
     records = load_attempt_records(run_path)
     attempts = tuple(_attempt_view(run_path, record) for record in records)
-    verification = tuple(item for item in attempts if item["phase"] == "VERIFYING")
-    baseline = _latest_attempt_result(run_path, "PREPARING")
+    verification = tuple(
+        _attempt_view(run_path, record)
+        for record in records
+        if _has_result_role(record, ResultArtifactRole.VERIFICATION_ROUND)
+    )
+    baseline = _latest_attempt_result(
+        run_path, ResultArtifactRole.BASELINE_VERIFICATION
+    )
     reviews, review_result_errors = _review_results(run_path, records)
     implementation, implementation_result_error = _latest_implementation_result(
         run_path
@@ -288,7 +300,7 @@ def count_patch_changes(patch_text: str) -> tuple[int, int]:
 
 
 def latest_verification_round(run_dir: Path | str) -> dict[str, Any] | None:
-    return _latest_attempt_result(Path(run_dir), "VERIFYING")
+    return _latest_attempt_result(Path(run_dir), ResultArtifactRole.VERIFICATION_ROUND)
 
 
 def latest_review_result(run_dir: Path | str) -> ReviewResult | None:
@@ -296,7 +308,7 @@ def latest_review_result(run_dir: Path | str) -> ReviewResult | None:
 
 
 def _latest_review_result(run_path: Path) -> ReviewResult | None:
-    record = latest_attempt(run_path, phases=("REVIEWING",))
+    record = _latest_attempt_for_role(run_path, ResultArtifactRole.REVIEW_RESULT)
     if record is None:
         return None
     value = _task_result_value(run_path, record)
@@ -307,12 +319,12 @@ def _latest_review_result(run_path: Path) -> ReviewResult | None:
 
 def _review_results(
     run_path: Path,
-    records: tuple[Any, ...],
+    records: tuple[AttemptRecord, ...],
 ) -> tuple[tuple[ReviewResult, ...], tuple[str, ...]]:
     results: list[ReviewResult] = []
     errors: list[str] = []
     for record in records:
-        if record.phase != "REVIEWING":
+        if not _has_result_role(record, ResultArtifactRole.REVIEW_RESULT):
             continue
         try:
             value = _task_result_value(run_path, record)
@@ -327,7 +339,9 @@ def _review_results(
 def _latest_implementation_result(
     run_path: Path,
 ) -> tuple[ImplementationResult | None, str | None]:
-    record = latest_attempt(run_path, phases=("IMPLEMENTING",))
+    record = _latest_attempt_for_role(
+        run_path, ResultArtifactRole.IMPLEMENTATION_RESULT
+    )
     if record is None:
         return None, None
     try:
@@ -342,17 +356,34 @@ def _latest_implementation_result(
         return None, str(error)
 
 
-def _latest_attempt_result(run_path: Path, phase: str) -> dict[str, Any] | None:
-    record = latest_attempt(run_path, phases=(phase,))
+def _latest_attempt_result(
+    run_path: Path,
+    role: ResultArtifactRole,
+) -> dict[str, Any] | None:
+    record = _latest_attempt_for_role(run_path, role)
     if record is None:
         return None
     path = attempt_result_path(run_path, record)
-    if path is None:
-        return None
     return _read_json(path)
 
 
-def _attempt_view(run_path: Path, record: Any) -> dict[str, Any]:
+def _latest_attempt_for_role(
+    run_path: Path,
+    role: ResultArtifactRole,
+) -> AttemptRecord | None:
+    phases = tuple(
+        phase
+        for phase, definition in PHASE_DEFINITIONS.items()
+        if definition.result_artifact_role is role
+    )
+    return latest_attempt(run_path, phases=phases)
+
+
+def _has_result_role(record: AttemptRecord, role: ResultArtifactRole) -> bool:
+    return PHASE_DEFINITIONS[record.phase].result_artifact_role is role
+
+
+def _attempt_view(run_path: Path, record: AttemptRecord) -> dict[str, Any]:
     correction_ticket = record.artifact_directory / "correction-ticket.md"
     return {
         "sequence": record.sequence,
@@ -366,9 +397,9 @@ def _attempt_view(run_path: Path, record: Any) -> dict[str, Any]:
     }
 
 
-def _task_result_value(run_path: Path, record: Any) -> object | None:
+def _task_result_value(run_path: Path, record: AttemptRecord) -> object | None:
     result_path = attempt_result_path(run_path, record)
-    if result_path is None or not result_path.is_file():
+    if not result_path.is_file():
         return None
     try:
         return json.loads(result_path.read_text(encoding="utf-8"))

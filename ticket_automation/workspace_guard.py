@@ -9,6 +9,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .models import AttemptPhase
+
 WORKSPACE_GUARD_DIR_NAME = "workspace-guard"
 WORKSPACE_GUARD_FORMAT = "ticket_automation.workspace_environment_guard"
 WORKSPACE_GUARD_SCHEMA_VERSION = 1
@@ -78,7 +80,7 @@ class WorkspaceEnvironmentSnapshot:
 
 @dataclass(frozen=True)
 class WorkspaceGuardInspection:
-    phase: str
+    phase: AttemptPhase
     timestamp: str
     artifact_path: Path | None
     before: WorkspaceEnvironmentSnapshot
@@ -103,7 +105,7 @@ class WorkspaceGuardInspection:
         return {
             "schema_version": WORKSPACE_GUARD_SCHEMA_VERSION,
             "format": WORKSPACE_GUARD_FORMAT,
-            "phase": self.phase,
+            "phase": self.phase.value,
             "timestamp": self.timestamp,
             "target_repository_path": str(self.after.repository_path),
             "environments_before": tuple(
@@ -153,7 +155,7 @@ def _compare_workspace_environment_change(
     *,
     before: WorkspaceEnvironmentSnapshot,
     after: WorkspaceEnvironmentSnapshot,
-    phase: str,
+    phase: AttemptPhase,
     clock: Callable[[], datetime] | None = None,
 ) -> WorkspaceGuardInspection:
     """Build environment evidence from the shared boundary's two snapshots."""

@@ -17,6 +17,7 @@ from .codex import (
 from .codex import execute as execute_codex
 from .git import GitRepository
 from .git_safety import WorkspaceSnapshot
+from .models import PHASE_DEFINITIONS, AttemptPhase
 from .workspace_guard import (
     WorkspaceEnvironmentSnapshot,
     WorkspaceGuardInspection,
@@ -60,7 +61,7 @@ def run_writable_codex(
     repository: GitRepository,
     run_dir: Path | str,
     operation: str,
-    phase: str,
+    phase: AttemptPhase,
     attempt_record: AttemptRecord,
     prompt: str,
     output_schema: Path | str,
@@ -78,6 +79,10 @@ def run_writable_codex(
     generated dependency trees, or global/external environment mutations.
     """
 
+    if not isinstance(phase, AttemptPhase):
+        raise TypeError("phase must be an AttemptPhase value.")
+    if not PHASE_DEFINITIONS[phase].writes_target_repository:
+        raise ValueError(f"Attempt phase {phase.value} is not writable.")
     environment_before = _capture_environment_snapshot(repository)
     before_workspace, before_error = _capture_workspace_snapshot(repository)
     environment_before = _with_workspace_inspection_errors(

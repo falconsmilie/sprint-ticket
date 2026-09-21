@@ -44,7 +44,16 @@ from .implementation import (
     run_implementation_stage,
 )
 from .locking import RepositoryRunLock, acquire_repository_run_lock
-from .models import StageOutcome, StopCategory, StopReason, WorkflowState
+from .models import (
+    PHASE_DEFINITIONS,
+    AttemptPhase,
+    AttemptStatus,
+    StageOutcome,
+    StopCategory,
+    StopReason,
+    WorkflowState,
+    phase_for_active_state,
+)
 from .preflight import PreflightResult
 from .reporting import (
     FINAL_PATCH_FILE,
@@ -652,7 +661,7 @@ def _drive_lifecycle(
                 )
             report_attempt = start_attempt(
                 run_dir,
-                phase=WorkflowState.REPORTING.value,
+                phase=AttemptPhase.REPORTING,
                 before_workspace_fingerprint=(
                     None if snapshot is None else snapshot.fingerprint
                 ),
@@ -666,13 +675,13 @@ def _drive_lifecycle(
             if handoff_problem is not None:
                 _write_attempt_result(
                     report_attempt,
-                    status="HUMAN_REQUIRED",
+                    status=StageOutcome.HUMAN_REQUIRED.value,
                     message=handoff_problem,
                 )
                 finish_phase_attempt(
                     run_dir,
-                    phase=WorkflowState.REPORTING.value,
-                    stage_outcome=StageOutcome.HUMAN_REQUIRED.value,
+                    phase=AttemptPhase.REPORTING,
+                    stage_outcome=StageOutcome.HUMAN_REQUIRED,
                     after_workspace_fingerprint=(
                         None if snapshot is None else snapshot.fingerprint
                     ),
@@ -709,13 +718,13 @@ def _drive_lifecycle(
             if handoff_problem is not None:
                 _write_attempt_result(
                     report_attempt,
-                    status="HUMAN_REQUIRED",
+                    status=StageOutcome.HUMAN_REQUIRED.value,
                     message=handoff_problem,
                 )
                 finish_phase_attempt(
                     run_dir,
-                    phase=WorkflowState.REPORTING.value,
-                    stage_outcome=StageOutcome.HUMAN_REQUIRED.value,
+                    phase=AttemptPhase.REPORTING,
+                    stage_outcome=StageOutcome.HUMAN_REQUIRED,
                     after_workspace_fingerprint=snapshot.fingerprint,
                     metadata={"controller_message": handoff_problem},
                     clock=clock,
@@ -735,8 +744,8 @@ def _drive_lifecycle(
             )
             finish_phase_attempt(
                 run_dir,
-                phase=WorkflowState.REPORTING.value,
-                stage_outcome=StageOutcome.COMPLETED.value,
+                phase=AttemptPhase.REPORTING,
+                stage_outcome=StageOutcome.COMPLETED,
                 after_workspace_fingerprint=snapshot.fingerprint,
                 metadata={
                     "controller_message": (
@@ -832,7 +841,7 @@ def _final_handoff_problem(
         )
     except _VerificationArtifactError as error:
         return f"Deterministic verification evidence is not passing: {error}"
-    review = _attempt_result(run_dir, WorkflowState.REVIEWING.value)
+    review = _attempt_result(run_dir, AttemptPhase.REVIEWING)
     if review is None:
         return "Final independent review evidence is missing."
     try:
@@ -862,7 +871,10 @@ def _write_attempt_result(
     status: str,
     message: str,
 ) -> None:
-    path = attempt.artifact_directory / "result.json"
+    path = (
+        attempt.artifact_directory
+        / PHASE_DEFINITIONS[attempt.phase].result_artifact_name
+    )
     path.write_text(
         json.dumps({"status": status, "message": message}, indent=2) + "\n",
         encoding="utf-8",
@@ -870,13 +882,18 @@ def _write_attempt_result(
     )
 
 
-def _attempt_result(run_dir: Path, phase: str) -> dict[str, object] | None:
-    attempt = latest_attempt(run_dir, phases=(phase,), statuses=("COMPLETED",))
+def _attempt_result(
+    run_dir: Path,
+    phase: AttemptPhase,
+) -> dict[str, object] | None:
+    attempt = latest_attempt(
+        run_dir,
+        phases=(phase,),
+        statuses=(AttemptStatus.COMPLETED,),
+    )
     if attempt is None:
         return None
     path = attempt_result_path(run_dir, attempt)
-    if path is None:
-        return None
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -1158,14 +1175,11 @@ def _update_repository_lock(
 
 
 def _resume_problem(run_dir: Path, run_record: RunRecord) -> str | None:
-    if run_record.state in {WorkflowState.IMPLEMENTING, WorkflowState.CORRECTING}:
-        operation = (
-            "implementation"
-            if run_record.state == WorkflowState.IMPLEMENTING
-            else "correction"
-        )
+    phase = phase_for_active_state(run_record.state)
+    definition = None if phase is None else PHASE_DEFINITIONS[phase]
+    if definition is not None and not definition.automatically_retry_interrupted:
         return (
-            f"Writable {operation} was interrupted before completion; the "
+            f"Writable {definition.display_name} was interrupted before completion; the "
             "working tree may contain partial source modifications."
         )
 
@@ -1177,12 +1191,9 @@ def _resume_problem(run_dir: Path, run_record: RunRecord) -> str | None:
             description="the recorded clean baseline",
         )
 
-    if run_record.state in {
-        WorkflowState.VERIFYING,
-        WorkflowState.REVIEWING,
-        WorkflowState.REPORTING,
-        WorkflowState.CORRECTION_PENDING,
-    }:
+    if (
+        definition is not None and definition.automatically_retry_interrupted
+    ) or run_record.state is WorkflowState.CORRECTION_PENDING:
         writable_attempt = latest_writable_attempt(run_dir)
         if (
             writable_attempt is None
@@ -1281,7 +1292,7 @@ def _terminal_label(state: WorkflowState) -> str:
     if state == WorkflowState.HUMAN_REQUIRED:
         return "HUMAN REQUIRED"
     if state == WorkflowState.FAILED:
-        return "FAILED"
+        return state.value
     return state.value
 
 

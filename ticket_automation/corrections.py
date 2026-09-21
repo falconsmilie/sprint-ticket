@@ -38,7 +38,7 @@ from .git_safety import (
     WorkspaceSnapshot,
     workspace_safety_changes,
 )
-from .models import StageOutcome, StopCategory, WorkflowState
+from .models import AttemptPhase, StageOutcome, StopCategory, WorkflowState
 from .resolved_config import config_from_resolved_run_config
 from .runs import (
     BASELINE_RECORD_FILE,
@@ -240,7 +240,7 @@ def run_correction_stage(
         before_fingerprint = None
     attempt_record = start_attempt(
         run_path,
-        phase=WorkflowState.CORRECTING.value,
+        phase=AttemptPhase.CORRECTING,
         before_workspace_fingerprint=before_fingerprint,
         clock=clock,
     )
@@ -351,7 +351,7 @@ def run_correction_stage(
         repository=repository,
         run_dir=run_path,
         operation=f"correction-round-{correction_round}",
-        phase=WorkflowState.CORRECTING.value,
+        phase=AttemptPhase.CORRECTING,
         attempt_record=attempt_record,
         prompt=prompt,
         output_schema=_CORRECTION_RESULT_SCHEMA,
@@ -667,8 +667,8 @@ def _finish(
         pass
     finish_phase_attempt(
         run_dir,
-        phase=WorkflowState.CORRECTING.value,
-        stage_outcome=outcome.value,
+        phase=AttemptPhase.CORRECTING,
+        stage_outcome=outcome,
         after_workspace_fingerprint=after_fingerprint,
         process_started=(None if execution is None else execution.process_started),
         execution_path=(None if execution is None else execution.execution_json_path),

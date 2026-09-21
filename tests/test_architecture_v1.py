@@ -19,7 +19,7 @@ from ticket_automation.codex import CodexProcessResult
 from ticket_automation.git import GitRepository
 from ticket_automation.git_safety import WorkspaceSnapshot
 from ticket_automation.implementation import run_implementation_stage
-from ticket_automation.models import StopCategory, WorkflowState
+from ticket_automation.models import AttemptPhase, StopCategory, WorkflowState
 from ticket_automation.reporting import run_report_stage
 from ticket_automation.review import run_review_stage
 from ticket_automation.runs import create_run_snapshot, load_run_record, save_run_record
@@ -258,7 +258,7 @@ def test_interrupted_writable_state_requires_human_inspection(tmp_path):
     before = WorkspaceSnapshot.capture(GitRepository(repo))
     attempt = start_attempt(
         snapshot.run_dir,
-        phase=WorkflowState.IMPLEMENTING.value,
+        phase=AttemptPhase.IMPLEMENTING,
         before_workspace_fingerprint=before.fingerprint,
         clock=fixed_clock,
     )
@@ -318,7 +318,7 @@ def test_resume_restarts_preparation_in_a_new_attempt(tmp_path):
     )
     start_attempt(
         snapshot.run_dir,
-        phase=WorkflowState.PREPARING.value,
+        phase=AttemptPhase.PREPARING,
         before_workspace_fingerprint=snapshot.run_record.baseline_sha,
         clock=fixed_clock,
     )
@@ -380,7 +380,7 @@ def test_resume_restarts_review_in_a_new_attempt(tmp_path):
     save_run_record(reviewing, snapshot.run_dir / "run.json")
     start_attempt(
         snapshot.run_dir,
-        phase=WorkflowState.REVIEWING.value,
+        phase=AttemptPhase.REVIEWING,
         before_workspace_fingerprint=None,
         clock=fixed_clock,
     )
@@ -453,7 +453,7 @@ def test_resume_restarts_reporting_in_a_new_attempt(tmp_path):
     save_run_record(reporting, snapshot.run_dir / "run.json")
     start_attempt(
         snapshot.run_dir,
-        phase=WorkflowState.REPORTING.value,
+        phase=AttemptPhase.REPORTING,
         before_workspace_fingerprint=None,
         clock=fixed_clock,
     )
@@ -560,7 +560,6 @@ def test_one_correction_round_preserves_the_ordinary_lifecycle(tmp_path):
         if item.phase == "VERIFYING" and item.sequence == 3
     )
     result_path = attempt_result_path(result.run_dir, failed_verification)
-    assert result_path is not None
     verification_evidence = json.loads(result_path.read_text(encoding="utf-8"))
     assert [
         reason["kind"] for reason in verification_evidence["correction_reasons"]

@@ -12,7 +12,7 @@ from tests.helpers import (
 )
 from ticket_automation.attempts import latest_attempt
 from ticket_automation.config import VerificationCommand
-from ticket_automation.models import WorkflowState
+from ticket_automation.models import AttemptPhase, StageOutcome, WorkflowState
 from ticket_automation.runs import create_run_snapshot, save_run_record
 from ticket_automation.verification import (
     VerificationProcessResult,
@@ -106,8 +106,8 @@ def test_verification_snapshot_failure_is_recorded_without_starting_a_process(
     )
     result = run_verification_stage(config, snapshot.run_dir, clock=fixed_clock)
 
-    attempt = latest_attempt(snapshot.run_dir, phases=(WorkflowState.VERIFYING.value,))
-    assert result.outcome.value == "HUMAN_REQUIRED"
+    attempt = latest_attempt(snapshot.run_dir, phases=(AttemptPhase.VERIFYING,))
+    assert result.outcome is StageOutcome.HUMAN_REQUIRED
     assert attempt is not None
     assert attempt.process_started is False
     assert attempt.status == "HUMAN_REQUIRED"
@@ -148,7 +148,7 @@ def test_verification_process_start_failure_is_not_recorded_as_a_started_process
         clock=fixed_clock,
     )
 
-    attempt = latest_attempt(snapshot.run_dir, phases=(WorkflowState.VERIFYING.value,))
-    assert result.outcome.value == "HUMAN_REQUIRED"
+    attempt = latest_attempt(snapshot.run_dir, phases=(AttemptPhase.VERIFYING,))
+    assert result.outcome is StageOutcome.HUMAN_REQUIRED
     assert attempt is not None
     assert attempt.process_started is False

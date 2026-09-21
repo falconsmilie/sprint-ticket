@@ -13,7 +13,12 @@ from tests.helpers import (
 from ticket_automation.attempts import latest_attempt
 from ticket_automation.codex import CodexProcessResult
 from ticket_automation.implementation import run_implementation_stage
-from ticket_automation.models import WorkflowState
+from ticket_automation.models import (
+    AttemptPhase,
+    AttemptStatus,
+    StageOutcome,
+    WorkflowState,
+)
 from ticket_automation.review import run_review_stage
 from ticket_automation.runs import save_run_record
 from ticket_automation.verification import (
@@ -138,8 +143,8 @@ def test_review_snapshot_failure_is_recorded_as_human_required(
     )
     result = run_review_stage(config, snapshot.run_dir, clock=fixed_clock)
 
-    attempt = latest_attempt(snapshot.run_dir, phases=(WorkflowState.REVIEWING.value,))
-    assert result.outcome.value == "HUMAN_REQUIRED"
+    attempt = latest_attempt(snapshot.run_dir, phases=(AttemptPhase.REVIEWING,))
+    assert result.outcome is StageOutcome.HUMAN_REQUIRED
     assert attempt is not None
     assert attempt.process_started is False
-    assert attempt.status == "HUMAN_REQUIRED"
+    assert attempt.status is AttemptStatus.HUMAN_REQUIRED

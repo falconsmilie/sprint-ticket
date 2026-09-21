@@ -26,7 +26,7 @@ from .git_safety import (
     WorkspaceSnapshot,
     workspace_safety_changes,
 )
-from .models import StageOutcome, StopCategory, WorkflowState
+from .models import AttemptPhase, StageOutcome, StopCategory, WorkflowState
 from .resolved_config import config_from_resolved_run_config
 from .runs import (
     BASELINE_RECORD_FILE,
@@ -124,7 +124,7 @@ def run_implementation_stage(
         before_fingerprint = None
     attempt_record = start_attempt(
         run_path,
-        phase=WorkflowState.IMPLEMENTING.value,
+        phase=AttemptPhase.IMPLEMENTING,
         before_workspace_fingerprint=before_fingerprint,
         clock=clock,
     )
@@ -180,7 +180,7 @@ def run_implementation_stage(
         repository=repository,
         run_dir=run_path,
         operation="implementation",
-        phase=WorkflowState.IMPLEMENTING.value,
+        phase=AttemptPhase.IMPLEMENTING,
         attempt_record=attempt_record,
         prompt=prompt,
         output_schema=_IMPLEMENTATION_RESULT_SCHEMA,
@@ -450,8 +450,8 @@ def _finish(
         pass
     finish_phase_attempt(
         run_dir,
-        phase=WorkflowState.IMPLEMENTING.value,
-        stage_outcome=outcome.value,
+        phase=AttemptPhase.IMPLEMENTING,
+        stage_outcome=outcome,
         after_workspace_fingerprint=after_fingerprint,
         process_started=(None if execution is None else execution.process_started),
         execution_path=(None if execution is None else execution.execution_json_path),

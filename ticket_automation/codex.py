@@ -21,6 +21,7 @@ from .config import (
     validate_codex_execution_settings,
 )
 from .domain.task_results import ResultValidationError, TaskResult
+from .models import ATTEMPT_RESULT_ARTIFACT_NAME
 from .process_output import decode_human_output
 from .task_result_codecs import decode_implementation_result, decode_review_result
 
@@ -30,7 +31,7 @@ PROMPT_ARTIFACT = "prompt.md"
 EVENTS_ARTIFACT = "events.jsonl"
 STDERR_ARTIFACT = "stderr.log"
 _EXECUTION_ARTIFACT = "execution.json"
-RESULT_ARTIFACT = "result.json"
+RESULT_ARTIFACT = ATTEMPT_RESULT_ARTIFACT_NAME
 
 
 class Sandbox(StrEnum):
