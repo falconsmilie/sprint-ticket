@@ -30,6 +30,16 @@ from .codex import (
     CodexProcessRunner,
 )
 from .config import AppConfig, VerificationCommand
+from .domain.task_results import (
+    FindingDisposition,
+    FindingScopeRelation,
+    ImplementationResult,
+    ImplementationStatus,
+    ResultValidationError,
+    ReviewFinding,
+    ReviewResult,
+    ReviewVerdict,
+)
 from .failure_classification import classify_writable_failure
 from .git import GitCommandError, GitRepository
 from .git_safety import (
@@ -41,7 +51,6 @@ from .models import StageOutcome, StopCategory, WorkflowState
 from .resolved_config import config_from_resolved_run_config
 from .review import (
     _AUTOMATIC_CORRECTION_SCOPE_RELATIONS,
-    _REVIEW_FINDING_SCOPE_RELATIONS,
 )
 from .runs import (
     BASELINE_RECORD_FILE,
@@ -52,6 +61,7 @@ from .runs import (
     load_baseline_record,
     load_run_record,
 )
+from .task_result_codecs import decode_review_result
 from .workspace_guard import WorkspaceGuardInspection
 from .writable_attempts import WritableAttempt
 
@@ -70,9 +80,6 @@ _CORRECTION_PROMPT_TEMPLATE = _PROJECT_ROOT / "prompts" / "correct.md"
 _CORRECTION_RESULT_SCHEMA = (
     _PROJECT_ROOT / "schemas" / "implementation-result.schema.json"
 )
-_REVIEW_FINDING_DISPOSITIONS = frozenset({"REQUIRED", "ADVISORY", "FOLLOW_UP"})
-
-
 class CorrectionError(RunError):
     """Raised when corrective work cannot be prepared or persisted."""
 
@@ -104,45 +111,6 @@ class VerificationFailure:
         }
 
 
-@dataclass(frozen=True)
-class ReviewFinding:
-    finding_id: str
-    summary: str
-    details: str
-    disposition: str
-    scope_relation: str
-    evidence: str = ""
-    required_change: str = ""
-    acceptance_criteria: tuple[str, ...] = ()
-
-    def __post_init__(self) -> None:
-        if self.disposition not in _REVIEW_FINDING_DISPOSITIONS:
-            raise ValueError(
-                "Review finding disposition must be a supported disposition."
-            )
-        if self.scope_relation not in _REVIEW_FINDING_SCOPE_RELATIONS:
-            raise ValueError(
-                "Review finding scope_relation must be a supported scope relation."
-            )
-
-    @property
-    def kind(self) -> CorrectionReasonKind:
-        return CorrectionReasonKind.REVIEW_FINDING
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "kind": self.kind.value,
-            "finding_id": self.finding_id,
-            "summary": self.summary,
-            "details": self.details,
-            "evidence": self.evidence,
-            "required_change": self.required_change,
-            "acceptance_criteria": list(self.acceptance_criteria),
-            "disposition": self.disposition,
-            "scope_relation": self.scope_relation,
-        }
-
-
 CorrectionReason = VerificationFailure | ReviewFinding
 
 
@@ -164,7 +132,7 @@ class CorrectionStageResult:
     ticket_path: Path | None
     artifact_directory: Path
     codex_execution: CodexExecution | None
-    agent_result: dict[str, Any] | None
+    agent_result: ImplementationResult | None
     safety_violations: tuple[CorrectionSafetyViolation, ...]
     correction_reasons: tuple[CorrectionReason, ...]
     workspace_guard: WorkspaceGuardInspection | None
@@ -487,7 +455,7 @@ def run_correction_stage(
             controller_message="Repository safety invariants were violated.",
         )
 
-    if agent_result["status"] == "BLOCKED":
+    if agent_result.status is ImplementationStatus.BLOCKED:
         return _finish(
             run_record=active_record,
             run_dir=run_path,
@@ -573,26 +541,10 @@ def render_correction_prompt(
     return template
 
 
-def review_findings_from_result(result: dict[str, Any]) -> tuple[ReviewFinding, ...]:
-    findings = result.get("findings")
-    if not isinstance(findings, list):
-        raise CorrectionError("Review correction source must contain a findings list.")
-    required_findings: list[ReviewFinding] = []
-    for index, finding in enumerate(findings, start=1):
-        if not isinstance(finding, dict):
-            raise CorrectionError(f"Review finding {index} must be an object.")
-        disposition = _required_string(
-            finding,
-            "disposition",
-            source=f"review finding {index}",
-        )
-        if disposition not in _REVIEW_FINDING_DISPOSITIONS:
-            raise CorrectionError(
-                f"Review finding {index} has unsupported disposition: {disposition!r}."
-            )
-        if disposition == "REQUIRED":
-            required_findings.append(_review_finding_from_dict(finding, index=index))
-    return tuple(required_findings)
+def review_findings_from_result(result: ReviewResult) -> tuple[ReviewFinding, ...]:
+    if not isinstance(result, ReviewResult):
+        raise CorrectionError("Review correction source has the wrong domain type.")
+    return result.required_findings
 
 
 def correction_reason_from_dict(data: dict[str, Any]) -> CorrectionReason:
@@ -624,15 +576,18 @@ def correction_reason_from_dict(data: dict[str, Any]) -> CorrectionReason:
         )
     if kind == CorrectionReasonKind.REVIEW_FINDING.value:
         source = "review correction reason"
-        disposition = _required_string(data, "disposition", source=source)
-        if disposition not in _REVIEW_FINDING_DISPOSITIONS:
-            raise CorrectionError(
-                f"{source} has unsupported disposition: {disposition!r}."
+        try:
+            disposition = FindingDisposition(
+                _required_string(data, "disposition", source=source)
             )
+        except ValueError as error:
+            raise CorrectionError(
+                f"{source} has unsupported disposition."
+            ) from error
         return ReviewFinding(
-            finding_id=_required_string(data, "finding_id", source=source),
-            summary=_required_string(data, "summary", source=source),
-            details=_required_string(data, "details", source=source),
+            id=_required_string(data, "finding_id", source=source),
+            title=_required_string(data, "summary", source=source),
+            description=_required_string(data, "details", source=source),
             evidence=_required_string(data, "evidence", source=source),
             required_change=_required_string(
                 data,
@@ -677,7 +632,7 @@ def format_correction_result(result: CorrectionStageResult) -> str:
         if result.workspace_guard.has_inspection_failure:
             rows.append("Workspace environment inspection was incomplete.")
     if result.agent_result is not None:
-        rows.append(f"Agent status: {result.agent_result['status']}")
+        rows.append(f"Agent status: {result.agent_result.status.value}")
     if result.safety_violations:
         rows.append("Safety violations:")
         rows.extend(
@@ -695,7 +650,7 @@ def _finish(
     ticket_path: Path | None,
     artifact_directory: Path,
     execution: CodexExecution | None,
-    agent_result: dict[str, Any] | None,
+    agent_result: ImplementationResult | None,
     safety_violations: tuple[CorrectionSafetyViolation, ...],
     correction_reasons: tuple[CorrectionReason, ...],
     workspace_guard: WorkspaceGuardInspection | None = None,
@@ -848,9 +803,13 @@ def _load_required_review_findings(
     if result_path is None or not result_path.is_file():
         return ()
     data = _read_json_object(result_path)
-    if data.get("verdict") != "CORRECTIONS_REQUIRED":
+    try:
+        result = decode_review_result(data)
+    except ResultValidationError as error:
+        raise CorrectionError(f"Review correction source is invalid: {error}") from error
+    if result.verdict is not ReviewVerdict.CORRECTIONS_REQUIRED:
         return ()
-    findings = review_findings_from_result(data)
+    findings = review_findings_from_result(result)
     if not findings:
         raise CorrectionError(
             "Review requested corrections but did not contain REQUIRED findings."
@@ -917,12 +876,12 @@ def _render_review_correction_ticket(
         lines.extend(
             [
                 "",
-                f"### {finding.finding_id} - {_text_or_default(finding.summary)}",
+                f"### {finding.id} - {_text_or_default(finding.title)}",
                 "",
-                f"Scope relation: {_display_enum(finding.scope_relation)}",
+                f"Scope relation: {_display_enum(finding.scope_relation.value)}",
                 "",
                 "Finding:",
-                _text_or_default(finding.details),
+                _text_or_default(finding.description),
                 "",
                 "Evidence:",
                 _text_or_default(finding.evidence),
@@ -1075,9 +1034,9 @@ def _read_snapshotted_ticket(path: Path) -> str:
         ) from error
 
 
-def _require_agent_result(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise CorrectionError("Correction agent result must be a JSON object.")
+def _require_agent_result(value: Any) -> ImplementationResult:
+    if not isinstance(value, ImplementationResult):
+        raise CorrectionError("Correction agent result has the wrong domain type.")
     return value
 
 
@@ -1303,24 +1262,6 @@ def _worktree_changed_files(
     return _changed_files_including_untracked(repository, baseline_sha)
 
 
-def _review_finding_from_dict(data: dict[str, Any], *, index: int) -> ReviewFinding:
-    source = f"review finding {index}"
-    return ReviewFinding(
-        finding_id=_required_string(data, "id", source=source),
-        summary=_required_string(data, "title", source=source),
-        details=_required_string(data, "description", source=source),
-        evidence=_required_string(data, "evidence", source=source),
-        required_change=_required_string(data, "required_change", source=source),
-        acceptance_criteria=_required_string_tuple(
-            data,
-            "acceptance_criteria",
-            source=source,
-        ),
-        disposition="REQUIRED",
-        scope_relation=_required_review_scope_relation(data, source=source),
-    )
-
-
 def _eligible_reasons(
     reasons: tuple[CorrectionReason, ...],
 ) -> tuple[CorrectionReason, ...]:
@@ -1329,19 +1270,27 @@ def _eligible_reasons(
         for reason in reasons
         if not isinstance(reason, ReviewFinding)
         or (
-            reason.disposition == "REQUIRED"
+            reason.disposition is FindingDisposition.REQUIRED
             and reason.scope_relation in _AUTOMATIC_CORRECTION_SCOPE_RELATIONS
         )
     )
 
 
 def _single_reason_kind(reasons: tuple[CorrectionReason, ...]) -> CorrectionReasonKind:
-    kinds = {reason.kind for reason in reasons}
+    kinds = {_correction_reason_kind(reason) for reason in reasons}
     if len(kinds) != 1:
         raise CorrectionError(
             "Correction reasons must come from one source type per correction round."
         )
     return next(iter(kinds))
+
+
+def _correction_reason_kind(reason: CorrectionReason) -> CorrectionReasonKind:
+    if isinstance(reason, VerificationFailure):
+        return CorrectionReasonKind.VERIFICATION_FAILURE
+    if isinstance(reason, ReviewFinding):
+        return CorrectionReasonKind.REVIEW_FINDING
+    raise CorrectionError(f"Unsupported correction reason: {reason!r}")
 
 
 def _review_findings(
@@ -1412,13 +1361,14 @@ def _required_review_scope_relation(
     data: dict[str, Any],
     *,
     source: str,
-) -> str:
+) -> FindingScopeRelation:
     scope_relation = _required_string(data, "scope_relation", source=source)
-    if scope_relation not in _REVIEW_FINDING_SCOPE_RELATIONS:
+    try:
+        return FindingScopeRelation(scope_relation)
+    except ValueError as error:
         raise CorrectionError(
             f"{source} has unsupported scope_relation: {scope_relation!r}."
-        )
-    return scope_relation
+        ) from error
 
 
 def _text_or_default(value: str) -> str:
@@ -1461,7 +1411,7 @@ def _required_string_tuple(
     source: str,
 ) -> tuple[str, ...]:
     value = data.get(field)
-    if not isinstance(value, list | tuple):
+    if not isinstance(value, (list, tuple)):
         raise CorrectionError(
             f"{source} must contain a non-empty string list field {field!r}."
         )

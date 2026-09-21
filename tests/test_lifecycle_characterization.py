@@ -14,9 +14,11 @@ from tests.lifecycle_characterization_fixtures import (
     configure_fake_codex_actions,
 )
 from ticket_automation.attempts import latest_writable_attempt
+from ticket_automation.domain.task_results import ImplementationResult, ReviewResult
 from ticket_automation.git import GitRepository
 from ticket_automation.git_safety import WorkspaceSnapshot
 from ticket_automation.models import StopCategory, WorkflowState
+from ticket_automation.reporting import collect_report_context
 from ticket_automation.workflow import run_ticket_lifecycle
 
 pytestmark = pytest.mark.skipif(GIT is None, reason="git executable is required")
@@ -203,6 +205,51 @@ def test_required_review_finding_creates_correction_work(tmp_path, monkeypatch):
         if path.name != "prompt.md"
     )
     assert len(correction_tickets) == 1
+
+    context = collect_report_context(result.run_dir, result.run_record)
+    controller = context["controller"]
+    agent = context["agent"]
+    assert isinstance(agent["implementation"], ImplementationResult)
+    assert controller["review_results"]
+    assert all(
+        isinstance(review_result, ReviewResult)
+        for review_result in controller["review_results"]
+    )
+    assert all("result" not in attempt for attempt in controller["attempts"])
+
+
+def test_inconsistent_review_result_requires_human_review(tmp_path, monkeypatch):
+    workspace = build_lifecycle_workspace(tmp_path)
+    configure_fake_codex_actions(
+        monkeypatch,
+        tmp_path,
+        "modify",
+        "review-inconsistent",
+    )
+
+    result = run_ticket_lifecycle(
+        workspace.config,
+        workspace.ticket,
+        runs_dir=workspace.runs_dir,
+        verification_runner=ScriptedVerificationRunner([0, 0]),
+        clock=TickingClock(),
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert result.run_record.stop_reason is not None
+    assert (
+        result.run_record.stop_reason.category
+        == StopCategory.HUMAN_JUDGMENT_REQUIRED
+    )
+    assert_attempt_ledger(
+        result.run_dir,
+        [
+            ("PREPARING", "COMPLETED"),
+            ("IMPLEMENTING", "COMPLETED"),
+            ("VERIFYING", "COMPLETED"),
+            ("REVIEWING", "HUMAN_REQUIRED"),
+        ],
+    )
 
 
 def test_correction_limit_exhaustion_stops_conservatively(tmp_path, monkeypatch):

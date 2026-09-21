@@ -30,6 +30,7 @@ from .corrections import (
     CorrectionStageResult,
     run_correction_stage,
 )
+from .domain.task_results import ReviewResult, ReviewVerdict
 from .failure_classification import (
     TerminalStop,
     classify_stage_stop,
@@ -55,7 +56,6 @@ from .reporting import (
 from .resolved_config import config_from_resolved_run_config
 from .review import (
     ReviewStageResult,
-    ReviewVerdict,
     _validate_review_result_artifact,
     run_review_stage,
 )
@@ -836,7 +836,7 @@ def _final_handoff_problem(
         review = _validate_review_result_artifact(review)
     except (KeyError, TypeError, ValueError) as error:
         return f"Final independent review evidence is invalid: {error}"
-    if review.get("verdict") != ReviewVerdict.PASS.value:
+    if review.verdict is not ReviewVerdict.PASS:
         return "Final independent review did not pass."
     return None
 
@@ -1388,17 +1388,14 @@ def _review_summary(
         controller = context["controller"]
         if isinstance(controller, dict):
             final_review = controller.get("final_review")
-            if isinstance(final_review, dict):
-                verdict = final_review.get("verdict")
-                if isinstance(verdict, str):
-                    return verdict
+            if isinstance(final_review, ReviewResult):
+                return final_review.verdict.value
     if not result.review_results:
         return "NOT RUN"
     review_result = result.review_results[-1].review_result
     if review_result is None:
         return "NOT AVAILABLE"
-    verdict = ReviewVerdict(review_result["verdict"])
-    return verdict.value
+    return review_result.verdict.value
 
 
 def _advisory_count(context: dict[str, object] | None) -> int:

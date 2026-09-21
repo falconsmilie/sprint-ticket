@@ -19,17 +19,25 @@ from ticket_automation.codex import (
     CodexProcessResult,
     CodexProcessTimedOut,
     CodexProcessTimeout,
-    CodexResultValidationError,
     Sandbox,
     SubprocessCodexRunner,
     _CodexResultKind,
     _execute,
-    _parse_implementation_result,
-    _parse_review_result,
     build_codex_command,
     execute,
 )
 from ticket_automation.config import CodexExecutionSettings, ConfigError
+from ticket_automation.domain.task_results import (
+    ImplementationResult,
+    ResultValidationError,
+    ReviewResult,
+)
+from ticket_automation.task_result_codecs import (
+    decode_implementation_result,
+    decode_review_result,
+    encode_implementation_result,
+    encode_review_result,
+)
 
 EXISTING_EXECUTABLE = str(Path(sys.executable).resolve())
 
@@ -172,7 +180,8 @@ def test_implementation_result_is_parsed_without_a_duplicate_raw_result(tmp_path
     )
 
     assert execution.status == CodexExecutionStatus.SUCCESS
-    assert execution.structured_result == payload
+    assert isinstance(execution.structured_result, ImplementationResult)
+    assert encode_implementation_result(execution.structured_result) == payload
     assert json.loads(execution.result_json_path.read_text(encoding="utf-8")) == payload
     assert not (execution.artifact_directory / "last-message.json").exists()
     assert execution.process_started is True
@@ -208,7 +217,8 @@ def test_review_result_uses_review_parser(tmp_path):
         _result_kind=_CodexResultKind.REVIEW,
     )
 
-    assert execution.structured_result == payload
+    assert isinstance(execution.structured_result, ReviewResult)
+    assert encode_review_result(execution.structured_result) == payload
 
 
 def test_correction_uses_implementation_parser(tmp_path):
@@ -225,7 +235,8 @@ def test_correction_uses_implementation_parser(tmp_path):
         runner=runner,
     )
 
-    assert execution.structured_result == payload
+    assert isinstance(execution.structured_result, ImplementationResult)
+    assert encode_implementation_result(execution.structured_result) == payload
 
 
 def test_missing_typed_result_fails_clearly(tmp_path):
@@ -342,7 +353,8 @@ def test_canonical_typed_result_wins_over_plausible_jsonl_result(tmp_path):
         runner=runner,
     )
 
-    assert execution.structured_result == canonical_result
+    assert isinstance(execution.structured_result, ImplementationResult)
+    assert encode_implementation_result(execution.structured_result) == canonical_result
     assert json.loads(execution.result_json_path.read_text(encoding="utf-8")) == (
         canonical_result
     )
@@ -681,8 +693,8 @@ def test_missing_executable_fails_before_runner_starts(monkeypatch, tmp_path):
     assert raised.value.kind == CodexFailureKind.EXECUTABLE_UNAVAILABLE
 
 
-def test_fixed_parsers_reject_unsupported_fields():
-    with pytest.raises(CodexResultValidationError, match="unsupported fields"):
-        _parse_implementation_result(implementation_result(extra="no"))
-    with pytest.raises(CodexResultValidationError, match="unsupported fields"):
-        _parse_review_result(review_result(extra="no"))
+def test_result_codecs_reject_unsupported_fields():
+    with pytest.raises(ResultValidationError, match="unsupported fields"):
+        decode_implementation_result(implementation_result(extra="no"))
+    with pytest.raises(ResultValidationError, match="unsupported fields"):
+        decode_review_result(review_result(extra="no"))

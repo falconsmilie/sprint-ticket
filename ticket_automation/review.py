@@ -4,7 +4,6 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -25,12 +24,20 @@ from .codex import (
     CodexProcessRunner,
     Sandbox,
     _CodexResultKind,
-    _parse_codex_result,
 )
 from .codex import (
     _execute as _execute_codex,
 )
 from .config import AppConfig, VerificationCommand
+from .domain.task_results import (
+    FindingDisposition,
+    FindingScopeRelation,
+    ResultValidationError,
+    ReviewFinding,
+    ReviewResult,
+    ReviewResultConsistencyError,
+    ReviewVerdict,
+)
 from .git import GitRepository
 from .git_safety import (
     WorkspaceChange,
@@ -48,6 +55,7 @@ from .runs import (
     load_baseline_record,
     load_run_record,
 )
+from .task_result_codecs import decode_implementation_result, decode_review_result
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _REVIEW_PROMPT_TEMPLATE = _PROJECT_ROOT / "prompts" / "review.md"
@@ -58,38 +66,10 @@ class ReviewError(RunError):
     """Raised when the review stage cannot be prepared."""
 
 
-class ReviewResultConsistencyError(ValueError):
-    """Raised when a schema-valid review result contradicts itself."""
-
-
-class ReviewVerdict(StrEnum):
-    PASS = "PASS"
-    CORRECTIONS_REQUIRED = "CORRECTIONS_REQUIRED"
-    HUMAN_REVIEW_REQUIRED = "HUMAN_REVIEW_REQUIRED"
-
-
-class FindingDisposition(StrEnum):
-    REQUIRED = "REQUIRED"
-    ADVISORY = "ADVISORY"
-    FOLLOW_UP = "FOLLOW_UP"
-
-
-class _FindingScopeRelation(StrEnum):
-    TICKET = "TICKET"
-    IMPLEMENTATION = "IMPLEMENTATION"
-    REPOSITORY_AUTHORITY = "REPOSITORY_AUTHORITY"
-    OUT_OF_SCOPE = "OUT_OF_SCOPE"
-    AMBIGUOUS = "AMBIGUOUS"
-
-
-_REVIEW_FINDING_SCOPE_RELATIONS = frozenset(
-    relation.value for relation in _FindingScopeRelation
-)
-
 _AUTOMATIC_CORRECTION_SCOPE_RELATIONS = frozenset(
     {
-        _FindingScopeRelation.TICKET.value,
-        _FindingScopeRelation.IMPLEMENTATION.value,
+        FindingScopeRelation.TICKET,
+        FindingScopeRelation.IMPLEMENTATION,
     }
 )
 
@@ -109,7 +89,7 @@ class ReviewStageResult:
     outcome: StageOutcome
     artifact_directory: Path
     codex_execution: CodexExecution | None
-    review_result: dict[str, Any] | None
+    review_result: ReviewResult | None
     safety_violations: tuple[ReviewSafetyViolation, ...]
     processing_error: str | None
     controller_message: str
@@ -119,10 +99,10 @@ class ReviewStageResult:
         return self.outcome == StageOutcome.COMPLETED
 
     @property
-    def required_findings(self) -> tuple[dict[str, Any], ...]:
+    def required_findings(self) -> tuple[ReviewFinding, ...]:
         if self.review_result is None:
             return ()
-        return _required_findings(self.review_result)
+        return self.review_result.required_findings
 
 
 def run_review_stage(
@@ -270,14 +250,21 @@ def run_review_stage(
             run_record,
             expected_snapshot=repository_snapshot,
         )
-        outcome = (
-            StageOutcome.HUMAN_REQUIRED if safety_violations else StageOutcome.FAILED
-        )
-        message = (
-            "Codex review failed and repository safety invariants were violated."
-            if safety_violations
-            else error.execution.failure_message or str(error)
-        )
+        consistency_error = _review_consistency_error(error.execution)
+        if safety_violations:
+            outcome = StageOutcome.HUMAN_REQUIRED
+            processing_error = None
+            message = (
+                "Codex review failed and repository safety invariants were violated."
+            )
+        elif consistency_error is not None:
+            outcome = StageOutcome.HUMAN_REQUIRED
+            processing_error = consistency_error
+            message = f"Review result is logically contradictory: {consistency_error}"
+        else:
+            outcome = StageOutcome.FAILED
+            processing_error = None
+            message = error.execution.failure_message or str(error)
         return _finish(
             run_record=run_record,
             run_dir=run_path,
@@ -285,7 +272,7 @@ def run_review_stage(
             execution=error.execution,
             review_result=None,
             safety_violations=safety_violations,
-            processing_error=None,
+            processing_error=processing_error,
             outcome=outcome,
             controller_message=message,
         )
@@ -318,34 +305,19 @@ def run_review_stage(
     )
 
 
-def validate_review_result_semantics(result: dict[str, Any]) -> None:
-    verdict = result.get("verdict")
-    required_count = len(_required_findings(result))
-    if verdict == ReviewVerdict.PASS.value and required_count:
-        raise ReviewResultConsistencyError(
-            "PASS results must not contain REQUIRED findings."
-        )
-    if verdict == ReviewVerdict.CORRECTIONS_REQUIRED.value and required_count == 0:
-        raise ReviewResultConsistencyError(
-            "CORRECTIONS_REQUIRED results must contain at least one REQUIRED finding."
-        )
-
-
-def _validate_review_result_artifact(value: Any) -> dict[str, Any]:
+def _validate_review_result_artifact(value: Any) -> ReviewResult:
     """Validate persisted review evidence before it influences final handoff."""
 
-    result = _parse_codex_result(value, _result_kind=_CodexResultKind.REVIEW)
-    validate_review_result_semantics(result)
-    return result
+    return decode_review_result(value)
 
 
 def _correction_eligible_review_findings(
-    result: dict[str, Any],
-) -> tuple[dict[str, Any], ...]:
+    result: ReviewResult,
+) -> tuple[ReviewFinding, ...]:
     return tuple(
         finding
-        for finding in _required_findings(result)
-        if finding.get("scope_relation") in _AUTOMATIC_CORRECTION_SCOPE_RELATIONS
+        for finding in result.required_findings
+        if finding.scope_relation in _AUTOMATIC_CORRECTION_SCOPE_RELATIONS
     )
 
 
@@ -356,8 +328,8 @@ def format_review_result(result: ReviewStageResult) -> str:
         result.controller_message,
     ]
     if result.review_result is not None:
-        rows.append(f"Verdict: {result.review_result['verdict']}")
-        rows.append(f"Findings: {len(result.review_result['findings'])}")
+        rows.append(f"Verdict: {result.review_result.verdict.value}")
+        rows.append(f"Findings: {len(result.review_result.findings)}")
         rows.append(f"Required findings: {len(result.required_findings)}")
     if result.processing_error:
         rows.append(f"Processing error: {result.processing_error}")
@@ -376,29 +348,14 @@ def _finish_valid_review_result(
     run_dir: Path,
     artifact_directory: Path,
     execution: CodexExecution | None,
-    review_result: dict[str, Any],
+    review_result: ReviewResult,
 ) -> ReviewStageResult:
-    try:
-        validate_review_result_semantics(review_result)
-    except ReviewResultConsistencyError as error:
-        return _finish(
-            run_record=run_record,
-            run_dir=run_dir,
-            artifact_directory=artifact_directory,
-            execution=execution,
-            review_result=review_result,
-            safety_violations=(),
-            processing_error=str(error),
-            outcome=StageOutcome.HUMAN_REQUIRED,
-            controller_message=f"Review result is logically contradictory: {error}",
-        )
-
-    verdict = ReviewVerdict(review_result["verdict"])
+    verdict = review_result.verdict
     if verdict == ReviewVerdict.PASS:
         outcome = StageOutcome.COMPLETED
         controller_message = "Review passed; final report can start."
     elif verdict == ReviewVerdict.CORRECTIONS_REQUIRED:
-        required_findings = _required_findings(review_result)
+        required_findings = review_result.required_findings
         eligible_findings = _correction_eligible_review_findings(review_result)
         if len(eligible_findings) == len(required_findings):
             outcome = StageOutcome.CORRECTION_REQUIRED
@@ -438,7 +395,7 @@ def _finish(
     run_dir: Path,
     artifact_directory: Path,
     execution: CodexExecution | None,
-    review_result: dict[str, Any] | None,
+    review_result: ReviewResult | None,
     safety_violations: tuple[ReviewSafetyViolation, ...],
     processing_error: str | None,
     outcome: StageOutcome,
@@ -571,28 +528,28 @@ def _read_implementation_summary(run_path: Path) -> str:
             "could not be read."
         )
 
-    summary = data.get("summary")
-    if isinstance(summary, str) and summary.strip():
-        return summary
-    return "No implementation summary is available."
+    try:
+        result = decode_implementation_result(data)
+    except ResultValidationError:
+        return "No implementation summary is available."
+    return result.summary
 
 
-def _require_review_result(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise ReviewError("Review result must be a JSON object.")
+def _review_consistency_error(execution: CodexExecution) -> str | None:
+    try:
+        value = json.loads(execution.result_json_path.read_text(encoding="utf-8"))
+        decode_review_result(value)
+    except ReviewResultConsistencyError as error:
+        return str(error)
+    except (OSError, json.JSONDecodeError, ResultValidationError):
+        return None
+    return None
+
+
+def _require_review_result(value: Any) -> ReviewResult:
+    if not isinstance(value, ReviewResult):
+        raise ReviewError("Review result has the wrong domain type.")
     return value
-
-
-def _required_findings(result: dict[str, Any]) -> tuple[dict[str, Any], ...]:
-    findings = result.get("findings", [])
-    if not isinstance(findings, list):
-        return ()
-    return tuple(
-        finding
-        for finding in findings
-        if isinstance(finding, dict)
-        and finding.get("disposition") == FindingDisposition.REQUIRED.value
-    )
 
 
 def _inspect_review_invariants(
@@ -687,5 +644,4 @@ __all__ = [
     "ReviewVerdict",
     "format_review_result",
     "run_review_stage",
-    "validate_review_result_semantics",
 ]

@@ -144,7 +144,11 @@ if action == "malformed-result":
     raise SystemExit(0)
 
 if "--sandbox" in sys.argv and sys.argv[sys.argv.index("--sandbox") + 1] == "read-only":
-    emit_result(review_result(corrections_required=action == "review-corrections"))
+    result = review_result(corrections_required=action == "review-corrections")
+    if action == "review-inconsistent":
+        result = review_result(corrections_required=True)
+        result["verdict"] = "PASS"
+    emit_result(result)
     if action == "review-pass-arm":
         arm_path = os.environ.get("TA_FAKE_CODEX_ARM_FILE")
         if not arm_path:

@@ -169,14 +169,7 @@ ARCHITECTURE_DEBT = (
         "ticket_automation.review",
         "_AUTOMATIC_CORRECTION_SCOPE_RELATIONS",
         "TA-DOM-002",
-        "Give correction scope relations a domain-owned public definition.",
-    ),
-    _private_debt(
-        "ticket_automation.corrections",
-        "ticket_automation.review",
-        "_REVIEW_FINDING_SCOPE_RELATIONS",
-        "TA-DOM-002",
-        "Give review finding relations a domain-owned public definition.",
+        "Move correction eligibility policy to the application correction planner.",
     ),
     _private_debt(
         "ticket_automation.implementation",
@@ -248,11 +241,6 @@ ARCHITECTURE_DEBT = (
     ),
     _provider_debt(
         "ticket_automation.review",
-        "_parse_codex_result",
-        "Keep Codex result parsing inside the Codex adapter.",
-    ),
-    _provider_debt(
-        "ticket_automation.review",
         "_execute",
         "Call the application-owned agent port instead of Codex internals.",
     ),
@@ -260,13 +248,6 @@ ARCHITECTURE_DEBT = (
         "ticket_automation.review",
         "ticket_automation.codex",
         "_CodexResultKind",
-        "TA-AGENT-002",
-        "Keep Codex result parsing private to the Codex adapter.",
-    ),
-    _private_debt(
-        "ticket_automation.review",
-        "ticket_automation.codex",
-        "_parse_codex_result",
         "TA-AGENT-002",
         "Keep Codex result parsing private to the Codex adapter.",
     ),

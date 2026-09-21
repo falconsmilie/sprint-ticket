@@ -23,10 +23,16 @@ from .audit import (
     diff_including_untracked,
     diff_stats_including_untracked,
 )
+from .domain.task_results import (
+    ImplementationResult,
+    ResultValidationError,
+    ReviewResult,
+)
 from .git import GitCommandError, GitRepository
 from .git_safety import WorkspaceSnapshot
 from .models import StageOutcome, WorkflowState
 from .runs import RUN_RECORD_FILE, RunError, RunRecord, load_run_record
+from .task_result_codecs import decode_implementation_result, decode_review_result
 
 FINAL_PATCH_FILE = "final.patch"
 FINAL_REPORT_FILE = "report.md"
@@ -146,8 +152,10 @@ def collect_report_context(
     attempts = tuple(_attempt_view(run_path, record) for record in records)
     verification = tuple(item for item in attempts if item["phase"] == "VERIFYING")
     baseline = _latest_attempt_result(run_path, "PREPARING")
-    reviews = tuple(item for item in attempts if item["phase"] == "REVIEWING")
-    implementation = _latest_attempt_result(run_path, "IMPLEMENTING")
+    reviews, review_result_errors = _review_results(run_path, records)
+    implementation, implementation_result_error = _latest_implementation_result(
+        run_path
+    )
     correction_tickets = tuple(
         item["correction_ticket"]
         for item in attempts
@@ -156,7 +164,12 @@ def collect_report_context(
     changed_files = _changed_files_or_empty(repository, run_record)
     diff_stats = _diff_stats_or_empty(repository, run_record)
     safety = inspect_git_safety(run_record)
-    final_review = reviews[-1]["result"] if reviews else None
+    try:
+        final_review = _latest_review_result(run_path)
+        final_review_error = None
+    except ResultValidationError as error:
+        final_review = None
+        final_review_error = str(error)
     additions, deletions = count_patch_changes(patch)
     return {
         "run_dir": run_path,
@@ -171,13 +184,18 @@ def collect_report_context(
             "verification_rounds": verification,
             "review_results": reviews,
             "final_review": final_review,
+            "final_review_error": final_review_error,
+            "review_result_errors": review_result_errors,
             "correction_ticket_paths": correction_tickets,
             "git_safety": safety,
             "latest_writable_attempt": latest_writable_attempt(run_path),
             "final_patch_path": FINAL_PATCH_FILE,
             "final_report_path": FINAL_REPORT_FILE,
         },
-        "agent": {"implementation": implementation},
+        "agent": {
+            "implementation": implementation,
+            "implementation_result_error": implementation_result_error,
+        },
     }
 
 
@@ -200,7 +218,7 @@ def render_final_report(context: dict[str, Any]) -> str:
         f"- Baseline SHA: {record.baseline_sha}",
         f"- Baseline verification: {_status(baseline)}",
         f"- Verification attempts: {len(verification)}",
-        f"- Final review: {_review_verdict(final_review)}",
+        f"- Final review: {_review_verdict(final_review, controller.get('final_review_error'))}",
         f"- Correction rounds: {record.current_correction_round} / {record.max_correction_rounds}",
         "",
         "## Workspace",
@@ -273,8 +291,55 @@ def latest_verification_round(run_dir: Path | str) -> dict[str, Any] | None:
     return _latest_attempt_result(Path(run_dir), "VERIFYING")
 
 
-def latest_review_result(run_dir: Path | str) -> dict[str, Any] | None:
-    return _latest_attempt_result(Path(run_dir), "REVIEWING")
+def latest_review_result(run_dir: Path | str) -> ReviewResult | None:
+    return _latest_review_result(Path(run_dir))
+
+
+def _latest_review_result(run_path: Path) -> ReviewResult | None:
+    record = latest_attempt(run_path, phases=("REVIEWING",))
+    if record is None:
+        return None
+    value = _task_result_value(run_path, record)
+    if value is None:
+        return None
+    return decode_review_result(value)
+
+
+def _review_results(
+    run_path: Path,
+    records: tuple[Any, ...],
+) -> tuple[tuple[ReviewResult, ...], tuple[str, ...]]:
+    results: list[ReviewResult] = []
+    errors: list[str] = []
+    for record in records:
+        if record.phase != "REVIEWING":
+            continue
+        try:
+            value = _task_result_value(run_path, record)
+            if value is None:
+                continue
+            results.append(decode_review_result(value))
+        except ResultValidationError as error:
+            errors.append(f"Review attempt {record.sequence}: {error}")
+    return tuple(results), tuple(errors)
+
+
+def _latest_implementation_result(
+    run_path: Path,
+) -> tuple[ImplementationResult | None, str | None]:
+    record = latest_attempt(run_path, phases=("IMPLEMENTING",))
+    if record is None:
+        return None, None
+    try:
+        value = _task_result_value(run_path, record)
+    except ResultValidationError as error:
+        return None, str(error)
+    if value is None:
+        return None, None
+    try:
+        return decode_implementation_result(value), None
+    except ResultValidationError as error:
+        return None, str(error)
 
 
 def _latest_attempt_result(run_path: Path, phase: str) -> dict[str, Any] | None:
@@ -288,19 +353,29 @@ def _latest_attempt_result(run_path: Path, phase: str) -> dict[str, Any] | None:
 
 
 def _attempt_view(run_path: Path, record: Any) -> dict[str, Any]:
-    result_path = attempt_result_path(run_path, record)
     correction_ticket = record.artifact_directory / "correction-ticket.md"
     return {
         "sequence": record.sequence,
         "phase": record.phase,
         "status": record.status,
-        "result": None if result_path is None else _read_json(result_path),
         "correction_ticket": (
             correction_ticket.relative_to(run_path).as_posix()
             if correction_ticket.is_file()
             else None
         ),
     }
+
+
+def _task_result_value(run_path: Path, record: Any) -> object | None:
+    result_path = attempt_result_path(run_path, record)
+    if result_path is None or not result_path.is_file():
+        return None
+    try:
+        return json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ResultValidationError(
+            f"Task result artifact could not be read as JSON: {result_path}: {error}"
+        ) from error
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -338,10 +413,10 @@ def _status(value: dict[str, Any] | None) -> str:
     return str(value.get("status", "NOT RUN")) if isinstance(value, dict) else "NOT RUN"
 
 
-def _review_verdict(value: dict[str, Any] | None) -> str:
-    return (
-        str(value.get("verdict", "NOT RUN")) if isinstance(value, dict) else "NOT RUN"
-    )
+def _review_verdict(value: ReviewResult | None, error: object) -> str:
+    if isinstance(error, str):
+        return "INVALID"
+    return "NOT RUN" if value is None else value.verdict.value
 
 
 def _yes_no(value: bool) -> str:

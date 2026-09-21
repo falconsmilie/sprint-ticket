@@ -18,6 +18,7 @@ from .codex import (
     CodexProcessRunner,
 )
 from .config import AppConfig
+from .domain.task_results import ImplementationResult, ImplementationStatus
 from .failure_classification import classify_writable_failure
 from .git import GitCommandError, GitRepository
 from .git_safety import (
@@ -73,7 +74,7 @@ class ImplementationStageResult:
     outcome: StageOutcome
     artifact_directory: Path
     codex_execution: CodexExecution | None
-    agent_result: dict[str, Any] | None
+    agent_result: ImplementationResult | None
     safety_violations: tuple[_ImplementationSafetyViolation, ...]
     changed_files: tuple[str, ...]
     workspace_guard: WorkspaceGuardInspection | None
@@ -344,8 +345,7 @@ def run_implementation_stage(
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=str(error),
         )
-    agent_status = agent_result["status"]
-    if agent_status == "BLOCKED":
+    if agent_result.status is ImplementationStatus.BLOCKED:
         return _finish(
             run_record=active_record,
             run_dir=run_path,
@@ -434,7 +434,7 @@ def _finish(
     run_dir: Path,
     artifact_directory: Path,
     execution: CodexExecution | None,
-    agent_result: dict[str, Any] | None,
+    agent_result: ImplementationResult | None,
     safety_violations: tuple[_ImplementationSafetyViolation, ...],
     changed_files: tuple[str, ...],
     workspace_guard: WorkspaceGuardInspection | None = None,
@@ -483,9 +483,9 @@ def _read_snapshotted_ticket(path: Path) -> str:
         ) from error
 
 
-def _require_agent_result(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise ImplementationError("Implementation agent result must be a JSON object.")
+def _require_agent_result(value: Any) -> ImplementationResult:
+    if not isinstance(value, ImplementationResult):
+        raise ImplementationError("Implementation agent result has the wrong domain type.")
     return value
 
 
