@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from tests.helpers import GIT, make_agent_executor, run_git
+from tests.helpers import GIT, make_run_dependencies, run_git
 from tests.lifecycle_characterization_fixtures import (
     ScriptedVerificationRunner,
     TickingClock,
@@ -130,7 +130,7 @@ def test_writable_implementation_stop_matrix(
         workspace.config,
         workspace.ticket,
         runs_dir=workspace.runs_dir,
-        agent_executor=make_agent_executor(
+        **make_run_dependencies(
             workspace.config, process_runner=codex_runner
         ),
         verification_runner=verification_runner,
@@ -171,7 +171,7 @@ def test_required_review_finding_creates_correction_work(tmp_path, monkeypatch):
         workspace.config,
         workspace.ticket,
         runs_dir=workspace.runs_dir,
-        agent_executor=make_agent_executor(
+        **make_run_dependencies(
             workspace.config, process_runner=codex_runner
         ),
         verification_runner=ScriptedVerificationRunner([0, 0, 0]),
@@ -238,7 +238,7 @@ def test_review_finding_outside_correction_scope_remains_human_required(
         workspace.config,
         workspace.ticket,
         runs_dir=workspace.runs_dir,
-        agent_executor=make_agent_executor(
+        **make_run_dependencies(
             workspace.config, process_runner=codex_runner
         ),
         verification_runner=ScriptedVerificationRunner([0, 0]),
@@ -274,7 +274,7 @@ def test_inconsistent_review_result_requires_human_review(tmp_path, monkeypatch)
         workspace.config,
         workspace.ticket,
         runs_dir=workspace.runs_dir,
-        agent_executor=make_agent_executor(
+        **make_run_dependencies(
             workspace.config, process_runner=codex_runner
         ),
         verification_runner=ScriptedVerificationRunner([0, 0]),
@@ -310,7 +310,7 @@ def test_correction_limit_exhaustion_stops_conservatively(tmp_path, monkeypatch)
         workspace.config,
         workspace.ticket,
         runs_dir=workspace.runs_dir,
-        agent_executor=make_agent_executor(
+        **make_run_dependencies(
             workspace.config, process_runner=codex_runner
         ),
         verification_runner=ScriptedVerificationRunner([0, 1, 1]),
@@ -403,7 +403,7 @@ def test_final_handoff_rejects_repository_drift(tmp_path, monkeypatch, drift):
         workspace.config,
         workspace.ticket,
         runs_dir=workspace.runs_dir,
-        agent_executor=make_agent_executor(
+        **make_run_dependencies(
             workspace.config, process_runner=codex_runner
         ),
         verification_runner=ScriptedVerificationRunner([0, 0]),

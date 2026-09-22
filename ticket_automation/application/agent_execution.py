@@ -369,6 +369,14 @@ class AgentExecutor(Protocol):
     ) -> AgentExecution[ResultT]: ...
 
 
+@dataclass(frozen=True)
+class AgentExecutorAssignments:
+    """Constructed executor ports selected for each application task kind."""
+
+    implementation: AgentExecutor
+    review: AgentExecutor
+    correction: AgentExecutor
+
 def required_execution_capabilities(
     access: RepositoryAccess,
 ) -> frozenset[AgentCapability]:
@@ -451,6 +459,7 @@ __all__ = [
     "AgentExecutionRequest",
     "AgentExecutionStatus",
     "AgentExecutor",
+    "AgentExecutorAssignments",
     "AgentFailureCategory",
     "AgentResultContract",
     "AgentTaskKind",

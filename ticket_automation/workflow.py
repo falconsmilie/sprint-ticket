@@ -13,7 +13,8 @@ from ._verification_artifacts import (
     _verification_commands_fingerprint,
     _VerificationArtifactError,
 )
-from .application.agent_execution import AgentExecutor
+from .application.agent_execution import AgentExecutorAssignments
+from .application.ports.preflight import ProviderPreflight
 from .attempts import (
     AttemptError,
     AttemptRecord,
@@ -131,7 +132,9 @@ def run_ticket_lifecycle(
     ticket_path: Path | str,
     *,
     runs_dir: Path | str,
-    agent_executor: AgentExecutor,
+    agent_executors: AgentExecutorAssignments,
+    provider_preflight: ProviderPreflight,
+    provider_policy: object,
     verification_runner: VerificationProcessRunner | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> LifecycleResult:
@@ -146,7 +149,9 @@ def run_ticket_lifecycle(
             ticket_path,
             runs_dir=runs_dir,
             repository_lock=repository_lock,
-            agent_executor=agent_executor,
+            agent_executor=agent_executors,
+            provider_preflight=provider_preflight,
+            provider_policy=provider_policy,
             verification_runner=verification_runner,
             clock=clock,
         )
@@ -158,7 +163,9 @@ def _run_ticket_lifecycle_locked(
     *,
     runs_dir: Path | str,
     repository_lock: RepositoryRunLock,
-    agent_executor: AgentExecutor,
+    agent_executor: AgentExecutorAssignments,
+    provider_preflight: ProviderPreflight,
+    provider_policy: object,
     verification_runner: VerificationProcessRunner | None,
     clock: Callable[[], datetime] | None,
 ) -> LifecycleResult:
@@ -166,6 +173,8 @@ def _run_ticket_lifecycle_locked(
         config,
         ticket_path,
         runs_dir=runs_dir,
+        provider_preflight=provider_preflight,
+        provider_policy=provider_policy,
         clock=clock,
     )
     config = config_from_resolved_run_config(snapshot.run_record.resolved_config)
@@ -244,7 +253,7 @@ def resume_ticket_lifecycle(
     run_id: str,
     *,
     runs_dir: Path | str,
-    agent_executor: AgentExecutor,
+    agent_executor_factory: Callable[[], AgentExecutorAssignments],
     verification_runner: VerificationProcessRunner | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> LifecycleResult:
@@ -270,7 +279,7 @@ def resume_ticket_lifecycle(
             preflight_result,
             run_record,
             repository_lock=repository_lock,
-            agent_executor=agent_executor,
+            agent_executor_factory=agent_executor_factory,
             verification_runner=verification_runner,
             clock=clock,
         )
@@ -283,7 +292,7 @@ def _resume_ticket_lifecycle_locked(
     run_record: RunRecord,
     *,
     repository_lock: RepositoryRunLock,
-    agent_executor: AgentExecutor,
+    agent_executor_factory: Callable[[], AgentExecutorAssignments],
     verification_runner: VerificationProcessRunner | None,
     clock: Callable[[], datetime] | None,
 ) -> LifecycleResult:
@@ -355,6 +364,7 @@ def _resume_ticket_lifecycle_locked(
             correction_results=(),
         )
 
+    agent_executor = agent_executor_factory()
     implementation_result: ImplementationStageResult | None = None
     verification_results: list[VerificationStageResult] = []
     review_results: list[ReviewStageResult] = []
@@ -380,7 +390,7 @@ def _resume_ticket_lifecycle_locked(
             implementation_result = run_implementation_stage(
                 config,
                 run_dir,
-                agent_executor=agent_executor,
+                agent_executor=agent_executor.implementation,
                 clock=clock,
             )
             run_record = _persist_stage_outcome(
@@ -522,7 +532,7 @@ def _drive_lifecycle(
     verification_results: list[VerificationStageResult],
     review_results: list[ReviewStageResult],
     correction_results: list[CorrectionStageResult],
-    agent_executor: AgentExecutor,
+    agent_executor: AgentExecutorAssignments,
     verification_runner: VerificationProcessRunner | None,
     repository_lock: RepositoryRunLock,
     clock: Callable[[], datetime] | None,
@@ -542,7 +552,7 @@ def _drive_lifecycle(
             implementation_result = run_implementation_stage(
                 config,
                 run_dir,
-                agent_executor=agent_executor,
+                agent_executor=agent_executor.implementation,
                 clock=clock,
             )
             run_record = _persist_stage_outcome(
@@ -584,7 +594,7 @@ def _drive_lifecycle(
             review = run_review_stage(
                 config,
                 run_dir,
-                agent_executor=agent_executor,
+                agent_executor=agent_executor.review,
                 clock=clock,
             )
             run_record = _persist_stage_outcome(
@@ -626,7 +636,7 @@ def _drive_lifecycle(
                 config,
                 run_dir,
                 cause_set=cause_set,
-                agent_executor=agent_executor,
+                agent_executor=agent_executor.correction,
                 clock=clock,
             )
             run_record = _persist_stage_outcome(

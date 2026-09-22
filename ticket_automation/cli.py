@@ -4,16 +4,20 @@ import argparse
 import sys
 from pathlib import Path
 
-from .config import (
-    CodexExecutionOverrides,
-    ConfigError,
+from .composition import (
     apply_codex_execution_overrides,
+    prepare_production_agents,
+)
+from .config import (
+    ConfigError,
     format_config_summary,
     load_config,
 )
 from .locking import RepositoryLockError, active_repository_locks
 from .preflight import format_preflight_result, run_preflight
-from .providers.codex_cli import CodexCliAgentExecutor
+from .providers.codex_cli import CodexExecutionOverrides
+from .providers.codex_cli.composition import CodexCliConfiguredSettings
+from .providers.codex_cli.identity import PROVIDER_ID as CODEX_CLI_PROVIDER_ID
 from .resolved_config import config_from_resolved_run_config
 from .runs import (
     RUNS_DIR_NAME,
@@ -110,13 +114,33 @@ def main(argv: list[str] | None = None) -> int:
 
 def _handle_config(args: argparse.Namespace) -> int:
     config = load_config(args.config_dir)
-    print(format_config_summary(config))
+    providers = prepare_production_agents(config)
+    effective_settings = {
+        provider_id: settings
+        for provider_id, settings in config.agents.providers.items()
+    }
+    codex = providers.providers.get(CODEX_CLI_PROVIDER_ID)
+    if codex is not None:
+        if not isinstance(codex.settings, CodexCliConfiguredSettings):
+            raise ConfigError("Codex CLI resolved settings have the wrong type.")
+        effective_settings[CODEX_CLI_PROVIDER_ID] = {
+            "executable": codex.settings.executable,
+            "model": codex.settings.execution.model,
+            "reasoning_effort": codex.settings.execution.reasoning_effort,
+        }
+    print(format_config_summary(config, provider_settings=effective_settings))
     return 0
 
 
 def _handle_preflight(args: argparse.Namespace) -> int:
     config = load_config(args.config_dir)
-    result = run_preflight(config)
+    providers = prepare_production_agents(config)
+    result = run_preflight(
+        config,
+        provider_result=providers.run_preflight(
+            repository_path=config.project.repo
+        ),
+    )
     print(format_preflight_result(result))
     return 0 if result.passed else 1
 
@@ -129,16 +153,17 @@ def _handle_run(args: argparse.Namespace) -> int:
             reasoning_effort=args.reasoning_effort,
         ),
     )
+    providers = prepare_production_agents(config)
+    composed = providers.compose_for_run()
     runs_dir = args.config_dir / RUNS_DIR_NAME
     try:
         result = run_ticket_lifecycle(
             config,
             args.ticket,
             runs_dir=runs_dir,
-            agent_executor=CodexCliAgentExecutor(
-                config.codex,
-                configuration_directory=config.configuration_directory,
-            ),
+            agent_executors=composed.executors,
+            provider_preflight=providers.run_preflight,
+            provider_policy=composed.policies[CODEX_CLI_PROVIDER_ID],
         )
     except TicketInputError as error:
         print(f"Ticket input error: {error}", file=sys.stderr)
@@ -174,14 +199,12 @@ def _handle_resume(args: argparse.Namespace) -> int:
     try:
         run_record = load_run_record(runs_dir / args.run_id / "run.json")
         config = config_from_resolved_run_config(run_record.resolved_config)
+        providers = prepare_production_agents(config)
         result = resume_ticket_lifecycle(
             config,
             args.run_id,
             runs_dir=runs_dir,
-            agent_executor=CodexCliAgentExecutor(
-                config.codex,
-                configuration_directory=config.configuration_directory,
-            ),
+            agent_executor_factory=lambda: providers.compose_for_run().executors,
         )
     except RunError as error:
         print(f"Run error: {error}", file=sys.stderr)

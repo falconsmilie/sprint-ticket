@@ -17,11 +17,31 @@ tooling. For example:
 [runner]
 max_correction_rounds = 3
 
+[agents.assignments]
+implementation = "codex-cli"
+review = "codex-cli"
+correction = "codex-cli"
+
+[agents.providers.codex-cli]
+executable = "codex"
+model = "gpt-5.5"
+reasoning_effort = "xhigh"
+
 [[verification.commands]]
 name = "tests"
 argv = ["C:/Projects/my-target/.venv/Scripts/python.exe", "-m", "pytest"]
 timeout_seconds = 1800
 ```
+
+Every agent task has an explicit provider assignment. Each assigned provider
+must have a matching table under `agents.providers`; unknown providers,
+missing assignments, missing provider settings, and providers without the
+required access, structured result, isolation, or evidence capabilities are
+rejected before a run is created. Provider preflight runs once per assigned
+provider and reports all affected task assignments.
+
+The former top-level `[codex]` table is invalid and has no implicit fallback or
+alias; provider settings belong under `[agents.providers.codex-cli]`.
 
 SprintTicket does not install or own pytest, ruff, pyright, or any other
 target-project verification tool. Its own development tools are in the `dev`

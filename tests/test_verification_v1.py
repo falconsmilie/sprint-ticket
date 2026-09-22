@@ -7,13 +7,14 @@ from pathlib import Path
 import ticket_automation.verification as verification_module
 from tests.helpers import (
     create_git_repo,
+    create_test_run_snapshot,
     create_trusted_prepared_run,
     make_config,
 )
 from ticket_automation.attempts import latest_attempt
 from ticket_automation.config import VerificationCommand
 from ticket_automation.models import AttemptPhase, StageOutcome, WorkflowState
-from ticket_automation.runs import create_run_snapshot, save_run_record
+from ticket_automation.runs import save_run_record
 from ticket_automation.verification import (
     VerificationProcessResult,
     _run_baseline_verification_stage,
@@ -42,7 +43,7 @@ def test_baseline_verification_uses_the_persisted_resolved_commands(
     ticket = tmp_path / "TA-ARCH-009.md"
     ticket.write_text("# Ticket\n", encoding="utf-8")
     original = make_config(repository)
-    snapshot = create_run_snapshot(
+    snapshot = create_test_run_snapshot(
         original,
         ticket,
         runs_dir=tmp_path / "runs",

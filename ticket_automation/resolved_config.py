@@ -9,19 +9,23 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .application.agent_execution import AgentTaskKind
 from .config import (
     IMPLEMENTATION_SANDBOX_POLICY,
     REVIEW_SANDBOX_POLICY,
+    AgentSettings,
     AppConfig,
-    CodexExecutionSettings,
-    CodexSettings,
     ProjectSettings,
     RunnerSettings,
     VerificationCommand,
     VerificationSettings,
+)
+from .providers.codex_cli.composition import CodexCliRunPolicy
+from .providers.codex_cli.identity import PROVIDER_ID
+from .providers.codex_cli.settings import (
+    CodexExecutionSettings,
     validate_codex_execution_settings,
 )
-from .providers.codex_cli.executable import resolve_executable
 from .providers.codex_cli.validation import (
     CodexCliValidationError,
 )
@@ -236,26 +240,19 @@ def resolve_run_config(
     config: AppConfig,
     *,
     target_repository_path: Path | str,
+    provider_policy: object,
 ) -> ResolvedRunConfig:
-    executable = resolve_executable(
-        config.codex.executable,
-        config_dir=config.configuration_directory,
-    )
-    if executable is None:
+    if not isinstance(provider_policy, CodexCliRunPolicy):
         raise ResolvedRunConfigError(
-            f"Configured Codex executable is unavailable: {config.codex.executable}"
-        )
-    if not _codex_cli_supports_ephemeral(executable):
-        raise ResolvedRunConfigError(
-            "Configured Codex executable does not support required --ephemeral mode."
+            "Resolved-run persistence requires a CodexCliRunPolicy."
         )
     return ResolvedRunConfig(
         target_repository_path=str(Path(target_repository_path).resolve()),
         protected_branches=config.project.protected_branches,
-        codex_model=config.codex.model,
-        codex_reasoning_effort=config.codex.reasoning_effort,
-        codex_executable=str(executable),
-        codex_cli_version=codex_cli_version(executable),
+        codex_model=provider_policy.model,
+        codex_reasoning_effort=provider_policy.reasoning_effort,
+        codex_executable=str(provider_policy.executable),
+        codex_cli_version=provider_policy.cli_version,
         implementation_sandbox=IMPLEMENTATION_SANDBOX_POLICY,
         review_sandbox=REVIEW_SANDBOX_POLICY,
         verification_commands=config.verification.commands,
@@ -275,10 +272,15 @@ def config_from_resolved_run_config(resolved: ResolvedRunConfig) -> AppConfig:
             protected_branches=resolved.protected_branches,
         ),
         runner=RunnerSettings(max_correction_rounds=resolved.max_correction_rounds),
-        codex=CodexSettings(
-            executable=resolved.codex_executable,
-            model=resolved.codex_model,
-            reasoning_effort=resolved.codex_reasoning_effort,
+        agents=AgentSettings(
+            assignments={task_kind: PROVIDER_ID for task_kind in AgentTaskKind},
+            providers={
+                PROVIDER_ID: {
+                    "executable": resolved.codex_executable,
+                    "model": resolved.codex_model,
+                    "reasoning_effort": resolved.codex_reasoning_effort,
+                }
+            },
         ),
         verification=VerificationSettings(commands=resolved.verification_commands),
         source_files=(),

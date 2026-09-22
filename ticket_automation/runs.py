@@ -13,10 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from ._verification_artifacts import _verification_commands_fingerprint
-from .config import (
-    AppConfig,
-    CodexExecutionSettings,
-)
+from .application.ports.preflight import ProviderPreflight
+from .config import AppConfig
 from .git import GitCommandError, GitRepository
 from .git_safety import WorkspaceSnapshot, workspace_safety_changes
 from .models import (
@@ -26,6 +24,7 @@ from .models import (
     _validate_workflow_transition,
 )
 from .preflight import PreflightResult, run_preflight
+from .providers.codex_cli.settings import CodexExecutionSettings
 from .resolved_config import (
     ResolvedRunConfig,
     ResolvedRunConfigError,
@@ -321,10 +320,13 @@ def create_run_snapshot(
     ticket_path: Path | str,
     *,
     runs_dir: Path | str,
+    provider_preflight: ProviderPreflight,
+    provider_policy: object,
     clock: Callable[[], datetime] | None = None,
 ) -> RunCreationResult:
     source_ticket = _read_ticket(ticket_path)
-    preflight_result = run_preflight(config)
+    provider_result = provider_preflight(repository_path=config.project.repo)
+    preflight_result = run_preflight(config, provider_result=provider_result)
     if not preflight_result.passed:
         raise RunPreflightError(preflight_result)
 
@@ -342,6 +344,7 @@ def create_run_snapshot(
         resolved_config = resolve_run_config(
             config,
             target_repository_path=baseline_record.repository_path,
+            provider_policy=provider_policy,
         )
     except ResolvedRunConfigError as error:
         raise RunError(

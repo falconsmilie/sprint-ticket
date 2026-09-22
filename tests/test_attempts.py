@@ -11,7 +11,7 @@ from tests.fake_agent_executor import InMemoryAgentExecutor
 from tests.helpers import (
     create_git_repo,
     create_trusted_prepared_run,
-    make_agent_executor,
+    make_agent_executors,
     make_config,
 )
 from ticket_automation.application.agent_execution import (
@@ -378,7 +378,7 @@ def test_resume_requires_human_inspection_for_invalid_attempt_evidence(
         config,
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
-        agent_executor=make_agent_executor(config),
+        agent_executor_factory=lambda: make_agent_executors(config),
         clock=fixed_clock,
     )
 

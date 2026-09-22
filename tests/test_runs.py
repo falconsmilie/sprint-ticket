@@ -8,8 +8,14 @@ from pathlib import Path
 import pytest
 
 import ticket_automation.runs as runs_module
-from tests.helpers import GIT, create_git_repo, make_config, run_git
-from ticket_automation.config import VerificationCommand
+from tests.helpers import (
+    GIT,
+    create_git_repo,
+    create_test_run_snapshot,
+    make_config,
+    run_git,
+)
+from ticket_automation.config import ConfigError, VerificationCommand
 from ticket_automation.models import StopCategory, StopReason, WorkflowState
 from ticket_automation.resolved_config import RESOLVED_RUN_CONFIG_SCHEMA_VERSION
 from ticket_automation.runs import (
@@ -20,7 +26,6 @@ from ticket_automation.runs import (
     RunPreflightError,
     RunRecord,
     TicketInputError,
-    create_run_snapshot,
     list_run_records,
     load_baseline_record,
     load_run_record,
@@ -68,7 +73,7 @@ def test_valid_run_directory_creation(tmp_path):
     ticket = tmp_path / "QDEB-003.md"
     ticket.write_text("# Ticket\n", encoding="utf-8")
 
-    result = create_run_snapshot(
+    result = create_test_run_snapshot(
         make_config(repo),
         ticket,
         runs_dir=tmp_path / "runs",
@@ -92,7 +97,7 @@ def test_ticket_is_copied_byte_for_byte(tmp_path):
     ticket = tmp_path / "QDEB-003.md"
     ticket.write_bytes(contents)
 
-    result = create_run_snapshot(
+    result = create_test_run_snapshot(
         make_config(repo),
         ticket,
         runs_dir=tmp_path / "runs",
@@ -111,7 +116,7 @@ def test_branch_and_sha_are_recorded(tmp_path):
     expected_sha = run_git(repo, "rev-parse", "--verify", "HEAD")
     expected_status = run_git(repo, "status", "--short")
 
-    result = create_run_snapshot(
+    result = create_test_run_snapshot(
         make_config(repo),
         ticket,
         runs_dir=tmp_path / "runs",
@@ -135,7 +140,7 @@ def test_run_json_survives_load_save_round_trip(tmp_path):
     repo = create_git_repo(tmp_path / "repo")
     ticket = tmp_path / "QDEB-003.md"
     ticket.write_text("# Ticket\n", encoding="utf-8")
-    result = create_run_snapshot(
+    result = create_test_run_snapshot(
         make_config(repo),
         ticket,
         runs_dir=tmp_path / "runs",
@@ -246,7 +251,7 @@ def test_old_run_schema_instructs_operator_to_start_a_new_run(tmp_path):
     repo = create_git_repo(tmp_path / "repo")
     ticket = tmp_path / "QDEB-003.md"
     ticket.write_text("# Ticket\n", encoding="utf-8")
-    result = create_run_snapshot(
+    result = create_test_run_snapshot(
         make_config(repo),
         ticket,
         runs_dir=tmp_path / "runs",
@@ -280,7 +285,7 @@ def test_run_record_rejects_unsupported_schema_metadata(
     repo = create_git_repo(tmp_path / "repo")
     ticket = tmp_path / "QDEB-003.md"
     ticket.write_text("# Ticket\n", encoding="utf-8")
-    result = create_run_snapshot(
+    result = create_test_run_snapshot(
         make_config(repo),
         ticket,
         runs_dir=tmp_path / "runs",
@@ -312,7 +317,7 @@ def test_baseline_record_rejects_unsupported_schema_metadata(
     repo = create_git_repo(tmp_path / "repo")
     ticket = tmp_path / "QDEB-003.md"
     ticket.write_text("# Ticket\n", encoding="utf-8")
-    result = create_run_snapshot(
+    result = create_test_run_snapshot(
         make_config(repo),
         ticket,
         runs_dir=tmp_path / "runs",
@@ -341,7 +346,7 @@ def test_baseline_record_rejects_invalid_sha256_evidence(tmp_path, field, value)
     repo = create_git_repo(tmp_path / "repo")
     ticket = tmp_path / "QDEB-003.md"
     ticket.write_text("# Ticket\n", encoding="utf-8")
-    result = create_run_snapshot(
+    result = create_test_run_snapshot(
         make_config(repo),
         ticket,
         runs_dir=tmp_path / "runs",
@@ -362,7 +367,7 @@ def test_record_schema_metadata_uses_current_supported_formats(tmp_path):
     ticket = tmp_path / "QDEB-003.md"
     ticket.write_text("# Ticket\n", encoding="utf-8")
 
-    result = create_run_snapshot(
+    result = create_test_run_snapshot(
         make_config(repo),
         ticket,
         runs_dir=tmp_path / "runs",
@@ -387,7 +392,7 @@ def test_correction_round_and_maximum_are_persisted(tmp_path):
     ticket = tmp_path / "QDEB-003.md"
     ticket.write_text("# Ticket\n", encoding="utf-8")
 
-    result = create_run_snapshot(
+    result = create_test_run_snapshot(
         make_config(repo, max_correction_rounds=7),
         ticket,
         runs_dir=tmp_path / "runs",
@@ -409,7 +414,7 @@ def test_codex_execution_config_is_persisted_in_run_record(tmp_path):
     ticket = tmp_path / "QDEB-003.md"
     ticket.write_text("# Ticket\n", encoding="utf-8")
 
-    result = create_run_snapshot(
+    result = create_test_run_snapshot(
         make_config(
             repo,
             codex_model="configured-model",
@@ -442,7 +447,7 @@ def test_run_record_persists_one_complete_resolved_execution_snapshot(tmp_path):
         timeout_seconds=91,
     )
 
-    result = create_run_snapshot(
+    result = create_test_run_snapshot(
         make_config(
             repo,
             protected_branches=("main", "release"),
@@ -491,13 +496,13 @@ def test_run_record_persists_one_complete_resolved_execution_snapshot(tmp_path):
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
-def test_snapshot_rejects_executable_without_ephemeral_support(tmp_path):
+def test_composition_rejects_executable_without_ephemeral_support(tmp_path):
     repo = create_git_repo(tmp_path / "repo")
     ticket = tmp_path / "TA-ARCH-007.md"
     ticket.write_text("# Ticket\n", encoding="utf-8")
 
-    with pytest.raises(RunError, match="does not support required --ephemeral"):
-        create_run_snapshot(
+    with pytest.raises(ConfigError, match="does not support required --ephemeral"):
+        create_test_run_snapshot(
             make_config(repo, codex_executable=sys.executable),
             ticket,
             runs_dir=tmp_path / "runs",
@@ -542,7 +547,7 @@ def test_run_record_rejects_missing_or_incompatible_resolved_config(
     repo = create_git_repo(tmp_path / "repo")
     ticket = tmp_path / "TA-ARCH-007.md"
     ticket.write_text("# Ticket\n", encoding="utf-8")
-    result = create_run_snapshot(
+    result = create_test_run_snapshot(
         make_config(repo),
         ticket,
         runs_dir=tmp_path / "runs",
@@ -562,7 +567,7 @@ def test_run_record_loads_optional_lifecycle_fields(tmp_path):
     repo = create_git_repo(tmp_path / "repo")
     ticket = tmp_path / "QDEB-003.md"
     ticket.write_text("# Ticket\n", encoding="utf-8")
-    result = create_run_snapshot(
+    result = create_test_run_snapshot(
         make_config(repo),
         ticket,
         runs_dir=tmp_path / "runs",
@@ -611,7 +616,7 @@ def test_run_record_rejects_malformed_or_negative_lifecycle_fields(
     repo = create_git_repo(tmp_path / "repo")
     ticket = tmp_path / "QDEB-003.md"
     ticket.write_text("# Ticket\n", encoding="utf-8")
-    result = create_run_snapshot(
+    result = create_test_run_snapshot(
         make_config(repo),
         ticket,
         runs_dir=tmp_path / "runs",
@@ -632,7 +637,7 @@ def test_invalid_ticket_input_fails_before_creating_misleading_run(tmp_path):
     runs_dir = tmp_path / "runs"
 
     with pytest.raises(TicketInputError):
-        create_run_snapshot(
+        create_test_run_snapshot(
             make_config(repo),
             tmp_path / "missing.md",
             runs_dir=runs_dir,
@@ -650,7 +655,7 @@ def test_empty_ticket_input_fails_before_creating_misleading_run(tmp_path):
     runs_dir = tmp_path / "runs"
 
     with pytest.raises(TicketInputError):
-        create_run_snapshot(
+        create_test_run_snapshot(
             make_config(repo),
             ticket,
             runs_dir=runs_dir,
@@ -669,7 +674,7 @@ def test_dirty_repository_fails_during_preflight_without_run_directory(tmp_path)
     runs_dir = tmp_path / "runs"
 
     with pytest.raises(RunPreflightError):
-        create_run_snapshot(
+        create_test_run_snapshot(
             make_config(repo),
             ticket,
             runs_dir=runs_dir,
@@ -695,7 +700,7 @@ def test_snapshot_persistence_failure_does_not_leave_listed_partial_run(
     monkeypatch.setattr(runs_module, "save_baseline_record", fail_save_baseline)
 
     with pytest.raises(OSError, match="cannot persist baseline"):
-        create_run_snapshot(
+        create_test_run_snapshot(
             make_config(repo),
             ticket,
             runs_dir=runs_dir,
@@ -717,7 +722,7 @@ def test_existing_run_directories_are_not_silently_clobbered(tmp_path):
     existing.mkdir(parents=True)
     existing.joinpath("run.json").write_text('{"sentinel": true}\n', encoding="utf-8")
 
-    result = create_run_snapshot(
+    result = create_test_run_snapshot(
         make_config(repo),
         ticket,
         runs_dir=runs_dir,
@@ -738,7 +743,7 @@ def test_atomic_run_persistence_keeps_previous_record_when_replace_fails(
     repo = create_git_repo(tmp_path / "repo")
     ticket = tmp_path / "QDEB-003.md"
     ticket.write_text("# Ticket\n", encoding="utf-8")
-    result = create_run_snapshot(
+    result = create_test_run_snapshot(
         make_config(repo),
         ticket,
         runs_dir=tmp_path / "runs",
@@ -772,10 +777,10 @@ def test_status_can_read_multiple_run_records(tmp_path):
     second_ticket.write_text("# Second\n", encoding="utf-8")
     runs_dir = tmp_path / "runs"
 
-    create_run_snapshot(
+    create_test_run_snapshot(
         make_config(repo), first_ticket, runs_dir=runs_dir, clock=fixed_clock
     )
-    create_run_snapshot(
+    create_test_run_snapshot(
         make_config(repo), second_ticket, runs_dir=runs_dir, clock=fixed_clock
     )
 

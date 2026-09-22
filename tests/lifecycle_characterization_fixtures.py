@@ -10,6 +10,7 @@ from tests.helpers import create_git_repo, make_config
 from ticket_automation.attempts import AttemptRecord, load_attempt_records
 from ticket_automation.config import AppConfig
 from ticket_automation.providers.codex_cli import CodexProcessResult
+from ticket_automation.providers.codex_cli.identity import PROVIDER_ID
 from ticket_automation.verification import VerificationProcessResult
 
 
@@ -50,7 +51,7 @@ def build_lifecycle_workspace(
         ticket=ticket,
         runs_dir=tmp_path / "runs",
         config=config,
-        agent_executable=Path(config.codex.executable),
+        agent_executable=Path(str(config.agents.providers[PROVIDER_ID]["executable"])),
     )
 
 

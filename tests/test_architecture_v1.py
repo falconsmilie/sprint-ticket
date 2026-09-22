@@ -11,9 +11,12 @@ from tests.fake_agent_executor import InMemoryAgentExecutor
 from tests.helpers import (
     GIT,
     create_git_repo,
+    create_test_run_snapshot,
     create_trusted_prepared_run,
     make_agent_executor,
+    make_agent_executors,
     make_config,
+    make_run_dependencies,
 )
 from ticket_automation.application.agent_execution import (
     AgentTaskKind,
@@ -36,11 +39,16 @@ from ticket_automation.domain.task_results import (
 from ticket_automation.git import GitRepository
 from ticket_automation.git_safety import WorkspaceSnapshot
 from ticket_automation.implementation import run_implementation_stage
-from ticket_automation.models import AttemptPhase, StopCategory, WorkflowState
+from ticket_automation.models import (
+    AttemptPhase,
+    StopCategory,
+    StopReason,
+    WorkflowState,
+)
 from ticket_automation.providers.codex_cli import CodexProcessResult
 from ticket_automation.reporting import run_report_stage
 from ticket_automation.review import run_review_stage
-from ticket_automation.runs import create_run_snapshot, load_run_record, save_run_record
+from ticket_automation.runs import load_run_record, save_run_record
 from ticket_automation.verification import (
     VerificationProcessResult,
     run_verification_stage,
@@ -147,7 +155,7 @@ def test_lifecycle_writes_only_numbered_attempt_evidence(tmp_path, monkeypatch):
         _ticket(tmp_path),
         runs_dir=tmp_path / "runs",
         verification_runner=runner,
-        agent_executor=make_agent_executor(
+        **make_run_dependencies(
             config, process_runner=CompletingCodexRunner()
         ),
         clock=fixed_clock,
@@ -257,7 +265,7 @@ def test_resume_reruns_safe_verification_as_a_new_attempt(tmp_path, monkeypatch)
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
         verification_runner=PassingVerificationRunner(),
-        agent_executor=make_agent_executor(
+        agent_executor_factory=lambda: make_agent_executors(
             config, process_runner=CompletingCodexRunner()
         ),
         clock=fixed_clock,
@@ -285,6 +293,70 @@ def test_resume_reruns_safe_verification_as_a_new_attempt(tmp_path, monkeypatch)
             directory.joinpath(relative_path).read_bytes() == contents
             for relative_path, contents in evidence.items()
         )
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required")
+def test_resume_checks_persisted_compatibility_before_constructing_executors(tmp_path):
+    repo = create_git_repo(tmp_path / "target")
+    config = make_config(repo)
+    snapshot = create_test_run_snapshot(
+        config,
+        _ticket(tmp_path),
+        runs_dir=tmp_path / "runs",
+        clock=fixed_clock,
+    )
+    Path(snapshot.run_record.resolved_config.codex_executable).unlink()
+
+    def unexpected_factory():
+        raise AssertionError("Incompatible persisted policy must stop before composition.")
+
+    result = resume_ticket_lifecycle(
+        config,
+        snapshot.run_record.run_id,
+        runs_dir=tmp_path / "runs",
+        agent_executor_factory=unexpected_factory,
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
+    assert "executable is unavailable" in result.run_record.terminal_reason
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required")
+def test_terminal_resume_does_not_construct_provider_runtime(tmp_path):
+    repo = create_git_repo(tmp_path / "target")
+    config = make_config(repo)
+    snapshot = create_test_run_snapshot(
+        config,
+        _ticket(tmp_path),
+        runs_dir=tmp_path / "runs",
+        clock=fixed_clock,
+    )
+    terminal = snapshot.run_record.transition_to(
+        WorkflowState.HUMAN_REQUIRED,
+        updated_timestamp="2026-09-14T10:20:00Z",
+        terminal_reason="trusted terminal state",
+        stop_reason=StopReason(
+            category=StopCategory.CONTROLLER_FAILURE,
+            message="trusted terminal state",
+            retryable=False,
+        ),
+    )
+    save_run_record(terminal, snapshot.run_dir / "run.json")
+    Path(terminal.resolved_config.codex_executable).unlink()
+
+    def unexpected_factory():
+        raise AssertionError("Terminal resume must not construct provider runtime.")
+
+    result = resume_ticket_lifecycle(
+        config,
+        terminal.run_id,
+        runs_dir=tmp_path / "runs",
+        agent_executor_factory=unexpected_factory,
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required")
@@ -316,7 +388,7 @@ def test_interrupted_writable_state_requires_human_inspection(tmp_path):
         config,
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
-        agent_executor=make_agent_executor(config),
+        agent_executor_factory=lambda: make_agent_executors(config),
         clock=fixed_clock,
     )
 
@@ -342,7 +414,7 @@ def test_reporting_renders_without_changing_controller_state(tmp_path, monkeypat
         _ticket(tmp_path),
         runs_dir=tmp_path / "runs",
         verification_runner=PassingVerificationRunner(),
-        agent_executor=make_agent_executor(
+        **make_run_dependencies(
             config, process_runner=CompletingCodexRunner()
         ),
         clock=fixed_clock,
@@ -361,7 +433,7 @@ def test_resume_restarts_preparation_in_a_new_attempt(tmp_path):
     repository = create_git_repo(tmp_path / "target")
     config = make_config(repository)
     ticket = _ticket(tmp_path)
-    snapshot = create_run_snapshot(
+    snapshot = create_test_run_snapshot(
         config,
         ticket,
         runs_dir=tmp_path / "runs",
@@ -379,7 +451,7 @@ def test_resume_restarts_preparation_in_a_new_attempt(tmp_path):
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
         verification_runner=PassingVerificationRunner(),
-        agent_executor=make_agent_executor(
+        agent_executor_factory=lambda: make_agent_executors(
             config, process_runner=CompletingCodexRunner()
         ),
         clock=fixed_clock,
@@ -445,7 +517,7 @@ def test_resume_restarts_review_in_a_new_attempt(tmp_path):
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
         verification_runner=PassingVerificationRunner(),
-        agent_executor=make_agent_executor(
+        agent_executor_factory=lambda: make_agent_executors(
             config, process_runner=CompletingCodexRunner()
         ),
         clock=fixed_clock,
@@ -524,7 +596,7 @@ def test_resume_restarts_reporting_in_a_new_attempt(tmp_path):
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
         verification_runner=PassingVerificationRunner(),
-        agent_executor=make_agent_executor(
+        agent_executor_factory=lambda: make_agent_executors(
             config, process_runner=CompletingCodexRunner()
         ),
         clock=fixed_clock,
@@ -556,7 +628,7 @@ def test_rendering_failure_cannot_reclassify_an_accepted_handoff(tmp_path, monke
         _ticket(tmp_path),
         runs_dir=tmp_path / "runs",
         verification_runner=PassingVerificationRunner(),
-        agent_executor=make_agent_executor(
+        **make_run_dependencies(
             config, process_runner=CompletingCodexRunner()
         ),
         clock=fixed_clock,
@@ -585,7 +657,7 @@ def test_terminal_report_describes_a_failed_baseline_attempt(tmp_path):
         config,
         _ticket(tmp_path),
         runs_dir=tmp_path / "runs",
-        agent_executor=make_agent_executor(config),
+        **make_run_dependencies(config),
         verification_runner=FailingBaselineRunner(),
         clock=fixed_clock,
     )
@@ -635,7 +707,7 @@ def test_one_correction_round_preserves_the_ordinary_lifecycle(tmp_path):
         _ticket(tmp_path),
         runs_dir=tmp_path / "runs",
         verification_runner=verification,
-        agent_executor=executor,
+        **make_run_dependencies(config, agent_executor=executor),
         clock=fixed_clock,
     )
 

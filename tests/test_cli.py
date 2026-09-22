@@ -14,6 +14,10 @@ from tests.helpers import (
     write_preflight_config,
 )
 from ticket_automation.config import VerificationCommand
+from ticket_automation.providers.codex_cli import (
+    DEFAULT_CODEX_MODEL,
+    DEFAULT_CODEX_REASONING_EFFORT,
+)
 
 
 def test_cli_help_succeeds(tmp_path):
@@ -35,7 +39,12 @@ name = "Configured project"
 repo = "C:/Projects/configured-project"
 protected_branches = ["main"]
 
-[codex]
+[agents.assignments]
+implementation = "codex-cli"
+review = "codex-cli"
+correction = "codex-cli"
+
+[agents.providers.codex-cli]
 executable = "codex"
 
 [[verification.commands]]
@@ -52,7 +61,39 @@ timeout_seconds = 1800
     assert "TicketAutomation configuration" in result.stdout
     assert "Configured project" in result.stdout
     assert "C:\\Projects\\configured-project" in result.stdout
+    assert f"model: {DEFAULT_CODEX_MODEL}" in result.stdout
+    assert f"reasoning_effort: {DEFAULT_CODEX_REASONING_EFFORT}" in result.stdout
     assert "tests (1800s): python -m pytest" in result.stdout
+
+
+def test_cli_config_reports_unknown_assigned_provider(tmp_path):
+    tmp_path.joinpath("config.local.toml").write_text(
+        """
+[project]
+name = "Configured project"
+repo = "C:/Projects/configured-project"
+protected_branches = ["main"]
+
+[agents.assignments]
+implementation = "stub"
+review = "stub"
+correction = "stub"
+
+[agents.providers.stub]
+
+[[verification.commands]]
+name = "tests"
+argv = ["python", "-m", "pytest"]
+timeout_seconds = 1800
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = run_cli("config", cwd=tmp_path)
+
+    assert result.returncode == 2
+    assert "stub is not registered" in result.stderr
+    assert "Codex CLI overrides" not in result.stderr
 
 
 @pytest.mark.skipif(
@@ -85,7 +126,7 @@ def test_cli_preflight_failure_returns_nonzero(tmp_path):
     result = run_cli("--config-dir", str(config_dir), "preflight", cwd=config_dir)
 
     assert result.returncode == 1
-    assert "Codex CLI" in result.stdout
+    assert "Provider codex-cli" in result.stdout
     assert "ticket-automation-missing-codex" in result.stdout
     assert "PREFLIGHT FAILED" in result.stdout
 

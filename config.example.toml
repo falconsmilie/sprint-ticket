@@ -8,7 +8,12 @@ protected_branches = ["main", "master"]
 [runner]
 max_correction_rounds = 1
 
-[codex]
+[agents.assignments]
+implementation = "codex-cli"
+review = "codex-cli"
+correction = "codex-cli"
+
+[agents.providers.codex-cli]
 executable = "codex"
 model = "gpt-5.5"
 reasoning_effort = "xhigh"

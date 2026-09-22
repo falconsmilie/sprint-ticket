@@ -11,17 +11,26 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ticket_automation.application.agent_execution import (
+    AgentExecutorAssignments,
+    AgentTaskKind,
+)
+from ticket_automation.composition import prepare_production_agents
 from ticket_automation.config import (
-    DEFAULT_CODEX_MODEL,
-    DEFAULT_CODEX_REASONING_EFFORT,
+    AgentSettings,
     AppConfig,
-    CodexSettings,
     ProjectSettings,
     RunnerSettings,
     VerificationCommand,
     VerificationSettings,
 )
-from ticket_automation.providers.codex_cli import CodexCliAgentExecutor
+from ticket_automation.providers.codex_cli import (
+    DEFAULT_CODEX_MODEL,
+    DEFAULT_CODEX_REASONING_EFFORT,
+    CodexCliAgentExecutor,
+    CodexSettings,
+)
+from ticket_automation.providers.codex_cli.identity import PROVIDER_ID
 
 if TYPE_CHECKING:
     from ticket_automation.runs import RunCreationResult
@@ -235,11 +244,14 @@ def write_path_executable(directory: Path, *, name: str = "codex") -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     if os.name == "nt":
         executable = directory / f"{name}.CMD"
-        executable.write_text("@echo off\nexit /b 0\n", encoding="utf-8")
+        executable.write_text(
+            "@echo off\nif \"%1\"==\"exec\" echo --ephemeral\nexit /b 0\n",
+            encoding="utf-8",
+        )
         return executable
 
     executable = directory / name
-    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.write_text("#!/bin/sh\necho --ephemeral\nexit 0\n", encoding="utf-8")
     executable.chmod(0o755)
     return executable
 
@@ -300,10 +312,15 @@ def make_config(
             protected_branches=protected_branches,
         ),
         runner=RunnerSettings(max_correction_rounds=max_correction_rounds),
-        codex=CodexSettings(
-            executable=executable,
-            model=codex_model,
-            reasoning_effort=codex_reasoning_effort,
+        agents=AgentSettings(
+            assignments={task_kind: PROVIDER_ID for task_kind in AgentTaskKind},
+            providers={
+                PROVIDER_ID: {
+                    "executable": executable,
+                    "model": codex_model,
+                    "reasoning_effort": codex_reasoning_effort,
+                }
+            },
         ),
         verification=VerificationSettings(
             commands=verification_commands
@@ -329,10 +346,70 @@ class _UnexpectedCodexRunner:
 def make_agent_executor(config: AppConfig, *, process_runner=None):
     """Compose the configured adapter for characterization tests."""
 
+    raw = config.agents.providers[PROVIDER_ID]
     return CodexCliAgentExecutor(
-        config.codex,
+        CodexSettings(
+            executable=str(raw["executable"]),
+            model=str(raw["model"]),
+            reasoning_effort=str(raw["reasoning_effort"]),
+        ),
         configuration_directory=config.configuration_directory,
         runner=process_runner or _UnexpectedCodexRunner(),
+    )
+
+
+def make_agent_executors(
+    config: AppConfig, *, process_runner=None
+) -> AgentExecutorAssignments:
+    executor = make_agent_executor(config, process_runner=process_runner)
+    return AgentExecutorAssignments(
+        implementation=executor,
+        review=executor,
+        correction=executor,
+    )
+
+
+def make_run_dependencies(
+    config: AppConfig, *, process_runner=None, agent_executor=None
+) -> dict[str, object]:
+    """Construct the explicit provider dependencies required by a new run."""
+
+    prepared = prepare_production_agents(config)
+    composed = prepared.compose_for_run()
+    executors = (
+        AgentExecutorAssignments(
+            implementation=agent_executor,
+            review=agent_executor,
+            correction=agent_executor,
+        )
+        if agent_executor is not None
+        else make_agent_executors(config, process_runner=process_runner)
+    )
+    return {
+        "agent_executors": executors,
+        "provider_preflight": prepared.run_preflight,
+        "provider_policy": composed.policies[PROVIDER_ID],
+    }
+
+
+def create_test_run_snapshot(
+    config: AppConfig,
+    ticket_path: Path | str,
+    *,
+    runs_dir: Path | str,
+    clock: Callable[[], datetime] | None = None,
+) -> RunCreationResult:
+    from ticket_automation.runs import create_run_snapshot
+
+    prepared = prepare_production_agents(config)
+    composed = prepared.compose_for_run()
+    return create_run_snapshot(
+        config,
+        ticket_path,
+        runs_dir=runs_dir,
+        provider_preflight=prepared.run_preflight,
+        provider_policy=composed.policies[PROVIDER_ID],
+        clock=clock,
     )
 
 
@@ -346,7 +423,7 @@ def create_trusted_prepared_run(
 ) -> RunCreationResult:
     """Build a PREPARED run through the real baseline-verification boundary."""
     from ticket_automation.models import WorkflowState
-    from ticket_automation.runs import create_run_snapshot, save_run_record
+    from ticket_automation.runs import save_run_record
     from ticket_automation.verification import (
         VerificationProcessResult,
         _run_baseline_verification_stage,
@@ -357,7 +434,7 @@ def create_trusted_prepared_run(
             del command, timeout_seconds
             return VerificationProcessResult(returncode=0, stdout="", stderr="")
 
-    snapshot = create_run_snapshot(
+    snapshot = create_test_run_snapshot(
         config,
         ticket_path,
         runs_dir=runs_dir,
@@ -387,7 +464,7 @@ def write_preflight_config(
     max_correction_rounds: int = 1,
     verification_commands: tuple[VerificationCommand, ...] | None = None,
 ) -> None:
-    executable = codex or Path(sys.executable).as_posix()
+    executable = codex or str(write_fake_codex_executable(config_dir / "fake-bin"))
     commands = verification_commands or (
         VerificationCommand(
             name="python",
@@ -404,7 +481,12 @@ def write_preflight_config(
         "[runner]",
         f"max_correction_rounds = {max_correction_rounds}",
         "",
-        "[codex]",
+        "[agents.assignments]",
+        'implementation = "codex-cli"',
+        'review = "codex-cli"',
+        'correction = "codex-cli"',
+        "",
+        "[agents.providers.codex-cli]",
         f"executable = {json.dumps(executable)}",
         f"model = {json.dumps(DEFAULT_CODEX_MODEL)}",
         f"reasoning_effort = {json.dumps(DEFAULT_CODEX_REASONING_EFFORT)}",

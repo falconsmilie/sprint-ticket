@@ -15,8 +15,10 @@ from tests.helpers import (
     GIT,
     PROJECT_ROOT,
     create_git_repo,
-    make_agent_executor,
+    create_test_run_snapshot,
+    make_agent_executors,
     make_config,
+    make_run_dependencies,
 )
 from ticket_automation.config import VerificationCommand
 from ticket_automation.locking import (
@@ -25,8 +27,9 @@ from ticket_automation.locking import (
     active_repository_locks,
 )
 from ticket_automation.models import WorkflowState
+from ticket_automation.preflight import PreflightCheck, PreflightResult, PreflightStatus
 from ticket_automation.providers.codex_cli import CodexCommand, CodexProcessResult
-from ticket_automation.runs import RunPreflightError, create_run_snapshot
+from ticket_automation.runs import RunPreflightError, TicketInputError
 from ticket_automation.verification import (
     VerificationProcessCommand,
     VerificationProcessResult,
@@ -156,7 +159,7 @@ def test_second_run_against_same_repository_is_blocked(tmp_path):
                 config,
                 ticket,
                 runs_dir=runs_dir,
-                agent_executor=make_agent_executor(
+                **make_run_dependencies(
                     config, process_runner=SequencedCodexRunner([])
                 ),
                 verification_runner=PassingVerificationRunner(),
@@ -173,10 +176,88 @@ def test_second_run_against_same_repository_is_blocked(tmp_path):
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for locking tests")
+def test_provider_preflight_runs_while_repository_lock_is_held(tmp_path):
+    _repo, ticket, config = workflow_inputs(tmp_path)
+    dependencies = make_run_dependencies(config)
+    observed_lock = False
+
+    def provider_preflight(*, repository_path):
+        nonlocal observed_lock
+        observed_lock = any(
+            lock.owner_pid == os.getpid()
+            and Path(lock.target_repository_path).resolve() == repository_path.resolve()
+            for lock in active_repository_locks()
+        )
+        return PreflightResult(
+            (
+                PreflightCheck(
+                    name="stub provider",
+                    status=PreflightStatus.FAIL,
+                    message="stop before run creation",
+                ),
+            )
+        )
+
+    dependencies["provider_preflight"] = provider_preflight
+    with pytest.raises(RunPreflightError):
+        run_ticket_lifecycle(
+            config,
+            ticket,
+            runs_dir=tmp_path / "runs",
+            **dependencies,
+        )
+
+    assert observed_lock
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for locking tests")
+def test_direct_lifecycle_dispatches_codex_preflight(tmp_path):
+    repo, ticket, config = workflow_inputs(tmp_path)
+    project_config = repo / ".codex" / "config.toml"
+    project_config.parent.mkdir()
+    project_config.write_text("model = 'target-controlled'\n", encoding="utf-8")
+
+    with pytest.raises(RunPreflightError) as raised:
+        run_ticket_lifecycle(
+            config,
+            ticket,
+            runs_dir=tmp_path / "runs",
+            **make_run_dependencies(config),
+        )
+
+    assert any("Provider codex-cli" in check.name for check in raised.value.result.failed_checks)
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for locking tests")
+def test_invalid_ticket_is_rejected_before_provider_preflight(tmp_path):
+    repo = create_git_repo(tmp_path / "repo")
+    config = make_config(repo)
+    dependencies = make_run_dependencies(config)
+    provider_preflight_called = False
+
+    def provider_preflight(*, repository_path):
+        nonlocal provider_preflight_called
+        del repository_path
+        provider_preflight_called = True
+        return PreflightResult(())
+
+    dependencies["provider_preflight"] = provider_preflight
+    with pytest.raises(TicketInputError):
+        run_ticket_lifecycle(
+            config,
+            tmp_path / "missing.md",
+            runs_dir=tmp_path / "runs",
+            **dependencies,
+        )
+
+    assert not provider_preflight_called
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for locking tests")
 def test_second_resume_against_same_repository_is_blocked(tmp_path):
     repo, ticket, config = workflow_inputs(tmp_path)
     runs_dir = tmp_path / "runs"
-    snapshot = create_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
+    snapshot = create_test_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
     holder = start_lock_holder(repo, run_id="owner-run", state="VERIFYING")
     try:
         with pytest.raises(RepositoryLockError) as raised:
@@ -184,7 +265,7 @@ def test_second_resume_against_same_repository_is_blocked(tmp_path):
                 config,
                 snapshot.run_record.run_id,
                 runs_dir=runs_dir,
-                agent_executor=make_agent_executor(
+                agent_executor_factory=lambda: make_agent_executors(
                     config, process_runner=SequencedCodexRunner([])
                 ),
                 verification_runner=PassingVerificationRunner(),
@@ -233,7 +314,7 @@ def test_same_repository_is_blocked_across_distinct_run_roots(tmp_path):
                 config,
                 ticket,
                 runs_dir=second_runs_dir,
-                agent_executor=make_agent_executor(
+                **make_run_dependencies(
                     config, process_runner=SequencedCodexRunner([])
                 ),
                 verification_runner=PassingVerificationRunner(),
@@ -258,7 +339,7 @@ def test_different_repositories_can_run_independently(tmp_path):
             config_b,
             ticket_b,
             runs_dir=runs_dir,
-            agent_executor=make_agent_executor(
+            **make_run_dependencies(
                 config_b,
                 process_runner=SequencedCodexRunner(
                     [
@@ -291,7 +372,7 @@ def test_lock_releases_after_ready_for_human(tmp_path):
         config,
         ticket,
         runs_dir=runs_dir,
-        agent_executor=make_agent_executor(
+        **make_run_dependencies(
             config,
             process_runner=SequencedCodexRunner(
                 [
@@ -320,7 +401,7 @@ def test_lock_releases_after_human_required(tmp_path):
         config,
         ticket,
         runs_dir=runs_dir,
-        agent_executor=make_agent_executor(
+        **make_run_dependencies(
             config,
             process_runner=SequencedCodexRunner(
                 [CodexStep(result=implementation_result())]
@@ -344,7 +425,7 @@ def test_lock_releases_after_failed(tmp_path):
         config,
         ticket,
         runs_dir=runs_dir,
-        agent_executor=make_agent_executor(
+        **make_run_dependencies(
             config,
             process_runner=SequencedCodexRunner(
                 [CodexStep(error=FileNotFoundError("missing codex"))]
@@ -369,7 +450,7 @@ def test_lock_releases_after_preflight_failure(tmp_path):
             config,
             ticket,
             runs_dir=runs_dir,
-            agent_executor=make_agent_executor(
+            **make_run_dependencies(
                 config, process_runner=SequencedCodexRunner([])
             ),
             verification_runner=PassingVerificationRunner(),

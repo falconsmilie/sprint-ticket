@@ -1,45 +1,22 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import StrEnum
+import os
 from pathlib import Path
 
 from . import executable_resolution
+from .application.ports.preflight import (
+    PreflightCheck,
+    PreflightResult,
+    PreflightStatus,
+)
 from .config import AppConfig, VerificationCommand
 from .git import GitCommandError, GitRepository
 from .git_safety import WorkspaceSnapshot
+from .locking import active_repository_locks, canonical_repository_identity
 
 
-class PreflightStatus(StrEnum):
-    PASS = "PASS"
-    FAIL = "FAIL"
-
-
-@dataclass(frozen=True)
-class PreflightCheck:
-    name: str
-    status: PreflightStatus
-    message: str = ""
-
-    @property
-    def passed(self) -> bool:
-        return self.status == PreflightStatus.PASS
-
-
-@dataclass(frozen=True)
-class PreflightResult:
-    checks: tuple[PreflightCheck, ...]
-
-    @property
-    def passed(self) -> bool:
-        return all(check.passed for check in self.checks)
-
-    @property
-    def failed_checks(self) -> tuple[PreflightCheck, ...]:
-        return tuple(check for check in self.checks if not check.passed)
-
-
-def run_preflight(config: AppConfig) -> PreflightResult:
+def _run_common_preflight(config: AppConfig) -> PreflightResult:
+    """Run repository and verification checks shared by every provider."""
     checks: list[PreflightCheck] = []
     repo_path = config.project.repo
 
@@ -72,6 +49,7 @@ def run_preflight(config: AppConfig) -> PreflightResult:
             )
         )
     checks.append(_pass("Git repository"))
+    _check_repository_lock(repo_path, checks)
 
     snapshot = WorkspaceSnapshot.capture(repository)
     if not snapshot.inspection_complete:
@@ -83,17 +61,21 @@ def run_preflight(config: AppConfig) -> PreflightResult:
         if branch is not None:
             _check_protected_branch(branch, config.project.protected_branches, checks)
 
-    _check_target_codex_configuration(repo_path, checks)
-    _check_executable(
-        "Codex CLI",
-        config.codex.executable,
-        checks,
-        config_dir=config.configuration_directory,
-    )
     for command in config.verification.commands:
         _check_verification_command(command, checks, cwd=repo_path)
 
     return PreflightResult(tuple(checks))
+
+
+def run_preflight(
+    config: AppConfig,
+    *,
+    provider_result: PreflightResult,
+) -> PreflightResult:
+    """Combine common checks with already-dispatched provider checks."""
+
+    common = _run_common_preflight(config)
+    return PreflightResult((*common.checks, *provider_result.checks))
 
 
 def format_preflight_result(result: PreflightResult) -> str:
@@ -213,19 +195,29 @@ def _check_executable(
     checks.append(_fail(name, f"Executable not found: {executable}"))
 
 
-def _check_target_codex_configuration(
+def _check_repository_lock(
     repo_path: Path,
     checks: list[PreflightCheck],
 ) -> None:
-    project_config = repo_path / ".codex" / "config.toml"
-    if project_config.is_file():
-        checks.append(
-            _fail(
-                "Codex project configuration",
-                "Target repository contains .codex/config.toml; V1 rejects it "
-                "because its execution policy cannot be isolated reliably.",
-            )
+    identity = canonical_repository_identity(repo_path)
+    conflicts = tuple(
+        lock
+        for lock in active_repository_locks()
+        if lock.canonical_repository_identity == identity and lock.owner_pid != os.getpid()
+    )
+    if not conflicts:
+        checks.append(_pass("Repository lock"))
+        return
+    assignments = ", ".join(
+        f"{lock.run_id} ({lock.current_state or 'unknown state'})"
+        for lock in conflicts
+    )
+    checks.append(
+        _fail(
+            "Repository lock",
+            f"Repository is owned by active run(s): {assignments}",
         )
+    )
 
 
 def _pass(name: str, message: str = "") -> PreflightCheck:
