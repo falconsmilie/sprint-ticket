@@ -47,6 +47,17 @@ Application and domain code use provider-neutral policy and evidence contracts.
 A provider-neutral evidence envelope may reference native provider artifacts,
 but those artifacts and their codecs remain with the provider.
 
+Run persistence stores a provider-neutral resolved policy. Its core records the
+repository, verification, task assignments, task requirements, package source,
+and provider-neutral prompt and result-contract hashes. Each referenced provider
+has a typed ID, adapter policy version, declared capabilities, and an opaque JSON
+payload. Only the matching registered adapter encodes, decodes, validates, and
+interprets that payload. Resume rejects unknown providers, adapter policy version
+changes, capability changes, and invalid payloads before constructing an
+executor. Composition retains the provider registry and supplies application
+workflows with a provider-neutral factory port that accepts the persisted
+policy; application code never receives the registry itself.
+
 ## Enforced rules
 
 The AST fitness checks in `tests/architecture_fitness.py` inspect source without

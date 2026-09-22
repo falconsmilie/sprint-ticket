@@ -53,7 +53,7 @@ from .models import (
     StopCategory,
     WorkflowState,
 )
-from .resolved_config import config_from_resolved_run_config
+from .resolved_config import config_from_resolved_run_policy
 from .runs import (
     BASELINE_RECORD_FILE,
     RUN_RECORD_FILE,
@@ -232,7 +232,7 @@ def run_correction_stage(
     run_path = Path(run_dir)
     run_record = load_run_record(run_path / RUN_RECORD_FILE)
     # Corrective writes use the same frozen policy as the initial implementation.
-    config = config_from_resolved_run_config(run_record.resolved_config)
+    config = config_from_resolved_run_policy(run_record.resolved_policy)
     if run_record.state != WorkflowState.CORRECTING:
         raise CorrectionError(
             f"Correction requires run state CORRECTING; found {run_record.state.value}."

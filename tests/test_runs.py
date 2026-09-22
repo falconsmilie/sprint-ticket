@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -17,7 +18,7 @@ from tests.helpers import (
 )
 from ticket_automation.config import ConfigError, VerificationCommand
 from ticket_automation.models import StopCategory, StopReason, WorkflowState
-from ticket_automation.resolved_config import RESOLVED_RUN_CONFIG_SCHEMA_VERSION
+from ticket_automation.resolved_config import RESOLVED_RUN_POLICY_SCHEMA_VERSION
 from ticket_automation.runs import (
     BASELINE_RECORD_FORMAT,
     RUN_RECORD_FORMAT,
@@ -195,6 +196,20 @@ def test_run_record_accepts_each_state_at_trusted_deserialization_boundary(state
 
 
 @pytest.mark.parametrize(
+    "schema_version",
+    [RUN_SCHEMA_VERSION - 1, float(RUN_SCHEMA_VERSION), True],
+)
+def test_trusted_run_record_construction_rejects_invalid_schema_version(
+    schema_version,
+):
+    with pytest.raises(ValueError, match="Unsupported run record schema version"):
+        replace(
+            trusted_run_record(WorkflowState.PREPARING),
+            schema_version=schema_version,
+        )
+
+
+@pytest.mark.parametrize(
     "state",
     (WorkflowState.HUMAN_REQUIRED, WorkflowState.FAILED),
 )
@@ -247,7 +262,8 @@ def test_terminal_stop_record_rejects_missing_or_inconsistent_evidence(patch, me
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
-def test_old_run_schema_instructs_operator_to_start_a_new_run(tmp_path):
+@pytest.mark.parametrize("old_version", [1, 2, 3, 4])
+def test_old_run_schemas_instruct_operator_to_start_a_new_run(tmp_path, old_version):
     repo = create_git_repo(tmp_path / "repo")
     ticket = tmp_path / "QDEB-003.md"
     ticket.write_text("# Ticket\n", encoding="utf-8")
@@ -259,13 +275,18 @@ def test_old_run_schema_instructs_operator_to_start_a_new_run(tmp_path):
     )
     record_path = result.run_dir / "run.json"
     data = json.loads(record_path.read_text(encoding="utf-8"))
-    data["schema_version"] = 1
+    data["schema_version"] = old_version
+    data["resolved_config"] = representative_old_resolved_config()
+    data.pop("resolved_policy")
     data["state"] = "SNAPSHOT"
     data["last_completed_state"] = "SNAPSHOT"
     record_path.write_text(json.dumps(data), encoding="utf-8")
+    old_contents = record_path.read_bytes()
 
     with pytest.raises(RunError, match="Start a new run"):
         load_run_record(record_path)
+    assert record_path.read_bytes() == old_contents
+    assert result.run_dir.is_dir()
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
@@ -380,7 +401,7 @@ def test_record_schema_metadata_uses_current_supported_formats(tmp_path):
         result.run_dir.joinpath("baseline.json").read_text(encoding="utf-8")
     )
 
-    assert run_data["schema_version"] == 4
+    assert run_data["schema_version"] == 5
     assert run_data["format"] == RUN_RECORD_FORMAT
     assert baseline_data["schema_version"] == 2
     assert baseline_data["format"] == BASELINE_RECORD_FORMAT
@@ -401,7 +422,7 @@ def test_correction_round_and_maximum_are_persisted(tmp_path):
     data = json.loads(result.run_dir.joinpath("run.json").read_text(encoding="utf-8"))
 
     assert data["current_correction_round"] == 0
-    assert data["resolved_config"]["max_correction_rounds"] == 7
+    assert data["resolved_policy"]["verification"]["max_correction_rounds"] == 7
     assert data["current_review_round"] == 0
     assert "last_completed_state" not in data
     assert data["terminal_reason"] is None
@@ -426,14 +447,17 @@ def test_codex_execution_config_is_persisted_in_run_record(tmp_path):
     )
     data = json.loads(result.run_dir.joinpath("run.json").read_text(encoding="utf-8"))
 
-    assert data["resolved_config"]["codex"]["model"] == "configured-model"
-    assert data["resolved_config"]["codex"]["reasoning_effort"] == "high"
-    assert load_run_record(result.run_dir / "run.json").codex.model == (
-        "configured-model"
+    payload = data["resolved_policy"]["providers"]["codex-cli"]["payload"]
+    assert payload["model"] == "configured-model"
+    assert payload["reasoning_effort"] == "high"
+    loaded_payload = (
+        load_run_record(result.run_dir / "run.json")
+        .resolved_policy.provider_policies[0]
+        .payload()
     )
-    assert load_run_record(result.run_dir / "run.json").codex.reasoning_effort == (
-        "high"
-    )
+    assert isinstance(loaded_payload, dict)
+    assert loaded_payload["model"] == "configured-model"
+    assert loaded_payload["reasoning_effort"] == "high"
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
@@ -461,22 +485,24 @@ def test_run_record_persists_one_complete_resolved_execution_snapshot(tmp_path):
         clock=fixed_clock,
     )
     data = json.loads(result.run_dir.joinpath("run.json").read_text(encoding="utf-8"))
-    resolved = data["resolved_config"]
+    resolved = data["resolved_policy"]
 
-    assert set(data) >= {"resolved_config", "run_id", "state"}
+    assert set(data) >= {"resolved_policy", "run_id", "state"}
     assert "codex" not in data
     assert "max_correction_rounds" not in data
-    assert resolved["target_repository_path"] == str(repo.resolve())
-    assert resolved["protected_branches"] == ["main", "release"]
-    assert resolved["codex"]["model"] == "resolved-model"
-    assert resolved["codex"]["reasoning_effort"] == "high"
-    assert Path(resolved["codex"]["executable"]).is_absolute()
-    assert resolved["codex"]["cli_version"]
-    assert resolved["codex"]["ephemeral"] is True
-    assert resolved["sandbox_policy"] == {
-        "implementation": "workspace-write",
-        "review": "read-only",
-    }
+    assert resolved["target_repository"]["path"] == str(repo.resolve())
+    assert resolved["target_repository"]["protected_branches"] == ["main", "release"]
+    assert set(resolved["tasks"]) == {"implementation", "review", "correction"}
+    assert {task["provider_id"] for task in resolved["tasks"].values()} == {"codex-cli"}
+    provider = resolved["providers"]["codex-cli"]
+    assert provider["provider_id"] == "codex-cli"
+    assert provider["adapter_policy_version"] == "1"
+    assert provider["declared_capabilities"]
+    assert provider["payload"]["model"] == "resolved-model"
+    assert provider["payload"]["reasoning_effort"] == "high"
+    assert Path(provider["payload"]["executable"]).is_absolute()
+    assert provider["payload"]["cli_version"]
+    assert provider["payload"]["ephemeral"] is True
     assert resolved["verification"]["commands"] == [
         {
             "name": "targeted tests",
@@ -484,15 +510,14 @@ def test_run_record_persists_one_complete_resolved_execution_snapshot(tmp_path):
             "timeout_seconds": 91,
         }
     ]
-    assert resolved["max_correction_rounds"] == 2
+    assert resolved["verification"]["max_correction_rounds"] == 2
     assert resolved["ticket_automation"]["version"]
-    assert resolved["prompt_schema_versions"]
+    assert resolved["ticket_automation"]["source"]
+    assert resolved["policy_assets"]
     assert all(
         isinstance(identifier, str) and isinstance(digest, str) and len(digest) == 64
-        for identifier, digest in resolved["prompt_schema_versions"].items()
+        for identifier, digest in resolved["policy_assets"].items()
     )
-    loaded = load_run_record(result.run_dir / "run.json")
-    assert loaded.resolved_config.runtime_compatibility_problem() is None
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
@@ -514,32 +539,32 @@ def test_composition_rejects_executable_without_ephemeral_support(tmp_path):
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
-        (lambda data: data.pop("resolved_config"), "resolved_config must be an object"),
+        (lambda data: data.pop("resolved_policy"), "resolved_policy must be an object"),
         (
-            lambda data: data["resolved_config"]["codex"].update(
-                {"reasoning_effort": "unsupported"}
+            lambda data: data["resolved_policy"]["tasks"]["review"].update(
+                {"repository_access": "workspace-write"}
             ),
-            "Codex execution settings are invalid",
+            "task requirements are incompatible: review",
         ),
         (
-            lambda data: data["resolved_config"]["codex"].update({"ephemeral": False}),
-            "requires ephemeral",
+            lambda data: data["resolved_policy"]["providers"].pop("codex-cli"),
+            "providers must contain at least one provider",
         ),
         (
-            lambda data: data["resolved_config"]["sandbox_policy"].update(
-                {"implementation": "read-only"}
+            lambda data: data["resolved_policy"]["tasks"]["implementation"].update(
+                {"provider_id": "unknown"}
             ),
-            "implementation sandbox is incompatible",
+            "providers must exactly match task assignments",
         ),
         (
-            lambda data: data["resolved_config"]["codex"].update(
-                {"executable": "target/bin/codex"}
+            lambda data: data["resolved_policy"]["target_repository"].update(
+                {"path": "target/repository"}
             ),
-            "codex.executable must be absolute",
+            "target_repository.path must be absolute",
         ),
     ],
 )
-def test_run_record_rejects_missing_or_incompatible_resolved_config(
+def test_run_record_rejects_missing_or_incompatible_resolved_policy(
     tmp_path,
     mutate,
     message,
@@ -810,7 +835,7 @@ def trusted_run_record(state: WorkflowState) -> RunRecord:
             "baseline_sha": "abc123",
             "current_correction_round": 0,
             "current_review_round": 0,
-            "resolved_config": trusted_resolved_config(),
+            "resolved_policy": trusted_resolved_policy(),
             "terminal_reason": None if stop_reason is None else stop_reason.message,
             "stop_reason": (
                 None
@@ -827,17 +852,95 @@ def trusted_run_record(state: WorkflowState) -> RunRecord:
     )
 
 
-def trusted_resolved_config() -> dict[str, object]:
+def trusted_resolved_policy() -> dict[str, object]:
+    digest = "0" * 64
+    declared = [
+        "diagnostic-artifact-capture",
+        "isolated-invocation",
+        "network-policy-control",
+        "read-only-execution",
+        "structured-result",
+        "workspace-write-execution",
+    ]
+    shared = [
+        "diagnostic-artifact-capture",
+        "isolated-invocation",
+        "network-policy-control",
+        "structured-result",
+    ]
+    return {
+        "schema_version": RESOLVED_RUN_POLICY_SCHEMA_VERSION,
+        "target_repository": {
+            "path": "C:/trusted/repository",
+            "protected_branches": ["main"],
+        },
+        "tasks": {
+            "implementation": {
+                "provider_id": "codex-cli",
+                "repository_access": "workspace-write",
+                "required_capabilities": sorted([*shared, "workspace-write-execution"]),
+            },
+            "review": {
+                "provider_id": "codex-cli",
+                "repository_access": "read-only",
+                "required_capabilities": sorted([*shared, "read-only-execution"]),
+            },
+            "correction": {
+                "provider_id": "codex-cli",
+                "repository_access": "workspace-write",
+                "required_capabilities": sorted([*shared, "workspace-write-execution"]),
+            },
+        },
+        "providers": {
+            "codex-cli": {
+                "provider_id": "codex-cli",
+                "adapter_policy_version": "1",
+                "declared_capabilities": declared,
+                "payload": {
+                    "model": "test-model",
+                    "reasoning_effort": "high",
+                    "executable": "C:/trusted/codex",
+                    "cli_version": "test-codex 1.0",
+                    "ephemeral": True,
+                },
+            }
+        },
+        "verification": {
+            "commands": [
+                {
+                    "name": "tests",
+                    "argv": ["python", "-m", "pytest"],
+                    "timeout_seconds": 1800,
+                }
+            ],
+            "max_correction_rounds": 3,
+        },
+        "ticket_automation": {
+            "package": "ticket-automation",
+            "version": "0.1.0",
+            "source": {"kind": "installed-package", "revision": None},
+        },
+        "policy_assets": {
+            "prompt.implementation": digest,
+            "prompt.correction": digest,
+            "prompt.review": digest,
+            "result-contract.implementation": digest,
+            "result-contract.review": digest,
+        },
+    }
+
+
+def representative_old_resolved_config() -> dict[str, object]:
     digest = "0" * 64
     return {
-        "schema_version": RESOLVED_RUN_CONFIG_SCHEMA_VERSION,
-        "target_repository_path": "C:/trusted/repository",
+        "schema_version": 1,
+        "target_repository_path": "C:/old/repository",
         "protected_branches": ["main"],
         "codex": {
-            "model": "test-model",
+            "model": "old-model",
             "reasoning_effort": "high",
-            "executable": "C:/trusted/codex",
-            "cli_version": "test-codex 1.0",
+            "executable": "C:/old/codex.exe",
+            "cli_version": "old-codex 1.0",
             "ephemeral": True,
         },
         "sandbox_policy": {
@@ -853,11 +956,11 @@ def trusted_resolved_config() -> dict[str, object]:
                 }
             ]
         },
-        "max_correction_rounds": 3,
+        "max_correction_rounds": 1,
         "ticket_automation": {
             "package": "ticket-automation",
             "version": "0.1.0",
-            "git_sha": None,
+            "git_sha": "0" * 40,
         },
         "prompt_schema_versions": {
             "implementation_prompt": digest,

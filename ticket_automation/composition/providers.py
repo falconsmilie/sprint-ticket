@@ -23,13 +23,19 @@ from ..application.ports.preflight import (
     PreflightResult,
     PreflightStatus,
 )
-from ..config import AgentSettings, ConfigError
+from ..config import AgentSettings, AppConfig, ConfigError
+from ..resolved_config import (
+    ResolvedRunPolicy,
+    ResolvedRunPolicyError,
+    resolve_run_policy,
+)
 
 
 class ProviderRegistration(Protocol):
     """Composition operations every explicitly registered provider supplies."""
 
     provider_id: ProviderId
+    policy_version: str
     capabilities: frozenset[AgentCapability]
 
     def resolve_settings(
@@ -47,6 +53,10 @@ class ProviderRegistration(Protocol):
     ) -> tuple[PreflightCheck, ...]: ...
 
     def resolve_run_policy(self, settings: object) -> object: ...
+
+    def encode_run_policy(self, policy: object) -> object: ...
+
+    def decode_run_policy(self, payload: object) -> object: ...
 
     def runtime_compatibility_problem(self, policy: object) -> str | None: ...
 
@@ -92,7 +102,9 @@ class PreparedAgentProviders:
                     f"Configured task assignments for provider {provider_id} do not "
                     "match the prepared assignment map."
                 )
-        object.__setattr__(self, "assignments", MappingProxyType(dict(self.assignments)))
+        object.__setattr__(
+            self, "assignments", MappingProxyType(dict(self.assignments))
+        )
         object.__setattr__(self, "providers", MappingProxyType(dict(self.providers)))
 
     def run_preflight(self, *, repository_path: Path) -> PreflightResult:
@@ -123,54 +135,111 @@ class PreparedAgentProviders:
                 )
         return PreflightResult(tuple(checks))
 
-    def compose_for_run(self) -> ComposedAgents:
-        executors: dict[ProviderId, AgentExecutor] = {}
+    def resolve_run_policy(
+        self,
+        config: AppConfig,
+        *,
+        target_repository_path: Path,
+    ) -> ResolvedRunPolicy:
+        """Resolve the complete immutable policy before a run is created."""
+
+        if not isinstance(config, AppConfig):
+            raise ConfigError("Run policy configuration has the wrong type.")
+
         policies: dict[ProviderId, object] = {}
         for provider_id, configured in self.providers.items():
             try:
                 policy = configured.registration.resolve_run_policy(configured.settings)
                 _validate_immutable_policy(policy, provider_id=provider_id)
-                problem = configured.registration.runtime_compatibility_problem(policy)
-                if problem is not None:
-                    raise ConfigError(
-                        f"Provider {provider_id} is incompatible with the current "
-                        f"run policy: {problem}"
-                    )
-                executor = configured.registration.create_executor(policy)
             except ConfigError:
                 raise
             except (OSError, RuntimeError, TypeError, ValueError) as error:
                 raise ConfigError(
-                    f"Could not compose provider {provider_id}: {error}"
+                    f"Could not resolve run policy for provider {provider_id}: {error}"
                 ) from error
             policies[provider_id] = policy
-            executors[provider_id] = executor
+        registrations = {
+            provider_id: configured.registration
+            for provider_id, configured in self.providers.items()
+        }
+        return resolve_run_policy(
+            config,
+            target_repository_path=target_repository_path,
+            assignments=self.assignments,
+            provider_policies=policies,
+            provider_registrations=registrations,
+        )
 
-        return ComposedAgents(
-            executors=AgentExecutorAssignments(
-                implementation=executors[
-                    self.assignments[AgentTaskKind.IMPLEMENTATION]
-                ],
-                review=executors[self.assignments[AgentTaskKind.REVIEW]],
-                correction=executors[self.assignments[AgentTaskKind.CORRECTION]],
-            ),
-            policies=MappingProxyType(policies),
+    def compatibility_problem(self, resolved_policy: object) -> str | None:
+        if not isinstance(resolved_policy, ResolvedRunPolicy):
+            return "Persisted run policy has the wrong type."
+        return resolved_policy.runtime_compatibility_problem(
+            {
+                provider_id: configured.registration
+                for provider_id, configured in self.providers.items()
+            }
+        )
+
+    def create_executors(self, resolved_policy: object) -> AgentExecutorAssignments:
+        return _compose_persisted_agents(
+            resolved_policy,
+            registry={
+                provider_id: configured.registration
+                for provider_id, configured in self.providers.items()
+            },
         )
 
 
 @dataclass(frozen=True)
-class ComposedAgents:
-    executors: AgentExecutorAssignments
-    policies: Mapping[ProviderId, object]
+class RegisteredProviderExecutorFactory:
+    """Executor factory backed by the statically composed provider registry."""
+
+    registry: Mapping[ProviderId, ProviderRegistration]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.executors, AgentExecutorAssignments):
-            raise ConfigError("Composed executors must be AgentExecutorAssignments.")
-        for provider_id, policy in self.policies.items():
-            if not isinstance(provider_id, ProviderId):
-                raise ConfigError("Composed policy keys must be ProviderId values.")
-            _validate_immutable_policy(policy, provider_id=provider_id)
-        object.__setattr__(self, "policies", MappingProxyType(dict(self.policies)))
+        object.__setattr__(self, "registry", MappingProxyType(dict(self.registry)))
+
+    def compatibility_problem(self, resolved_policy: object) -> str | None:
+        if not isinstance(resolved_policy, ResolvedRunPolicy):
+            return "Persisted run policy has the wrong type."
+        return resolved_policy.runtime_compatibility_problem(self.registry)
+
+    def create_executors(self, resolved_policy: object) -> AgentExecutorAssignments:
+        return _compose_persisted_agents(resolved_policy, registry=self.registry)
+
+
+def _compose_persisted_agents(
+    resolved_policy: object,
+    *,
+    registry: Mapping[ProviderId, ProviderRegistration],
+) -> AgentExecutorAssignments:
+    """Recreate executors exclusively from a persisted resolved-run policy."""
+
+    if not isinstance(resolved_policy, ResolvedRunPolicy):
+        raise ConfigError("Persisted run policy has the wrong type.")
+    try:
+        policies = resolved_policy.restore_provider_policies(registry)
+    except ResolvedRunPolicyError as error:
+        raise ConfigError(str(error)) from error
+    executors: dict[ProviderId, AgentExecutor] = {}
+    for persisted in resolved_policy.provider_policies:
+        registration = registry[persisted.provider_id]
+        try:
+            policy = policies[persisted.provider_id]
+            _validate_immutable_policy(policy, provider_id=persisted.provider_id)
+            executors[persisted.provider_id] = registration.create_executor(policy)
+        except ConfigError:
+            raise
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            raise ConfigError(
+                f"Could not restore provider {persisted.provider_id}: {error}"
+            ) from error
+    assignments = resolved_policy.assignments
+    return AgentExecutorAssignments(
+        implementation=executors[assignments[AgentTaskKind.IMPLEMENTATION]],
+        review=executors[assignments[AgentTaskKind.REVIEW]],
+        correction=executors[assignments[AgentTaskKind.CORRECTION]],
+    )
 
 
 def prepare_agent_providers(

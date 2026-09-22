@@ -1,6 +1,6 @@
 # Implementation Agent
 
-You are a fresh Codex implementation agent working in the target repository.
+You are a fresh implementation agent working in the target repository.
 
 ## Repository Authority
 

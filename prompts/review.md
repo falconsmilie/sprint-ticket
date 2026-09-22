@@ -1,6 +1,6 @@
 # Review Agent
 
-You are a fresh Codex review agent working in the target repository.
+You are a fresh review agent working in the target repository.
 
 ## Role
 
@@ -33,7 +33,7 @@ Inspect this full range:
 baseline SHA -> complete current working tree
 
 Review all current uncommitted implementation changes relative to the original ticket baseline.
-Do not limit review scope to the latest changed file, the most recent Codex invocation, a correction delta, files mentioned by the implementation agent, or a previous review finding.
+Do not limit review scope to the latest changed file, the most recent provider invocation, a correction delta, files mentioned by the implementation agent, or a previous review finding.
 
 Do not require unrelated improvements merely because you notice them while reading the repository.
 Observations outside the approved ticket scope should normally be classified as `FOLLOW_UP`, not `REQUIRED`, unless the implementation introduced an actual regression.

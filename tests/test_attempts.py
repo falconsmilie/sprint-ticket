@@ -13,6 +13,7 @@ from tests.helpers import (
     create_trusted_prepared_run,
     make_agent_executors,
     make_config,
+    make_resume_agent_executor_factory,
 )
 from ticket_automation.application.agent_execution import (
     IMPLEMENTATION_RESULT_CONTRACT,
@@ -375,10 +376,11 @@ def test_resume_requires_human_inspection_for_invalid_attempt_evidence(
     baseline_attempt.path.write_text(json.dumps(data), encoding="utf-8")
 
     result = resume_ticket_lifecycle(
-        config,
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
-        agent_executor_factory=lambda: make_agent_executors(config),
+        agent_executor_factory=make_resume_agent_executor_factory(
+            make_agent_executors(config).implementation
+        ),
         clock=fixed_clock,
     )
 

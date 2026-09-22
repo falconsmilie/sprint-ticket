@@ -39,6 +39,7 @@ class CodexCliRunPolicy:
 
 class CodexCliProviderRegistration:
     provider_id: ProviderId = PROVIDER_ID
+    policy_version = "1"
     capabilities: frozenset[AgentCapability] = CAPABILITIES
 
     def resolve_settings(
@@ -158,6 +159,52 @@ class CodexCliProviderRegistration:
             return "Codex CLI no longer supports required --ephemeral mode."
         return None
 
+    def encode_run_policy(self, policy: object) -> object:
+        resolved = _run_policy(policy)
+        return {
+            "executable": str(resolved.executable),
+            "model": resolved.model,
+            "reasoning_effort": resolved.reasoning_effort,
+            "cli_version": resolved.cli_version,
+            "ephemeral": True,
+        }
+
+    def decode_run_policy(self, payload: object) -> CodexCliRunPolicy:
+        if not isinstance(payload, dict):
+            raise CodexSettingsError("Codex CLI resolved payload must be an object.")
+        expected = {
+            "executable",
+            "model",
+            "reasoning_effort",
+            "cli_version",
+            "ephemeral",
+        }
+        if set(payload) != expected:
+            raise CodexSettingsError(
+                "Codex CLI resolved payload fields are incomplete or unsupported."
+            )
+        if payload.get("ephemeral") is not True:
+            raise CodexSettingsError(
+                "Codex CLI resolved payload requires ephemeral invocation."
+            )
+        executable = Path(_payload_string(payload, "executable"))
+        if not executable.is_absolute():
+            raise CodexSettingsError(
+                "Codex CLI resolved executable must be an absolute path."
+            )
+        execution = validate_codex_execution_settings(
+            CodexExecutionSettings(
+                model=_payload_string(payload, "model"),
+                reasoning_effort=_payload_string(payload, "reasoning_effort"),
+            )
+        )
+        return CodexCliRunPolicy(
+            executable=executable,
+            model=execution.model,
+            reasoning_effort=execution.reasoning_effort,
+            cli_version=_payload_string(payload, "cli_version"),
+        )
+
     def create_executor(self, policy: object) -> AgentExecutor:
         resolved = _run_policy(policy)
         return CodexCliAgentExecutor(
@@ -185,6 +232,15 @@ def _run_policy(policy: object) -> CodexCliRunPolicy:
 def _non_empty(value: object, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise CodexSettingsError(f"Missing required non-empty string: {name}.")
+    return value.strip()
+
+
+def _payload_string(payload: Mapping[str, object], key: str) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise CodexSettingsError(
+            f"Codex CLI resolved payload field must be a non-empty string: {key}."
+        )
     return value.strip()
 
 

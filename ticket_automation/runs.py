@@ -24,14 +24,12 @@ from .models import (
     _validate_workflow_transition,
 )
 from .preflight import PreflightResult, run_preflight
-from .providers.codex_cli.settings import CodexExecutionSettings
 from .resolved_config import (
-    ResolvedRunConfig,
-    ResolvedRunConfigError,
-    resolve_run_config,
+    ResolvedRunPolicy,
+    ResolvedRunPolicyError,
 )
 
-RUN_SCHEMA_VERSION = 4
+RUN_SCHEMA_VERSION = 5
 BASELINE_SCHEMA_VERSION = 2
 RUN_RECORD_FORMAT = "ticket_automation.run"
 BASELINE_RECORD_FORMAT = "ticket_automation.baseline"
@@ -168,7 +166,7 @@ class RunRecord:
     baseline_sha: str
     current_correction_round: int
     current_review_round: int
-    resolved_config: ResolvedRunConfig
+    resolved_policy: ResolvedRunPolicy
     terminal_reason: str | None
     stop_reason: StopReason | None
     created_timestamp: str
@@ -178,19 +176,31 @@ class RunRecord:
 
     @property
     def target_repository_path(self) -> str:
-        return self.resolved_config.target_repository_path
+        return self.resolved_policy.target_repository_path
 
     @property
     def max_correction_rounds(self) -> int:
-        return self.resolved_config.max_correction_rounds
-
-    @property
-    def codex(self) -> CodexExecutionSettings:
-        return self.resolved_config.codex_execution
+        return self.resolved_policy.max_correction_rounds
 
     def __post_init__(self) -> None:
         """Keep terminal stop evidence inseparable from terminal failure state."""
 
+        if (
+            not isinstance(self.schema_version, int)
+            or isinstance(self.schema_version, bool)
+            or self.schema_version != RUN_SCHEMA_VERSION
+        ):
+            raise ValueError(
+                "Unsupported run record schema version: "
+                f"{self.schema_version}; expected {RUN_SCHEMA_VERSION}. Start a new run."
+            )
+        if self.format != RUN_RECORD_FORMAT:
+            raise ValueError(
+                f"Unsupported run record format: {self.format!r}; "
+                f"expected {RUN_RECORD_FORMAT!r}."
+            )
+        if not isinstance(self.resolved_policy, ResolvedRunPolicy):
+            raise TypeError("Run record requires a ResolvedRunPolicy.")
         is_failure_stop = self.state in {
             WorkflowState.HUMAN_REQUIRED,
             WorkflowState.FAILED,
@@ -252,7 +262,7 @@ class RunRecord:
             "baseline_sha": self.baseline_sha,
             "current_correction_round": self.current_correction_round,
             "current_review_round": self.current_review_round,
-            "resolved_config": self.resolved_config.to_dict(),
+            "resolved_policy": self.resolved_policy.to_dict(),
             "terminal_reason": self.terminal_reason,
             "stop_reason": (
                 None
@@ -295,15 +305,15 @@ class RunRecord:
                     "current_review_round",
                     default=0,
                 ),
-                resolved_config=ResolvedRunConfig.from_dict(
-                    data.get("resolved_config")
+                resolved_policy=ResolvedRunPolicy.from_dict(
+                    data.get("resolved_policy")
                 ),
                 terminal_reason=_optional_nullable_string(data, "terminal_reason"),
                 stop_reason=_optional_stop_reason(data),
                 created_timestamp=_require_string(data, "created_timestamp"),
                 updated_timestamp=_require_string(data, "updated_timestamp"),
             )
-        except (TypeError, ValueError, ResolvedRunConfigError) as error:
+        except (TypeError, ValueError, ResolvedRunPolicyError) as error:
             raise RunError(f"Invalid run record: {error}") from error
 
 
@@ -321,7 +331,7 @@ def create_run_snapshot(
     *,
     runs_dir: Path | str,
     provider_preflight: ProviderPreflight,
-    provider_policy: object,
+    resolved_policy: ResolvedRunPolicy,
     clock: Callable[[], datetime] | None = None,
 ) -> RunCreationResult:
     source_ticket = _read_ticket(ticket_path)
@@ -340,16 +350,7 @@ def create_run_snapshot(
             config.verification.commands
         ),
     )
-    try:
-        resolved_config = resolve_run_config(
-            config,
-            target_repository_path=baseline_record.repository_path,
-            provider_policy=provider_policy,
-        )
-    except ResolvedRunConfigError as error:
-        raise RunError(
-            f"Could not resolve immutable run configuration: {error}"
-        ) from error
+    _validate_new_run_policy(config, baseline_record, resolved_policy)
     ticket_id = sanitize_ticket_id(source_ticket.path.stem)
     run_id, run_dir = _reserve_run_directory(Path(runs_dir), timestamp, ticket_id)
     run_ticket_path = run_dir / RUN_TICKET_FILE
@@ -367,7 +368,7 @@ def create_run_snapshot(
             baseline_sha=baseline_record.head_sha,
             current_correction_round=0,
             current_review_round=0,
-            resolved_config=resolved_config,
+            resolved_policy=resolved_policy,
             terminal_reason=None,
             stop_reason=None,
             created_timestamp=timestamp,
@@ -388,6 +389,36 @@ def create_run_snapshot(
         baseline_record=baseline_record,
         preflight_result=preflight_result,
     )
+
+
+def _validate_new_run_policy(
+    config: AppConfig,
+    baseline_record: BaselineRecord,
+    resolved_policy: ResolvedRunPolicy,
+) -> None:
+    if not isinstance(resolved_policy, ResolvedRunPolicy):
+        raise RunError("Resolved run policy has the wrong type.")
+    expected_repository = str(Path(baseline_record.repository_path).resolve())
+    mismatches: list[str] = []
+    if (
+        str(Path(resolved_policy.target_repository_path).resolve())
+        != expected_repository
+    ):
+        mismatches.append("target repository")
+    if resolved_policy.protected_branches != config.project.protected_branches:
+        mismatches.append("protected branches")
+    if resolved_policy.verification_commands != config.verification.commands:
+        mismatches.append("verification commands")
+    if resolved_policy.max_correction_rounds != config.runner.max_correction_rounds:
+        mismatches.append("correction limit")
+    if resolved_policy.assignments != config.agents.assignments:
+        mismatches.append("provider assignments")
+    if mismatches:
+        raise RunError(
+            "Resolved run policy does not match the run configuration: "
+            + ", ".join(mismatches)
+            + "."
+        )
 
 
 def sanitize_ticket_id(value: str) -> str:

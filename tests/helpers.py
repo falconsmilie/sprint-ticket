@@ -16,6 +16,7 @@ from ticket_automation.application.agent_execution import (
     AgentTaskKind,
 )
 from ticket_automation.composition import prepare_production_agents
+from ticket_automation.composition.providers import RegisteredProviderExecutorFactory
 from ticket_automation.config import (
     AgentSettings,
     AppConfig,
@@ -29,6 +30,9 @@ from ticket_automation.providers.codex_cli import (
     DEFAULT_CODEX_REASONING_EFFORT,
     CodexCliAgentExecutor,
     CodexSettings,
+)
+from ticket_automation.providers.codex_cli.composition import (
+    CodexCliProviderRegistration,
 )
 from ticket_automation.providers.codex_cli.identity import PROVIDER_ID
 
@@ -245,7 +249,7 @@ def write_path_executable(directory: Path, *, name: str = "codex") -> Path:
     if os.name == "nt":
         executable = directory / f"{name}.CMD"
         executable.write_text(
-            "@echo off\nif \"%1\"==\"exec\" echo --ephemeral\nexit /b 0\n",
+            '@echo off\nif "%1"=="exec" echo --ephemeral\nexit /b 0\n',
             encoding="utf-8",
         )
         return executable
@@ -369,13 +373,29 @@ def make_agent_executors(
     )
 
 
+class _TestCodexRegistration(CodexCliProviderRegistration):
+    def __init__(self, executor):
+        self._executor = executor
+
+    def create_executor(self, policy):
+        self.decode_run_policy(self.encode_run_policy(policy))
+        return self._executor
+
+
+def make_resume_agent_executor_factory(agent_executor):
+    """Build the executor factory used to restore a persisted test run."""
+
+    return RegisteredProviderExecutorFactory(
+        {PROVIDER_ID: _TestCodexRegistration(agent_executor)}
+    )
+
+
 def make_run_dependencies(
     config: AppConfig, *, process_runner=None, agent_executor=None
 ) -> dict[str, object]:
     """Construct the explicit provider dependencies required by a new run."""
 
     prepared = prepare_production_agents(config)
-    composed = prepared.compose_for_run()
     executors = (
         AgentExecutorAssignments(
             implementation=agent_executor,
@@ -385,10 +405,15 @@ def make_run_dependencies(
         if agent_executor is not None
         else make_agent_executors(config, process_runner=process_runner)
     )
+    factory = make_resume_agent_executor_factory(executors.implementation)
+    resolved_policy = prepared.resolve_run_policy(
+        config,
+        target_repository_path=config.project.repo,
+    )
     return {
-        "agent_executors": executors,
         "provider_preflight": prepared.run_preflight,
-        "provider_policy": composed.policies[PROVIDER_ID],
+        "resolved_policy": resolved_policy,
+        "agent_executor_factory": factory,
     }
 
 
@@ -402,13 +427,16 @@ def create_test_run_snapshot(
     from ticket_automation.runs import create_run_snapshot
 
     prepared = prepare_production_agents(config)
-    composed = prepared.compose_for_run()
+    resolved_policy = prepared.resolve_run_policy(
+        config,
+        target_repository_path=config.project.repo,
+    )
     return create_run_snapshot(
         config,
         ticket_path,
         runs_dir=runs_dir,
         provider_preflight=prepared.run_preflight,
-        provider_policy=composed.policies[PROVIDER_ID],
+        resolved_policy=resolved_policy,
         clock=clock,
     )
 

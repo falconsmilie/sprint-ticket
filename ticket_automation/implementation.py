@@ -41,7 +41,7 @@ from .models import (
     StopCategory,
     WorkflowState,
 )
-from .resolved_config import config_from_resolved_run_config
+from .resolved_config import config_from_resolved_run_policy
 from .runs import (
     BASELINE_RECORD_FILE,
     RUN_RECORD_FILE,
@@ -116,7 +116,7 @@ def run_implementation_stage(
     run_path = Path(run_dir)
     run_record = load_run_record(run_path / RUN_RECORD_FILE)
     # Existing runs execute exclusively from the policy captured in run.json.
-    config = config_from_resolved_run_config(run_record.resolved_config)
+    config = config_from_resolved_run_policy(run_record.resolved_policy)
     if run_record.state != WorkflowState.IMPLEMENTING:
         raise ImplementationError(
             "Implementation requires run state IMPLEMENTING; "

@@ -18,6 +18,7 @@ from tests.helpers import (
     create_test_run_snapshot,
     make_agent_executors,
     make_config,
+    make_resume_agent_executor_factory,
     make_run_dependencies,
 )
 from ticket_automation.config import VerificationCommand
@@ -225,7 +226,10 @@ def test_direct_lifecycle_dispatches_codex_preflight(tmp_path):
             **make_run_dependencies(config),
         )
 
-    assert any("Provider codex-cli" in check.name for check in raised.value.result.failed_checks)
+    assert any(
+        "Provider codex-cli" in check.name
+        for check in raised.value.result.failed_checks
+    )
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for locking tests")
@@ -257,16 +261,19 @@ def test_invalid_ticket_is_rejected_before_provider_preflight(tmp_path):
 def test_second_resume_against_same_repository_is_blocked(tmp_path):
     repo, ticket, config = workflow_inputs(tmp_path)
     runs_dir = tmp_path / "runs"
-    snapshot = create_test_run_snapshot(config, ticket, runs_dir=runs_dir, clock=fixed_clock)
+    snapshot = create_test_run_snapshot(
+        config, ticket, runs_dir=runs_dir, clock=fixed_clock
+    )
     holder = start_lock_holder(repo, run_id="owner-run", state="VERIFYING")
     try:
         with pytest.raises(RepositoryLockError) as raised:
             resume_ticket_lifecycle(
-                config,
                 snapshot.run_record.run_id,
                 runs_dir=runs_dir,
-                agent_executor_factory=lambda: make_agent_executors(
-                    config, process_runner=SequencedCodexRunner([])
+                agent_executor_factory=make_resume_agent_executor_factory(
+                    make_agent_executors(
+                        config, process_runner=SequencedCodexRunner([])
+                    ).implementation
                 ),
                 verification_runner=PassingVerificationRunner(),
                 clock=fixed_clock,
@@ -450,9 +457,7 @@ def test_lock_releases_after_preflight_failure(tmp_path):
             config,
             ticket,
             runs_dir=runs_dir,
-            **make_run_dependencies(
-                config, process_runner=SequencedCodexRunner([])
-            ),
+            **make_run_dependencies(config, process_runner=SequencedCodexRunner([])),
             verification_runner=PassingVerificationRunner(),
             clock=fixed_clock,
         )

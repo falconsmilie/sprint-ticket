@@ -52,7 +52,7 @@ from .models import (
     StageOutcome,
     WorkflowState,
 )
-from .resolved_config import config_from_resolved_run_config
+from .resolved_config import config_from_resolved_run_policy
 from .runs import (
     BASELINE_RECORD_FILE,
     RUN_RECORD_FILE,
@@ -119,7 +119,7 @@ def run_review_stage(
     run_record_path = run_path / RUN_RECORD_FILE
     run_record = load_run_record(run_record_path)
     # A later local configuration cannot select a different review invocation.
-    config = config_from_resolved_run_config(run_record.resolved_config)
+    config = config_from_resolved_run_policy(run_record.resolved_policy)
     if run_record.state != WorkflowState.REVIEWING:
         raise ReviewError(
             f"Review requires run state REVIEWING; found {run_record.state.value}."

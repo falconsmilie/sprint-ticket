@@ -7,6 +7,7 @@ from pathlib import Path
 from .composition import (
     apply_codex_execution_overrides,
     prepare_production_agents,
+    production_agent_executor_factory,
 )
 from .config import (
     ConfigError,
@@ -18,7 +19,6 @@ from .preflight import format_preflight_result, run_preflight
 from .providers.codex_cli import CodexExecutionOverrides
 from .providers.codex_cli.composition import CodexCliConfiguredSettings
 from .providers.codex_cli.identity import PROVIDER_ID as CODEX_CLI_PROVIDER_ID
-from .resolved_config import config_from_resolved_run_config
 from .runs import (
     RUNS_DIR_NAME,
     RunError,
@@ -26,7 +26,6 @@ from .runs import (
     TicketInputError,
     format_status,
     list_run_records,
-    load_run_record,
 )
 from .workflow import (
     format_lifecycle_result,
@@ -137,9 +136,7 @@ def _handle_preflight(args: argparse.Namespace) -> int:
     providers = prepare_production_agents(config)
     result = run_preflight(
         config,
-        provider_result=providers.run_preflight(
-            repository_path=config.project.repo
-        ),
+        provider_result=providers.run_preflight(repository_path=config.project.repo),
     )
     print(format_preflight_result(result))
     return 0 if result.passed else 1
@@ -154,16 +151,19 @@ def _handle_run(args: argparse.Namespace) -> int:
         ),
     )
     providers = prepare_production_agents(config)
-    composed = providers.compose_for_run()
+    resolved_policy = providers.resolve_run_policy(
+        config,
+        target_repository_path=config.project.repo,
+    )
     runs_dir = args.config_dir / RUNS_DIR_NAME
     try:
         result = run_ticket_lifecycle(
             config,
             args.ticket,
             runs_dir=runs_dir,
-            agent_executors=composed.executors,
             provider_preflight=providers.run_preflight,
-            provider_policy=composed.policies[CODEX_CLI_PROVIDER_ID],
+            resolved_policy=resolved_policy,
+            agent_executor_factory=providers,
         )
     except TicketInputError as error:
         print(f"Ticket input error: {error}", file=sys.stderr)
@@ -184,9 +184,14 @@ def _handle_run(args: argparse.Namespace) -> int:
 
 def _handle_status(args: argparse.Namespace) -> int:
     runs_dir = args.config_dir / RUNS_DIR_NAME
+    try:
+        records = list_run_records(runs_dir)
+    except RunError as error:
+        print(f"Run error: {error}", file=sys.stderr)
+        return 1
     print(
         format_status(
-            list_run_records(runs_dir),
+            records,
             runs_dir=runs_dir,
             active_ownerships=active_repository_locks(),
         )
@@ -197,14 +202,10 @@ def _handle_status(args: argparse.Namespace) -> int:
 def _handle_resume(args: argparse.Namespace) -> int:
     runs_dir = args.config_dir / RUNS_DIR_NAME
     try:
-        run_record = load_run_record(runs_dir / args.run_id / "run.json")
-        config = config_from_resolved_run_config(run_record.resolved_config)
-        providers = prepare_production_agents(config)
         result = resume_ticket_lifecycle(
-            config,
             args.run_id,
             runs_dir=runs_dir,
-            agent_executor_factory=lambda: providers.compose_for_run().executors,
+            agent_executor_factory=production_agent_executor_factory(),
         )
     except RunError as error:
         print(f"Run error: {error}", file=sys.stderr)

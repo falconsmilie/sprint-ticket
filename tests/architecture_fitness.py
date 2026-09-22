@@ -462,9 +462,10 @@ def _import_violations(edge: ImportEdge) -> list[Violation]:
                 )
             )
 
-    if layer in {"application", "domain", "infrastructure", "providers"} and (
-        _targets_layer(edge, "presentation") or _targets_layer(edge, "composition")
-    ):
+    if (
+        layer in {"application", "domain", "infrastructure", "providers"}
+        or edge.importer in LEGACY_APPLICATION_MODULES
+    ) and (_targets_layer(edge, "presentation") or _targets_layer(edge, "composition")):
         violations.append(
             _edge_violation(
                 edge,

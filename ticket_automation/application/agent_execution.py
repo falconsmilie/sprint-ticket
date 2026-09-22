@@ -377,6 +377,15 @@ class AgentExecutorAssignments:
     review: AgentExecutor
     correction: AgentExecutor
 
+
+class PersistedAgentExecutorFactory(Protocol):
+    """Construct executors from an already resolved, persisted-shape policy."""
+
+    def compatibility_problem(self, resolved_policy: object) -> str | None: ...
+
+    def create_executors(self, resolved_policy: object) -> AgentExecutorAssignments: ...
+
+
 def required_execution_capabilities(
     access: RepositoryAccess,
 ) -> frozenset[AgentCapability]:
@@ -466,6 +475,7 @@ __all__ = [
     "ArtifactReference",
     "InvocationStart",
     "NetworkAccess",
+    "PersistedAgentExecutorFactory",
     "ProviderId",
     "ProviderMetadataScalar",
     "ProviderMetadataValue",

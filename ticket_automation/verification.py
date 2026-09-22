@@ -21,7 +21,7 @@ from .git import GitRepository
 from .git_safety import WorkspaceChange, WorkspaceSnapshot, workspace_safety_changes
 from .models import AttemptPhase, StageOutcome, WorkflowState
 from .process_output import decode_human_output
-from .resolved_config import config_from_resolved_run_config
+from .resolved_config import config_from_resolved_run_policy
 from .runs import (
     BASELINE_RECORD_FILE,
     RUN_RECORD_FILE,
@@ -361,7 +361,7 @@ def _run_baseline_verification_stage(
     # The baseline is part of the same immutable run contract as later
     # verification. The caller's current configuration cannot alter it.
     del config
-    config = config_from_resolved_run_config(run_record.resolved_config)
+    config = config_from_resolved_run_policy(run_record.resolved_policy)
     if run_record.state != WorkflowState.PREPARING:
         raise VerificationError("Baseline verification requires PREPARING state.")
     baseline = load_baseline_record(run_path / BASELINE_RECORD_FILE)
@@ -423,7 +423,7 @@ def run_verification_stage(
 ) -> VerificationStageResult:
     run_path = Path(run_dir)
     run_record = load_run_record(run_path / RUN_RECORD_FILE)
-    config = config_from_resolved_run_config(run_record.resolved_config)
+    config = config_from_resolved_run_policy(run_record.resolved_policy)
     if run_record.state != WorkflowState.VERIFYING:
         raise VerificationError("Verification requires VERIFYING state.")
     repository = GitRepository(Path(run_record.target_repository_path))

@@ -8,15 +8,21 @@ import pytest
 from tests.helpers import (
     GIT,
     create_git_repo,
+    create_test_run_snapshot,
+    make_config,
     run_cli,
     run_git,
     write_fake_codex_executable,
     write_preflight_config,
 )
+from ticket_automation.cli import main
 from ticket_automation.config import VerificationCommand
 from ticket_automation.providers.codex_cli import (
     DEFAULT_CODEX_MODEL,
     DEFAULT_CODEX_REASONING_EFFORT,
+)
+from ticket_automation.providers.codex_cli.composition import (
+    CodexCliProviderRegistration,
 )
 
 
@@ -132,6 +138,43 @@ def test_cli_preflight_failure_returns_nonzero(tmp_path):
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for run CLI tests")
+def test_cli_provider_composition_failure_does_not_create_a_run(
+    tmp_path, monkeypatch, capsys
+):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    repo = create_git_repo(tmp_path / "repo")
+    ticket = tmp_path / "QDEB-COMPOSE.md"
+    ticket.write_text("# Ticket\n", encoding="utf-8")
+    fake_codex = write_fake_codex_executable(tmp_path / "fake-bin")
+    write_preflight_config(config_dir, repo, codex=str(fake_codex))
+
+    def fail_executor_creation(self, policy):
+        del self, policy
+        raise RuntimeError("executor construction failed")
+
+    monkeypatch.setattr(
+        CodexCliProviderRegistration,
+        "create_executor",
+        fail_executor_creation,
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        main(
+            [
+                "--config-dir",
+                str(config_dir),
+                "run",
+                str(ticket),
+            ]
+        )
+
+    assert raised.value.code == 2
+    assert "executor construction failed" in capsys.readouterr().err
+    assert not config_dir.joinpath("runs").exists()
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for run CLI tests")
 def test_cli_run_invokes_fake_codex_and_runs_verification(tmp_path, monkeypatch):
     config_dir = tmp_path / "config"
     repo = create_git_repo(tmp_path / "repo")
@@ -182,8 +225,53 @@ def test_cli_run_invokes_fake_codex_and_runs_verification(tmp_path, monkeypatch)
     ]
     run_record_path = next(config_dir.joinpath("runs").glob("*/run.json"))
     run_record = json.loads(run_record_path.read_text(encoding="utf-8"))
-    assert run_record["resolved_config"]["codex"]["model"] == "cli-model"
-    assert run_record["resolved_config"]["codex"]["reasoning_effort"] == "high"
+    payload = run_record["resolved_policy"]["providers"]["codex-cli"]["payload"]
+    assert payload["model"] == "cli-model"
+    assert payload["reasoning_effort"] == "high"
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for run CLI tests")
+def test_cli_resume_uses_only_persisted_policy_after_local_config_changes(
+    tmp_path, monkeypatch
+):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    repo = create_git_repo(tmp_path / "repo")
+    ticket = tmp_path / "QDEB-RESUME.md"
+    ticket.write_text("# Ticket\n\nResume from stored policy.\n", encoding="utf-8")
+    fake_codex = write_fake_codex_executable(tmp_path / "fake-bin")
+    snapshot = create_test_run_snapshot(
+        make_config(
+            repo,
+            codex_executable=str(fake_codex),
+            codex_model="persisted-model",
+            codex_reasoning_effort="high",
+        ),
+        ticket,
+        runs_dir=config_dir / "runs",
+    )
+    config_dir.joinpath("config.local.toml").write_text(
+        "this is no longer valid TOML = [",
+        encoding="utf-8",
+    )
+    record_path = tmp_path / "resume-codex-record.json"
+    monkeypatch.setenv("TA_FAKE_CODEX_ACTION", "modify")
+    monkeypatch.setenv("TA_FAKE_CODEX_RECORD", str(record_path))
+
+    result = run_cli(
+        "--config-dir",
+        str(config_dir),
+        "resume",
+        snapshot.run_record.run_id,
+        cwd=config_dir,
+    )
+
+    assert result.returncode == 0
+    calls = json.loads(record_path.read_text(encoding="utf-8"))["calls"]
+    assert [option_value(tuple(call["argv"]), "--model") for call in calls] == [
+        "persisted-model",
+        "persisted-model",
+    ]
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for run CLI tests")

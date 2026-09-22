@@ -16,6 +16,7 @@ from tests.helpers import (
     make_agent_executor,
     make_agent_executors,
     make_config,
+    make_resume_agent_executor_factory,
     make_run_dependencies,
 )
 from ticket_automation.application.agent_execution import (
@@ -155,9 +156,7 @@ def test_lifecycle_writes_only_numbered_attempt_evidence(tmp_path, monkeypatch):
         _ticket(tmp_path),
         runs_dir=tmp_path / "runs",
         verification_runner=runner,
-        **make_run_dependencies(
-            config, process_runner=CompletingCodexRunner()
-        ),
+        **make_run_dependencies(config, process_runner=CompletingCodexRunner()),
         clock=fixed_clock,
     )
 
@@ -261,12 +260,13 @@ def test_resume_reruns_safe_verification_as_a_new_attempt(tmp_path, monkeypatch)
     }
 
     resumed = resume_ticket_lifecycle(
-        config,
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
         verification_runner=PassingVerificationRunner(),
-        agent_executor_factory=lambda: make_agent_executors(
-            config, process_runner=CompletingCodexRunner()
+        agent_executor_factory=make_resume_agent_executor_factory(
+            make_agent_executors(
+                config, process_runner=CompletingCodexRunner()
+            ).implementation
         ),
         clock=fixed_clock,
     )
@@ -305,16 +305,15 @@ def test_resume_checks_persisted_compatibility_before_constructing_executors(tmp
         runs_dir=tmp_path / "runs",
         clock=fixed_clock,
     )
-    Path(snapshot.run_record.resolved_config.codex_executable).unlink()
-
-    def unexpected_factory():
-        raise AssertionError("Incompatible persisted policy must stop before composition.")
+    payload = snapshot.run_record.resolved_policy.provider_policies[0].payload()
+    assert isinstance(payload, dict)
+    Path(payload["executable"]).unlink()
+    repo.joinpath("workspace-drift.txt").write_text("changed\n", encoding="utf-8")
 
     result = resume_ticket_lifecycle(
-        config,
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
-        agent_executor_factory=unexpected_factory,
+        agent_executor_factory=make_resume_agent_executor_factory(object()),
         clock=fixed_clock,
     )
 
@@ -343,16 +342,10 @@ def test_terminal_resume_does_not_construct_provider_runtime(tmp_path):
         ),
     )
     save_run_record(terminal, snapshot.run_dir / "run.json")
-    Path(terminal.resolved_config.codex_executable).unlink()
-
-    def unexpected_factory():
-        raise AssertionError("Terminal resume must not construct provider runtime.")
-
     result = resume_ticket_lifecycle(
-        config,
         terminal.run_id,
         runs_dir=tmp_path / "runs",
-        agent_executor_factory=unexpected_factory,
+        agent_executor_factory=make_resume_agent_executor_factory(object()),
         clock=fixed_clock,
     )
 
@@ -385,10 +378,11 @@ def test_interrupted_writable_state_requires_human_inspection(tmp_path):
     repo.joinpath("partial.txt").write_text("partial work\n", encoding="utf-8")
 
     result = resume_ticket_lifecycle(
-        config,
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
-        agent_executor_factory=lambda: make_agent_executors(config),
+        agent_executor_factory=make_resume_agent_executor_factory(
+            make_agent_executors(config).implementation
+        ),
         clock=fixed_clock,
     )
 
@@ -414,9 +408,7 @@ def test_reporting_renders_without_changing_controller_state(tmp_path, monkeypat
         _ticket(tmp_path),
         runs_dir=tmp_path / "runs",
         verification_runner=PassingVerificationRunner(),
-        **make_run_dependencies(
-            config, process_runner=CompletingCodexRunner()
-        ),
+        **make_run_dependencies(config, process_runner=CompletingCodexRunner()),
         clock=fixed_clock,
     )
     before = load_run_record(result.run_dir / "run.json")
@@ -447,12 +439,13 @@ def test_resume_restarts_preparation_in_a_new_attempt(tmp_path):
     )
 
     result = resume_ticket_lifecycle(
-        config,
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
         verification_runner=PassingVerificationRunner(),
-        agent_executor_factory=lambda: make_agent_executors(
-            config, process_runner=CompletingCodexRunner()
+        agent_executor_factory=make_resume_agent_executor_factory(
+            make_agent_executors(
+                config, process_runner=CompletingCodexRunner()
+            ).implementation
         ),
         clock=fixed_clock,
     )
@@ -513,12 +506,13 @@ def test_resume_restarts_review_in_a_new_attempt(tmp_path):
     )
 
     result = resume_ticket_lifecycle(
-        config,
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
         verification_runner=PassingVerificationRunner(),
-        agent_executor_factory=lambda: make_agent_executors(
-            config, process_runner=CompletingCodexRunner()
+        agent_executor_factory=make_resume_agent_executor_factory(
+            make_agent_executors(
+                config, process_runner=CompletingCodexRunner()
+            ).implementation
         ),
         clock=fixed_clock,
     )
@@ -592,12 +586,13 @@ def test_resume_restarts_reporting_in_a_new_attempt(tmp_path):
     )
 
     result = resume_ticket_lifecycle(
-        config,
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
         verification_runner=PassingVerificationRunner(),
-        agent_executor_factory=lambda: make_agent_executors(
-            config, process_runner=CompletingCodexRunner()
+        agent_executor_factory=make_resume_agent_executor_factory(
+            make_agent_executors(
+                config, process_runner=CompletingCodexRunner()
+            ).implementation
         ),
         clock=fixed_clock,
     )
@@ -628,9 +623,7 @@ def test_rendering_failure_cannot_reclassify_an_accepted_handoff(tmp_path, monke
         _ticket(tmp_path),
         runs_dir=tmp_path / "runs",
         verification_runner=PassingVerificationRunner(),
-        **make_run_dependencies(
-            config, process_runner=CompletingCodexRunner()
-        ),
+        **make_run_dependencies(config, process_runner=CompletingCodexRunner()),
         clock=fixed_clock,
     )
 

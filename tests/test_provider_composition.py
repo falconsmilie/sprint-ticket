@@ -11,18 +11,25 @@ from ticket_automation.application.agent_execution import (
     ProviderId,
 )
 from ticket_automation.composition import prepare_agent_providers
-from ticket_automation.config import AgentSettings, ConfigError
+from ticket_automation.config import (
+    AgentSettings,
+    AppConfig,
+    ConfigError,
+    ProjectSettings,
+    RunnerSettings,
+    VerificationCommand,
+    VerificationSettings,
+)
 from ticket_automation.preflight import PreflightCheck, PreflightStatus
 
 ALL_CAPABILITIES = frozenset(AgentCapability)
-READ_ONLY_CAPABILITIES = ALL_CAPABILITIES - {
-    AgentCapability.WORKSPACE_WRITE_EXECUTION
-}
+READ_ONLY_CAPABILITIES = ALL_CAPABILITIES - {AgentCapability.WORKSPACE_WRITE_EXECUTION}
 
 
 @dataclass
 class StubRegistration:
     provider_id: ProviderId
+    policy_version: str = "stub-v1"
     capabilities: frozenset[AgentCapability] = ALL_CAPABILITIES
     preflight_status: PreflightStatus = PreflightStatus.PASS
     compatibility_problem: str | None = None
@@ -46,7 +53,9 @@ class StubRegistration:
             PreflightCheck(
                 name="connection",
                 status=self.preflight_status,
-                message="unavailable" if self.preflight_status is PreflightStatus.FAIL else "",
+                message="unavailable"
+                if self.preflight_status is PreflightStatus.FAIL
+                else "",
             ),
         )
 
@@ -58,6 +67,16 @@ class StubRegistration:
     def runtime_compatibility_problem(self, policy):
         del policy
         return self.compatibility_problem
+
+    def encode_run_policy(self, policy):
+        if not isinstance(policy, StubPolicy):
+            raise TypeError("wrong stub policy type")
+        return {"provider_id": str(policy.provider_id)}
+
+    def decode_run_policy(self, payload):
+        if not isinstance(payload, dict) or set(payload) != {"provider_id"}:
+            raise ValueError("invalid stub policy payload")
+        return StubPolicy(provider_id=ProviderId(payload["provider_id"]))
 
     def create_executor(self, policy):
         del policy
@@ -92,43 +111,65 @@ class MutablePolicyRegistration(StubRegistration):
 def test_distinct_providers_are_selected_for_each_task_kind(tmp_path):
     registrations = {
         ProviderId(name): StubRegistration(ProviderId(name))
-        for name in ("implementation-provider", "review-provider", "correction-provider")
+        for name in (
+            "implementation-provider",
+            "review-provider",
+            "correction-provider",
+        )
     }
+    settings = _settings(
+        implementation="implementation-provider",
+        review="review-provider",
+        correction="correction-provider",
+    )
     prepared = prepare_agent_providers(
-        _settings(
-            implementation="implementation-provider",
-            review="review-provider",
-            correction="correction-provider",
-        ),
+        settings,
         registry=registrations,
         configuration_directory=tmp_path,
     )
-    composed = prepared.compose_for_run()
+    policy = prepared.resolve_run_policy(
+        _config(tmp_path, settings), target_repository_path=tmp_path
+    )
+    executors = prepared.create_executors(policy)
 
-    assert composed.executors.implementation is registrations[ProviderId("implementation-provider")].executor
-    assert composed.executors.review is registrations[ProviderId("review-provider")].executor
-    assert composed.executors.correction is registrations[ProviderId("correction-provider")].executor
-    assert all(registration.policy_calls == 1 for registration in registrations.values())
-    assert all(registration.executor_calls == 1 for registration in registrations.values())
+    assert (
+        executors.implementation
+        is registrations[ProviderId("implementation-provider")].executor
+    )
+    assert executors.review is registrations[ProviderId("review-provider")].executor
+    assert (
+        executors.correction
+        is registrations[ProviderId("correction-provider")].executor
+    )
+    assert all(
+        registration.policy_calls == 1 for registration in registrations.values()
+    )
+    assert all(
+        registration.executor_calls == 1 for registration in registrations.values()
+    )
 
 
 def test_shared_provider_reuses_preflight_and_executor(tmp_path):
     provider_id = ProviderId("shared")
     registration = StubRegistration(provider_id)
+    settings = _settings(implementation="shared", review="shared", correction="shared")
     prepared = prepare_agent_providers(
-        _settings(implementation="shared", review="shared", correction="shared"),
+        settings,
         registry={provider_id: registration},
         configuration_directory=tmp_path,
     )
     preflight = prepared.run_preflight(repository_path=Path("repo"))
-    composed = prepared.compose_for_run()
+    policy = prepared.resolve_run_policy(
+        _config(tmp_path, settings), target_repository_path=tmp_path
+    )
+    executors = prepared.create_executors(policy)
 
     assert preflight.passed
     assert registration.preflight_calls == 1
     assert registration.policy_calls == 1
     assert registration.executor_calls == 1
-    assert composed.executors.implementation is composed.executors.review
-    assert composed.executors.review is composed.executors.correction
+    assert executors.implementation is executors.review
+    assert executors.review is executors.correction
 
 
 def test_unassigned_provider_is_not_resolved_or_preflighted(tmp_path):
@@ -168,7 +209,9 @@ def test_read_only_provider_is_accepted_for_review(tmp_path):
     assert prepared.assignments[AgentTaskKind.REVIEW] == read_only.provider_id
 
 
-@pytest.mark.parametrize("task_kind", [AgentTaskKind.IMPLEMENTATION, AgentTaskKind.CORRECTION])
+@pytest.mark.parametrize(
+    "task_kind", [AgentTaskKind.IMPLEMENTATION, AgentTaskKind.CORRECTION]
+)
 def test_read_only_provider_is_rejected_for_writable_tasks(tmp_path, task_kind):
     full = StubRegistration(ProviderId("full"))
     read_only = StubRegistration(
@@ -193,9 +236,7 @@ def test_read_only_provider_is_rejected_for_writable_tasks(tmp_path, task_kind):
 
 def test_provider_preflight_failure_names_provider_and_assignments(tmp_path):
     provider_id = ProviderId("broken")
-    registration = StubRegistration(
-        provider_id, preflight_status=PreflightStatus.FAIL
-    )
+    registration = StubRegistration(provider_id, preflight_status=PreflightStatus.FAIL)
     prepared = prepare_agent_providers(
         _settings(implementation="broken", review="broken", correction="broken"),
         registry={provider_id: registration},
@@ -212,7 +253,9 @@ def test_provider_preflight_failure_names_provider_and_assignments(tmp_path):
 
 def test_trusted_agent_settings_require_every_assignment():
     provider_id = ProviderId("shared")
-    with pytest.raises(ConfigError, match="must contain implementation, review, and correction"):
+    with pytest.raises(
+        ConfigError, match="must contain implementation, review, and correction"
+    ):
         AgentSettings(
             assignments={AgentTaskKind.REVIEW: provider_id},
             providers={provider_id: {}},
@@ -231,7 +274,9 @@ def test_trusted_agent_settings_reject_unconfigured_assignment():
 def test_registry_key_must_match_registration_identity(tmp_path):
     configured_id = ProviderId("configured")
     registration = StubRegistration(ProviderId("different"))
-    with pytest.raises(ConfigError, match="does not match registration identity different"):
+    with pytest.raises(
+        ConfigError, match="does not match registration identity different"
+    ):
         prepare_agent_providers(
             _settings(
                 implementation="configured",
@@ -269,14 +314,19 @@ def test_provider_capabilities_must_be_typed_and_immutable(tmp_path, capabilitie
 def test_mutable_run_policy_is_rejected(tmp_path):
     provider_id = ProviderId("mutable")
     registration = MutablePolicyRegistration(provider_id)
+    settings = _settings(
+        implementation="mutable", review="mutable", correction="mutable"
+    )
     prepared = prepare_agent_providers(
-        _settings(implementation="mutable", review="mutable", correction="mutable"),
+        settings,
         registry={provider_id: registration},
         configuration_directory=tmp_path,
     )
 
     with pytest.raises(ConfigError, match="mutable run policy"):
-        prepared.compose_for_run()
+        prepared.resolve_run_policy(
+            _config(tmp_path, settings), target_repository_path=tmp_path
+        )
 
 
 def test_runtime_compatibility_problem_prevents_executor_construction(tmp_path):
@@ -285,18 +335,22 @@ def test_runtime_compatibility_problem_prevents_executor_construction(tmp_path):
         provider_id,
         compatibility_problem="adapter version changed",
     )
+    settings = _settings(
+        implementation=str(provider_id),
+        review=str(provider_id),
+        correction=str(provider_id),
+    )
     prepared = prepare_agent_providers(
-        _settings(
-            implementation=str(provider_id),
-            review=str(provider_id),
-            correction=str(provider_id),
-        ),
+        settings,
         registry={provider_id: registration},
         configuration_directory=tmp_path,
     )
+    policy = prepared.resolve_run_policy(
+        _config(tmp_path, settings), target_repository_path=tmp_path
+    )
 
     with pytest.raises(ConfigError, match="adapter version changed"):
-        prepared.compose_for_run()
+        prepared.create_executors(policy)
 
     assert registration.policy_calls == 1
     assert registration.executor_calls == 0
@@ -341,4 +395,27 @@ def _settings(*, implementation: str, review: str, correction: str) -> AgentSett
             AgentTaskKind.CORRECTION: ProviderId(correction),
         },
         providers={ProviderId(name): {} for name in names},
+    )
+
+
+def _config(repository: Path, agents: AgentSettings) -> AppConfig:
+    return AppConfig(
+        project=ProjectSettings(
+            name="provider composition",
+            repo=repository.resolve(),
+            protected_branches=("main",),
+        ),
+        runner=RunnerSettings(max_correction_rounds=1),
+        agents=agents,
+        verification=VerificationSettings(
+            commands=(
+                VerificationCommand(
+                    name="tests",
+                    argv=("python", "-m", "pytest"),
+                    timeout_seconds=30,
+                ),
+            )
+        ),
+        source_files=(),
+        configuration_directory=repository,
     )

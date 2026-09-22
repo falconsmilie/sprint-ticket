@@ -47,9 +47,12 @@ SprintTicket does not install or own pytest, ruff, pyright, or any other
 target-project verification tool. Its own development tools are in the `dev`
 dependency group.
 
-`runner.max_correction_rounds` defaults to `1`. The resolved configuration is
-persisted in `run.json`, so changing `config.local.toml` cannot change a run
-that already exists. Sandboxes are fixed by phase: implementation and
+`runner.max_correction_rounds` defaults to `1`. A versioned resolved run policy
+is persisted in `run.json`. It records all three task assignments, their access
+and capability requirements, and an adapter-owned payload for every assigned
+provider. Resume reconstructs executors only from that policy and the matching
+registered adapter, so changing `config.local.toml` cannot change a run that
+already exists. Sandboxes are fixed by phase: implementation and
 correction use `workspace-write`; verification, review, and reporting are
 read-only with respect to the target project. Workspace-write Codex calls
 enable outbound network access so implementation and correction can run
@@ -69,7 +72,7 @@ run creation. Baseline verification runs before the first writable Codex call.
 
 ## Run Model
 
-Each run has an immutable resolved configuration, a snapshotted ticket, and a
+Each run has an immutable resolved policy, a snapshotted ticket, and a
 clean Git baseline. The controller drives this explicit state machine:
 
 ```text
@@ -145,3 +148,14 @@ a person can inspect the target workspace before deciding what to do.
 Attempt records are trusted only when their sequence, phase, status, paths, and
 directory agree. Invalid attempt evidence stops resume for human inspection;
 the controller never follows an artifact path outside its own attempt.
+
+## Breaking policy schema cutover
+
+This release uses resolved-policy schema 2 and run-record schema 5. It rejects
+all earlier resolved-policy and run-record schemas. There is no legacy reader,
+migration, conversion, report fallback, or fallback to the current local
+configuration. Existing run directories are left untouched on disk.
+
+Operators must finish or discard every old active run before installing this
+release. Old run directories may be retained as files, but this release cannot
+list, report, or resume them.

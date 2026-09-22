@@ -13,7 +13,10 @@ from ._verification_artifacts import (
     _verification_commands_fingerprint,
     _VerificationArtifactError,
 )
-from .application.agent_execution import AgentExecutorAssignments
+from .application.agent_execution import (
+    AgentExecutorAssignments,
+    PersistedAgentExecutorFactory,
+)
 from .application.ports.preflight import ProviderPreflight
 from .attempts import (
     AttemptError,
@@ -26,7 +29,7 @@ from .attempts import (
     start_attempt,
 )
 from .audit import diff_including_untracked
-from .config import AppConfig
+from .config import AppConfig, ConfigError
 from .correction_planner import plan_pending_correction
 from .corrections import (
     CorrectionStageResult,
@@ -64,7 +67,7 @@ from .reporting import (
     generate_terminal_report_best_effort,
     run_report_stage,
 )
-from .resolved_config import config_from_resolved_run_config
+from .resolved_config import ResolvedRunPolicy, config_from_resolved_run_policy
 from .review import (
     ReviewStageResult,
     _validate_review_result_artifact,
@@ -132,9 +135,9 @@ def run_ticket_lifecycle(
     ticket_path: Path | str,
     *,
     runs_dir: Path | str,
-    agent_executors: AgentExecutorAssignments,
     provider_preflight: ProviderPreflight,
-    provider_policy: object,
+    resolved_policy: ResolvedRunPolicy,
+    agent_executor_factory: PersistedAgentExecutorFactory,
     verification_runner: VerificationProcessRunner | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> LifecycleResult:
@@ -149,9 +152,9 @@ def run_ticket_lifecycle(
             ticket_path,
             runs_dir=runs_dir,
             repository_lock=repository_lock,
-            agent_executor=agent_executors,
             provider_preflight=provider_preflight,
-            provider_policy=provider_policy,
+            resolved_policy=resolved_policy,
+            agent_executor_factory=agent_executor_factory,
             verification_runner=verification_runner,
             clock=clock,
         )
@@ -163,21 +166,22 @@ def _run_ticket_lifecycle_locked(
     *,
     runs_dir: Path | str,
     repository_lock: RepositoryRunLock,
-    agent_executor: AgentExecutorAssignments,
     provider_preflight: ProviderPreflight,
-    provider_policy: object,
+    resolved_policy: ResolvedRunPolicy,
+    agent_executor_factory: PersistedAgentExecutorFactory,
     verification_runner: VerificationProcessRunner | None,
     clock: Callable[[], datetime] | None,
 ) -> LifecycleResult:
+    agent_executors = agent_executor_factory.create_executors(resolved_policy)
     snapshot = create_run_snapshot(
         config,
         ticket_path,
         runs_dir=runs_dir,
         provider_preflight=provider_preflight,
-        provider_policy=provider_policy,
+        resolved_policy=resolved_policy,
         clock=clock,
     )
-    config = config_from_resolved_run_config(snapshot.run_record.resolved_config)
+    config = config_from_resolved_run_policy(snapshot.run_record.resolved_policy)
     _update_repository_lock(repository_lock, snapshot.run_record)
     implementation_result: ImplementationStageResult | None = None
     verification_results: list[VerificationStageResult] = []
@@ -201,7 +205,7 @@ def _run_ticket_lifecycle_locked(
             verification_results=verification_results,
             review_results=review_results,
             correction_results=correction_results,
-            agent_executor=agent_executor,
+            agent_executor=agent_executors,
             verification_runner=verification_runner,
             repository_lock=repository_lock,
             clock=clock,
@@ -249,11 +253,10 @@ def _run_ticket_lifecycle_locked(
 
 
 def resume_ticket_lifecycle(
-    config: AppConfig,
     run_id: str,
     *,
     runs_dir: Path | str,
-    agent_executor_factory: Callable[[], AgentExecutorAssignments],
+    agent_executor_factory: PersistedAgentExecutorFactory,
     verification_runner: VerificationProcessRunner | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> LifecycleResult:
@@ -263,10 +266,7 @@ def resume_ticket_lifecycle(
 
     preflight_result = PreflightResult(())
     run_record = load_run_record(run_dir / RUN_RECORD_FILE)
-    # A caller may still provide the legacy configuration argument, but an
-    # existing run always executes from its persisted policy snapshot.
-    del config
-    config = config_from_resolved_run_config(run_record.resolved_config)
+    config = config_from_resolved_run_policy(run_record.resolved_policy)
     with acquire_repository_run_lock(
         run_record.target_repository_path,
         run_id=run_record.run_id,
@@ -292,7 +292,7 @@ def _resume_ticket_lifecycle_locked(
     run_record: RunRecord,
     *,
     repository_lock: RepositoryRunLock,
-    agent_executor_factory: Callable[[], AgentExecutorAssignments],
+    agent_executor_factory: PersistedAgentExecutorFactory,
     verification_runner: VerificationProcessRunner | None,
     clock: Callable[[], datetime] | None,
 ) -> LifecycleResult:
@@ -307,7 +307,9 @@ def _resume_ticket_lifecycle_locked(
             correction_results=(),
         )
 
-    compatibility_problem = run_record.resolved_config.runtime_compatibility_problem()
+    compatibility_problem = agent_executor_factory.compatibility_problem(
+        run_record.resolved_policy
+    )
     if compatibility_problem is not None:
         run_record = _mark_human_required(
             run_dir,
@@ -364,12 +366,14 @@ def _resume_ticket_lifecycle_locked(
             correction_results=(),
         )
 
-    agent_executor = agent_executor_factory()
     implementation_result: ImplementationStageResult | None = None
     verification_results: list[VerificationStageResult] = []
     review_results: list[ReviewStageResult] = []
     correction_results: list[CorrectionStageResult] = []
     try:
+        agent_executor = agent_executor_factory.create_executors(
+            run_record.resolved_policy
+        )
         if run_record.state == WorkflowState.PREPARING:
             run_record = _complete_preparation(
                 config,
@@ -420,6 +424,23 @@ def _resume_ticket_lifecycle_locked(
             verification_runner=verification_runner,
             repository_lock=repository_lock,
             clock=clock,
+        )
+    except ConfigError as error:
+        run_record = _mark_human_required(
+            run_dir,
+            terminal_reason=str(error),
+            clock=clock,
+        )
+        _update_repository_lock(repository_lock, run_record)
+        generate_terminal_report_best_effort(run_dir)
+        return LifecycleResult(
+            run_dir=run_dir,
+            run_record=run_record,
+            preflight_result=preflight_result,
+            implementation_result=implementation_result,
+            verification_results=tuple(verification_results),
+            review_results=tuple(review_results),
+            correction_results=tuple(correction_results),
         )
     except RunError as error:
         controller_error = str(error)
@@ -847,7 +868,7 @@ def _final_handoff_problem(
             run_dir,
             run_record,
             expected_statuses=frozenset({"PASS"}),
-            verification_commands=run_record.resolved_config.verification_commands,
+            verification_commands=run_record.resolved_policy.verification_commands,
         )
     except _VerificationArtifactError as error:
         return f"Deterministic verification evidence is not passing: {error}"
