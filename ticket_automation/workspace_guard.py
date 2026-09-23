@@ -3,9 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -151,24 +149,6 @@ def capture_workspace_environment_snapshot(
     )
 
 
-def _compare_workspace_environment_change(
-    *,
-    before: WorkspaceEnvironmentSnapshot,
-    after: WorkspaceEnvironmentSnapshot,
-    phase: AttemptPhase,
-    clock: Callable[[], datetime] | None = None,
-) -> WorkspaceGuardInspection:
-    """Build environment evidence from the shared boundary's two snapshots."""
-    return WorkspaceGuardInspection(
-        phase=phase,
-        timestamp=_timestamp(clock),
-        artifact_path=None,
-        before=before,
-        after=after,
-        new_environments=new_environments(before, after),
-    )
-
-
 def new_environments(
     before: WorkspaceEnvironmentSnapshot,
     after: WorkspaceEnvironmentSnapshot,
@@ -209,38 +189,11 @@ def format_workspace_hygiene_violation(
     )
     return (
         "Workspace hygiene violation: "
-        f"The writable Codex operation for {operation} created a new local "
+        f"The writable agent operation for {operation} created a new local "
         f"Python/Conda environment inside the target repository: {environments}. "
         "The environment did not exist before that writable operation. "
         f"Git safety: {git_safety}. "
         "TicketAutomation has stopped for human inspection. "
-        "No files were deleted automatically. "
-        f"Workspace-guard artifact: {artifact}."
-    )
-
-
-def _format_workspace_environment_inspection_failure(
-    inspection: WorkspaceGuardInspection,
-    *,
-    operation: str,
-    run_dir: Path | str,
-) -> str:
-    """Describe a fail-closed scanner error without overstating its coverage."""
-
-    errors = tuple(
-        f"before: {error}" for error in inspection.before.inspection_errors
-    ) + tuple(f"after: {error}" for error in inspection.after.inspection_errors)
-    artifact = (
-        "writable execution record"
-        if inspection.artifact_path is None
-        else _relative_path(inspection.artifact_path, Path(run_dir))
-    )
-    details = "; ".join(errors) or "unknown scanner failure"
-    return (
-        "Workspace environment inspection could not complete for the writable "
-        f"Codex operation {operation}. TicketAutomation has stopped for human "
-        "inspection. The deterministic check covers Python and Conda "
-        f"environment roots inside the target repository. Details: {details}. "
         "No files were deleted automatically. "
         f"Workspace-guard artifact: {artifact}."
     )
@@ -402,13 +355,6 @@ def _scandir(path: Path) -> os.ScandirIterator[os.DirEntry[str]]:
 def _is_junction(path: Path) -> bool:
     isjunction = getattr(os.path, "isjunction", None)
     return bool(isjunction is not None and isjunction(path))
-
-
-def _timestamp(clock: Callable[[], datetime] | None) -> str:
-    now = datetime.now(UTC) if clock is None else clock()
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=UTC)
-    return now.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:

@@ -6,7 +6,7 @@ import json
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TypeVar, cast
+from typing import Protocol, TypeVar, cast
 
 from ...application.agent_execution import (
     AgentCapability,
@@ -37,6 +37,7 @@ from .failures import (
 from .identity import CAPABILITIES, PROVIDER_ID
 from .process import (
     CodexCommand,
+    CodexProcessResult,
     CodexProcessRunner,
     CodexProcessTimedOut,
     CodexScratchDirectoryError,
@@ -48,6 +49,25 @@ from .results import decode_result
 from .settings import CodexSettings, validate_codex_settings
 
 ResultT = TypeVar("ResultT", bound=TaskResult)
+
+
+class _InvocationStartObserverError(BaseException):
+    def __init__(self, error: BaseException) -> None:
+        super().__init__(str(error))
+        self.error = error
+
+
+class _StartTrackingCodexProcessRunner(Protocol):
+    def _run_with_start_tracking(
+        self,
+        command: CodexCommand,
+        *,
+        stdin: str,
+        timeout_seconds: float | None,
+        on_process_start: Callable[[], None],
+    ) -> CodexProcessResult: ...
+
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _IMPLEMENTATION_SCHEMA = _PROJECT_ROOT / "schemas" / "implementation-result.schema.json"
 _REVIEW_SCHEMA = _PROJECT_ROOT / "schemas" / "review-result.schema.json"
@@ -60,9 +80,11 @@ class CodexCliAgentExecutor:
 
     @property
     def capabilities(self) -> frozenset[AgentCapability]:
-        """Capabilities are provider identity, not mutable executor state."""
+        """Report write support only when the process boundary can track start."""
 
-        return CAPABILITIES
+        if _start_tracking_runner(self.runner) is not None:
+            return CAPABILITIES
+        return CAPABILITIES - {AgentCapability.WORKSPACE_WRITE_EXECUTION}
 
     def __init__(
         self,
@@ -181,14 +203,37 @@ class CodexCliAgentExecutor:
         try:
             with external_scratch_environment(request.repository_path) as environment:
                 command = with_environment(command, environment)
-                if on_invocation_start is not None:
-                    on_invocation_start()
+                process_start_observer = _process_start_observer(on_invocation_start)
                 try:
-                    process = self.runner.run(
-                        command,
-                        stdin=request.prompt,
-                        timeout_seconds=request.policy.timeout_seconds,
-                    )
+                    if process_start_observer is None:
+                        process = self.runner.run(
+                            command,
+                            stdin=request.prompt,
+                            timeout_seconds=request.policy.timeout_seconds,
+                        )
+                    else:
+                        tracking_runner = _start_tracking_runner(self.runner)
+                        if tracking_runner is None:
+                            return self._failure(
+                                request,
+                                paths,
+                                started,
+                                reason=CodexFailureReason.CAPABILITY_REJECTED,
+                                message=(
+                                    "Provider process runner cannot report invocation "
+                                    "start for workspace-write execution."
+                                ),
+                                command=command,
+                                exit_code=None,
+                            )
+                        process = tracking_runner._run_with_start_tracking(
+                            command,
+                            stdin=request.prompt,
+                            timeout_seconds=request.policy.timeout_seconds,
+                            on_process_start=process_start_observer,
+                        )
+                except _InvocationStartObserverError as error:
+                    raise error.error
                 except FileNotFoundError as error:
                     write_process_output(paths, stdout="", stderr=f"{error}\n")
                     return self._failure(
@@ -373,6 +418,29 @@ class CodexCliAgentExecutor:
         )
         write_execution(paths, _execution_record(execution))
         return execution
+
+
+def _process_start_observer(
+    observer: Callable[[], None] | None,
+) -> Callable[[], None] | None:
+    if observer is None:
+        return None
+
+    def notify() -> None:
+        try:
+            observer()
+        except BaseException as error:
+            raise _InvocationStartObserverError(error) from error
+
+    return notify
+
+
+def _start_tracking_runner(
+    runner: CodexProcessRunner,
+) -> _StartTrackingCodexProcessRunner | None:
+    if not callable(getattr(runner, "_run_with_start_tracking", None)):
+        return None
+    return cast(_StartTrackingCodexProcessRunner, runner)
 
 
 def _policy_problem(request: AgentExecutionRequest[TaskResult]) -> str | None:

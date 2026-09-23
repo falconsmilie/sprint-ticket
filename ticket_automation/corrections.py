@@ -8,7 +8,6 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from . import writable_worker
 from ._verification_artifacts import (
     _baseline_verification_evidence_problem,
     _read_verification_source_fingerprint,
@@ -20,11 +19,24 @@ from .application.agent_execution import (
     AgentExecutionPolicy,
     AgentExecutionRequest,
     AgentExecutor,
-    AgentFailureCategory,
     AgentTaskKind,
     NetworkAccess,
     RepositoryAccess,
     required_execution_capabilities,
+)
+from .application.guarded_writable_operation import (
+    GuardedWritableOperation,
+    GuardedWritableRejectionRequest,
+    GuardedWritableRequest,
+    WritableBaseline,
+    WritableFailedUncertain,
+    WritableFailedUnchanged,
+    WritableRejectedBeforeStart,
+    WritableSafetyStopped,
+    WritableSafetyViolation,
+    WritableSucceeded,
+    format_writable_failure_audit,
+    format_writable_guard_stop,
 )
 from .attempts import (
     finish_phase_attempt,
@@ -39,18 +51,11 @@ from .domain.task_results import (
     ImplementationResult,
     ImplementationStatus,
 )
-from .failure_classification import classify_writable_failure
 from .git import GitCommandError, GitRepository
-from .git_safety import (
-    WorkspaceChange,
-    WorkspaceSnapshot,
-    workspace_safety_changes,
-)
 from .models import (
     ATTEMPT_RESULT_ARTIFACT_NAME,
     AttemptPhase,
     StageOutcome,
-    StopCategory,
     WorkflowState,
 )
 from .resolved_config import config_from_resolved_run_policy
@@ -65,7 +70,6 @@ from .runs import (
 )
 from .task_result_codecs import encode_implementation_result
 from .workspace_guard import WorkspaceGuardInspection
-from .writable_attempts import WritableAttempt
 
 CORRECTIONS_DIR_NAME = "corrections"
 CORRECTION_EXECUTIONS_DIR_NAME = "correction-executions"
@@ -213,14 +217,6 @@ class CorrectionStageResult:
         return self.outcome == StageOutcome.COMPLETED
 
 
-@dataclass(frozen=True)
-class _FailedWritableAudit:
-    safety_violations: tuple[CorrectionSafetyViolation, ...]
-    changed_files: tuple[str, ...]
-    workspace_guard: WorkspaceGuardInspection | None
-    human_required: bool
-
-
 def run_correction_stage(
     config: AppConfig,
     run_dir: Path | str,
@@ -246,19 +242,30 @@ def run_correction_stage(
 
     correction_round = run_record.current_correction_round + 1
     repository = GitRepository(Path(run_record.target_repository_path))
-    try:
-        before_snapshot = WorkspaceSnapshot.capture(repository)
-        before_fingerprint = before_snapshot.fingerprint
-    except (OSError, RuntimeError, ValueError):
-        before_fingerprint = None
     attempt_record = start_attempt(
         run_path,
         phase=AttemptPhase.CORRECTING,
-        before_workspace_fingerprint=before_fingerprint,
+        before_workspace_fingerprint=None,
         clock=clock,
     )
     artifact_directory = attempt_record.artifact_directory
+    baseline_identity = WritableBaseline(
+        repository_path=repository.path,
+        branch=run_record.starting_branch,
+        head_sha=run_record.baseline_sha,
+    )
+    writable_operation = GuardedWritableOperation(agent_executor, clock=clock)
     if run_record.current_correction_round >= run_record.max_correction_rounds:
+        message = "Maximum corrective rounds exhausted; human intervention is required."
+        rejected = writable_operation.reject_before_start(
+            GuardedWritableRejectionRequest(
+                phase=AttemptPhase.CORRECTING,
+                artifact_directory=artifact_directory,
+                baseline=baseline_identity,
+                failure_message=message,
+            )
+        )
+        audit = rejected.audit
         return _finish(
             run_record=run_record,
             run_dir=run_path,
@@ -267,13 +274,14 @@ def run_correction_stage(
             artifact_directory=artifact_directory,
             execution=None,
             agent_result=None,
-            safety_violations=(),
+            safety_violations=_correction_violations(audit.safety_violations),
             correction_causes=(),
+            workspace_guard=audit.workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
-            controller_message=(
-                "Maximum corrective rounds exhausted; human intervention is required."
-            ),
+            controller_message=message,
             advance_correction_round=False,
+            after_workspace_fingerprint=audit.after_workspace_fingerprint,
+            invocation_started=False,
         )
 
     evidence_problem = _baseline_verification_evidence_problem(
@@ -283,6 +291,23 @@ def run_correction_stage(
         verification_commands=config.verification.commands,
     )
     if evidence_problem is not None:
+        rejected = writable_operation.reject_before_start(
+            GuardedWritableRejectionRequest(
+                phase=AttemptPhase.CORRECTING,
+                artifact_directory=artifact_directory,
+                baseline=baseline_identity,
+                failure_message=evidence_problem,
+                safety_violations=(
+                    WritableSafetyViolation(
+                        name="baseline-verification",
+                        expected="persisted passing clean-baseline verification",
+                        actual=evidence_problem,
+                        message="Writable correction is not authorized.",
+                    ),
+                ),
+            )
+        )
+        audit = rejected.audit
         return _finish(
             run_record=run_record,
             run_dir=run_path,
@@ -291,34 +316,42 @@ def run_correction_stage(
             artifact_directory=artifact_directory,
             execution=None,
             agent_result=None,
-            safety_violations=(
-                CorrectionSafetyViolation(
-                    name="baseline-verification",
-                    expected="persisted passing clean-baseline verification",
-                    actual=evidence_problem,
-                    message="Writable correction is not authorized.",
-                ),
-            ),
+            safety_violations=_correction_violations(audit.safety_violations),
             correction_causes=(),
+            workspace_guard=audit.workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=evidence_problem,
             advance_correction_round=False,
+            after_workspace_fingerprint=audit.after_workspace_fingerprint,
+            invocation_started=False,
         )
 
-    starting_snapshot = WorkspaceSnapshot.capture(repository)
-    starting_violations = _inspect_correction_invariants(
-        repository,
-        run_record,
-        phase="before correction",
-        current_snapshot=starting_snapshot,
-    )
-    starting_violations += _inspect_correction_source_fingerprint(
+    expected_source_fingerprint, starting_violations = _correction_source_fingerprint(
         run_path,
         run_record,
-        starting_snapshot,
         verification_commands=config.verification.commands,
     )
     if starting_violations:
+        rejected = writable_operation.reject_before_start(
+            GuardedWritableRejectionRequest(
+                phase=AttemptPhase.CORRECTING,
+                artifact_directory=artifact_directory,
+                baseline=baseline_identity,
+                failure_message=(
+                    "Repository no longer matches the recorded correction baseline."
+                ),
+                safety_violations=tuple(
+                    WritableSafetyViolation(
+                        item.name,
+                        item.expected,
+                        item.actual,
+                        item.message,
+                    )
+                    for item in starting_violations
+                ),
+            )
+        )
+        audit = rejected.audit
         return _finish(
             run_record=run_record,
             run_dir=run_path,
@@ -327,39 +360,78 @@ def run_correction_stage(
             artifact_directory=artifact_directory,
             execution=None,
             agent_result=None,
-            safety_violations=starting_violations,
+            safety_violations=_correction_violations(audit.safety_violations),
             correction_causes=(),
+            workspace_guard=audit.workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=(
                 "Repository no longer matches the recorded correction baseline."
             ),
             advance_correction_round=False,
+            after_workspace_fingerprint=audit.after_workspace_fingerprint,
+            invocation_started=False,
         )
 
     selected_causes = cause_set.causes
-    ticket_markdown = render_correction_ticket(
-        ticket_id=run_record.ticket_id,
-        round_number=correction_round,
-        cause_set=cause_set,
-        run_dir=run_path,
-    )
     active_record = run_record
-    ticket_path = _write_correction_ticket(
-        artifact_directory=artifact_directory,
-        ticket_id=active_record.ticket_id,
-        round_number=correction_round,
-        markdown=ticket_markdown,
-    )
-
-    prompt = render_correction_prompt(
-        original_ticket=_read_snapshotted_ticket(run_path / RUN_TICKET_FILE),
-        correction_ticket=ticket_markdown,
-        repository_context=_render_repository_context(
-            repository,
-            active_record,
+    ticket_path: Path | None = None
+    try:
+        ticket_markdown = render_correction_ticket(
+            ticket_id=run_record.ticket_id,
+            round_number=correction_round,
+            cause_set=cause_set,
+            run_dir=run_path,
+        )
+        ticket_path = _write_correction_ticket(
+            artifact_directory=artifact_directory,
+            ticket_id=active_record.ticket_id,
+            round_number=correction_round,
+            markdown=ticket_markdown,
+        )
+        prompt = render_correction_prompt(
+            original_ticket=_read_snapshotted_ticket(run_path / RUN_TICKET_FILE),
+            correction_ticket=ticket_markdown,
+            repository_context=_render_repository_context(
+                repository,
+                active_record,
+                correction_round=correction_round,
+            ),
+        )
+    except Exception as error:  # noqa: BLE001 - preserve writable safety evidence.
+        message = (
+            f"Could not prepare correction invocation: {type(error).__name__}: {error}"
+        )
+        rejected = writable_operation.reject_before_start(
+            GuardedWritableRejectionRequest(
+                phase=AttemptPhase.CORRECTING,
+                artifact_directory=artifact_directory,
+                baseline=WritableBaseline(
+                    repository_path=repository.path,
+                    branch=active_record.starting_branch,
+                    head_sha=active_record.baseline_sha,
+                    expected_workspace_fingerprint=expected_source_fingerprint,
+                ),
+                failure_message=message,
+            )
+        )
+        audit = rejected.audit
+        return _finish(
+            run_record=active_record,
+            run_dir=run_path,
             correction_round=correction_round,
-        ),
-    )
+            ticket_path=ticket_path,
+            artifact_directory=artifact_directory,
+            execution=None,
+            agent_result=None,
+            safety_violations=_correction_violations(audit.safety_violations),
+            correction_causes=selected_causes,
+            workspace_guard=audit.workspace_guard,
+            outcome=StageOutcome.HUMAN_REQUIRED,
+            controller_message=message,
+            advance_correction_round=False,
+            after_workspace_fingerprint=audit.after_workspace_fingerprint,
+            invocation_started=False,
+        )
     request = AgentExecutionRequest(
         task_kind=AgentTaskKind.CORRECTION,
         repository_path=repository.path,
@@ -375,87 +447,33 @@ def run_correction_stage(
             RepositoryAccess.WORKSPACE_WRITE
         ),
     )
-    writable_invocation = writable_worker.run_writable_agent(
-        repository=repository,
-        run_dir=run_path,
-        operation=f"correction-round-{correction_round}",
+    guarded_request = GuardedWritableRequest(
         phase=AttemptPhase.CORRECTING,
-        attempt_record=attempt_record,
-        executor=agent_executor,
-        request=request,
-        clock=clock,
+        execution_request=request,
+        baseline=WritableBaseline(
+            repository_path=repository.path,
+            branch=active_record.starting_branch,
+            head_sha=active_record.baseline_sha,
+            expected_workspace_fingerprint=expected_source_fingerprint,
+        ),
     )
-    workspace_guard = writable_invocation.workspace_guard
-    if not writable_invocation.invocation_permitted:
-        return _finish(
-            run_record=active_record,
-            run_dir=run_path,
-            correction_round=correction_round,
-            ticket_path=ticket_path,
-            artifact_directory=artifact_directory,
-            execution=None,
-            agent_result=None,
-            safety_violations=(),
-            correction_causes=selected_causes,
-            workspace_guard=workspace_guard,
-            outcome=StageOutcome.HUMAN_REQUIRED,
-            controller_message=writable_worker._format_writable_guard_stop(
+    writable_outcome = writable_operation.execute(guarded_request)
+    audit = writable_outcome.audit
+    workspace_guard = audit.workspace_guard
+    safety_violations = _correction_violations(audit.safety_violations)
+
+    if isinstance(writable_outcome, WritableSafetyStopped):
+        message = (
+            format_writable_guard_stop(
                 workspace_guard,
                 operation=f"correction round {correction_round}",
                 run_dir=run_path,
-                git_safety=_format_failure_safety(()),
-            ),
-            advance_correction_round=False,
-        )
-
-    if (
-        writable_invocation.execution is not None
-        and not writable_invocation.execution.successful
-    ):
-        execution = writable_invocation.execution
-        failed_audit = _audit_failed_writable_invocation(
-            repository,
-            run_path,
-            active_record,
-            round_number=correction_round,
-            execution=execution,
-            writable_attempt=writable_invocation.attempt,
-            after_workspace=writable_invocation.after_workspace,
-            workspace_guard=workspace_guard,
-        )
-        decision = classify_writable_failure(
-            repository,
-            attempt=writable_invocation.attempt,
-            message=execution.failure_message or "Agent execution failed.",
-            category_if_safe=StopCategory.EXTERNAL_TOOL_FAILURE,
-            retryable_if_safe=True,
-            malformed_result=execution.failure_category
-            in {
-                AgentFailureCategory.MISSING_RESULT,
-                AgentFailureCategory.INVALID_RESULT,
-            },
-            untrusted_completion=execution.failure_category
-            in {
-                AgentFailureCategory.TIMEOUT,
-            },
-        )
-        outcome = (
-            StageOutcome.HUMAN_REQUIRED
-            if (
-                decision.state == WorkflowState.HUMAN_REQUIRED
-                or workspace_guard.requires_human
+                git_safety=_format_failure_safety(safety_violations),
             )
-            else StageOutcome.FAILED
-        )
-        message = (
-            _failed_writable_message(
-                operation=f"correction round {correction_round}",
-                execution=execution,
-                audit=failed_audit,
-                run_dir=run_path,
-            )
-            if outcome == StageOutcome.HUMAN_REQUIRED
-            else decision.reason.message
+            if workspace_guard.requires_human
+            else "Repository no longer matches the recorded correction baseline."
+            if audit.execution is None
+            else "Repository safety invariants were violated."
         )
         return _finish(
             run_record=active_record,
@@ -463,82 +481,68 @@ def run_correction_stage(
             correction_round=correction_round,
             ticket_path=ticket_path,
             artifact_directory=artifact_directory,
-            execution=execution,
+            execution=audit.execution,
+            agent_result=(
+                audit.execution.result
+                if audit.execution is not None and audit.execution.successful
+                else None
+            ),
+            safety_violations=safety_violations,
+            correction_causes=selected_causes,
+            workspace_guard=workspace_guard,
+            outcome=StageOutcome.HUMAN_REQUIRED,
+            controller_message=message,
+            advance_correction_round=False,
+            after_workspace_fingerprint=audit.after_workspace_fingerprint,
+            invocation_started=audit.invocation_started,
+        )
+
+    if isinstance(
+        writable_outcome,
+        (WritableRejectedBeforeStart, WritableFailedUnchanged, WritableFailedUncertain),
+    ):
+        outcome = (
+            StageOutcome.HUMAN_REQUIRED
+            if isinstance(writable_outcome, WritableFailedUncertain)
+            else StageOutcome.FAILED
+        )
+        message = (
+            (
+                "The writable agent invocation did not complete successfully and may "
+                "have left partial source changes. Automation has stopped for human "
+                "inspection. "
+            )
+            + format_writable_failure_audit(
+                audit,
+                operation=f"correction round {correction_round}",
+                run_dir=run_path,
+            )
+            if outcome == StageOutcome.HUMAN_REQUIRED
+            else audit.failure_message or "Agent execution failed."
+        )
+        return _finish(
+            run_record=active_record,
+            run_dir=run_path,
+            correction_round=correction_round,
+            ticket_path=ticket_path,
+            artifact_directory=artifact_directory,
+            execution=audit.execution,
             agent_result=None,
-            safety_violations=failed_audit.safety_violations,
+            safety_violations=safety_violations,
             correction_causes=selected_causes,
             workspace_guard=workspace_guard,
             outcome=outcome,
             controller_message=message,
             advance_correction_round=False,
+            after_workspace_fingerprint=audit.after_workspace_fingerprint,
+            invocation_started=audit.invocation_started,
         )
 
-    execution = writable_invocation.execution
-    if execution is None:
-        raise CorrectionError("Writable agent boundary returned no execution result.")
-    agent_result = _require_agent_result(execution.result)
-    if writable_invocation.after_workspace is None:
-        return _finish(
-            run_record=active_record,
-            run_dir=run_path,
-            correction_round=correction_round,
-            ticket_path=ticket_path,
-            artifact_directory=artifact_directory,
-            execution=execution,
-            agent_result=agent_result,
-            safety_violations=(),
-            correction_causes=selected_causes,
-            workspace_guard=workspace_guard,
-            outcome=StageOutcome.HUMAN_REQUIRED,
-            controller_message=writable_worker._format_writable_guard_stop(
-                workspace_guard,
-                operation=f"correction round {correction_round}",
-                run_dir=run_path,
-                git_safety=_format_failure_safety(()),
-            ),
-        )
-    safety_violations = _inspect_correction_invariants(
-        repository,
-        active_record,
-        phase="after correction",
-        current_snapshot=writable_invocation.after_workspace,
-    )
-    if workspace_guard.requires_human:
-        message = writable_worker._format_writable_guard_stop(
-            workspace_guard,
-            operation=f"correction round {correction_round}",
-            run_dir=run_path,
-            git_safety=_format_failure_safety(safety_violations),
-        )
-        return _finish(
-            run_record=active_record,
-            run_dir=run_path,
-            correction_round=correction_round,
-            ticket_path=ticket_path,
-            artifact_directory=artifact_directory,
-            execution=execution,
-            agent_result=agent_result,
-            safety_violations=safety_violations,
-            correction_causes=selected_causes,
-            workspace_guard=workspace_guard,
-            outcome=StageOutcome.HUMAN_REQUIRED,
-            controller_message=message,
-        )
-    if safety_violations:
-        return _finish(
-            run_record=active_record,
-            run_dir=run_path,
-            correction_round=correction_round,
-            ticket_path=ticket_path,
-            artifact_directory=artifact_directory,
-            execution=execution,
-            agent_result=agent_result,
-            safety_violations=safety_violations,
-            correction_causes=selected_causes,
-            workspace_guard=workspace_guard,
-            outcome=StageOutcome.HUMAN_REQUIRED,
-            controller_message="Repository safety invariants were violated.",
-        )
+    if not isinstance(writable_outcome, WritableSucceeded):
+        raise CorrectionError("Unknown guarded writable-operation outcome.")
+    execution = audit.execution
+    assert execution is not None
+    agent_result = _require_agent_result(writable_outcome.result)
 
     if agent_result.status is ImplementationStatus.BLOCKED:
         return _finish(
@@ -554,6 +558,8 @@ def run_correction_stage(
             workspace_guard=workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message="Correction agent returned BLOCKED.",
+            after_workspace_fingerprint=audit.after_workspace_fingerprint,
+            invocation_started=True,
         )
 
     return _finish(
@@ -571,6 +577,8 @@ def run_correction_stage(
         controller_message=(
             "Correction completed; deterministic verification must run next."
         ),
+        after_workspace_fingerprint=audit.after_workspace_fingerprint,
+        invocation_started=True,
     )
 
 
@@ -682,6 +690,8 @@ def _finish(
     outcome: StageOutcome,
     controller_message: str,
     advance_correction_round: bool = True,
+    after_workspace_fingerprint: str | None = None,
+    invocation_started: bool | None = None,
 ) -> CorrectionStageResult:
     _write_agent_result(
         artifact_directory,
@@ -689,19 +699,18 @@ def _finish(
         outcome=outcome,
         controller_message=controller_message,
     )
-    after_fingerprint: str | None = None
-    try:
-        after_fingerprint = WorkspaceSnapshot.capture(
-            GitRepository(Path(run_record.target_repository_path))
-        ).fingerprint
-    except (OSError, RuntimeError, ValueError):
-        pass
     finish_phase_attempt(
         run_dir,
         phase=AttemptPhase.CORRECTING,
         stage_outcome=outcome,
-        after_workspace_fingerprint=after_fingerprint,
-        process_started=(None if execution is None else execution.invocation_started),
+        after_workspace_fingerprint=after_workspace_fingerprint,
+        process_started=(
+            invocation_started
+            if invocation_started is not None
+            else None
+            if execution is None
+            else execution.invocation_started
+        ),
         execution_path=None,
     )
     return CorrectionStageResult(
@@ -946,46 +955,26 @@ def _require_agent_result(value: Any) -> ImplementationResult:
     return value
 
 
-def _inspect_correction_invariants(
-    repository: GitRepository,
-    run_record: RunRecord,
-    *,
-    phase: str,
-    current_snapshot: WorkspaceSnapshot | None = None,
-) -> tuple[CorrectionSafetyViolation, ...]:
-    snapshot = current_snapshot or WorkspaceSnapshot.capture(repository)
-    changes = workspace_safety_changes(
-        snapshot,
-        expected_repository_path=run_record.target_repository_path,
-        expected_branch=run_record.starting_branch,
-        expected_head_sha=run_record.baseline_sha,
-    )
-    return _correction_changes(changes, phase=phase)
-
-
-def _correction_changes(
-    changes: tuple[WorkspaceChange, ...],
-    *,
-    phase: str,
+def _correction_violations(
+    violations: tuple[WritableSafetyViolation, ...],
 ) -> tuple[CorrectionSafetyViolation, ...]:
     return tuple(
         CorrectionSafetyViolation(
-            name=change.name,
-            expected=change.expected,
-            actual=change.actual,
-            message=f"{change.message.rstrip('.')} {phase}.",
+            name=violation.name,
+            expected=violation.expected,
+            actual=violation.actual,
+            message=violation.message,
         )
-        for change in changes
+        for violation in violations
     )
 
 
-def _inspect_correction_source_fingerprint(
+def _correction_source_fingerprint(
     run_path: Path,
     run_record: RunRecord,
-    current: WorkspaceSnapshot,
     *,
     verification_commands: tuple[VerificationCommand, ...],
-) -> tuple[CorrectionSafetyViolation, ...]:
+) -> tuple[str | None, tuple[CorrectionSafetyViolation, ...]]:
     try:
         expected = _read_verification_source_fingerprint(
             run_path,
@@ -995,153 +984,17 @@ def _inspect_correction_source_fingerprint(
         )
     except _VerificationArtifactError as error:
         return (
-            CorrectionSafetyViolation(
-                name="verification-evidence",
-                expected="readable canonical workspace fingerprint",
-                actual=str(error),
-                message="Could not validate the correction source evidence.",
+            None,
+            (
+                CorrectionSafetyViolation(
+                    name="verification-evidence",
+                    expected="readable canonical workspace fingerprint",
+                    actual=str(error),
+                    message="Could not validate the correction source evidence.",
+                ),
             ),
         )
-    if not current.inspection_complete:
-        return (
-            CorrectionSafetyViolation(
-                name="inspection-incomplete",
-                expected="complete workspace inspection",
-                actual="; ".join(current.inspection_errors) or "incomplete",
-                message="Could not validate the correction source workspace.",
-            ),
-        )
-    if current.matches_fingerprint(expected):
-        return ()
-    return (
-        CorrectionSafetyViolation(
-            name="workspace-fingerprint",
-            expected=expected,
-            actual=current.fingerprint,
-            message="Correction source workspace changed after verification.",
-        ),
-    )
-
-
-def _audit_failed_writable_invocation(
-    repository: GitRepository,
-    run_path: Path,
-    run_record: RunRecord,
-    *,
-    round_number: int,
-    execution: AgentExecution[ImplementationResult],
-    writable_attempt: WritableAttempt,
-    after_workspace: WorkspaceSnapshot | None,
-    workspace_guard: WorkspaceGuardInspection | None,
-) -> _FailedWritableAudit:
-    violations: list[CorrectionSafetyViolation] = []
-    if after_workspace is None:
-        violations.append(
-            CorrectionSafetyViolation(
-                name="workspace-inspection",
-                expected="complete post-call canonical workspace snapshot",
-                actual="unavailable",
-                message="Could not inspect the workspace after writable agent execution.",
-            )
-        )
-    else:
-        violations.extend(
-            _inspect_correction_invariants(
-                repository,
-                run_record,
-                phase="after correction",
-                current_snapshot=after_workspace,
-            )
-        )
-    changed_files: tuple[str, ...] = ()
-    try:
-        changed_files = _worktree_changed_files(repository, run_record.baseline_sha)
-    except (GitCommandError, OSError, ValueError) as error:
-        violations.append(
-            CorrectionSafetyViolation(
-                name="worktree-inspection",
-                expected="baseline-relative source diff inspection succeeds",
-                actual=str(error),
-                message=(
-                    "Could not inspect source changes after failed writable agent "
-                    "invocation."
-                ),
-            )
-        )
-
-    if changed_files and _workspace_changed_since_writable_attempt(
-        writable_attempt,
-        after_workspace,
-    ):
-        violations.append(
-            CorrectionSafetyViolation(
-                name="worktree",
-                expected="no baseline-relative source changes after failed writable invocation",
-                actual=_format_files(changed_files),
-                message=(
-                    "Baseline-relative source changes exist after failed writable "
-                    "agent invocation."
-                ),
-            )
-        )
-
-    human_required = (
-        execution.invocation_started is not False
-        or bool(violations)
-        or bool(workspace_guard is not None and workspace_guard.requires_human)
-    )
-    return _FailedWritableAudit(
-        safety_violations=tuple(violations),
-        changed_files=changed_files,
-        workspace_guard=workspace_guard,
-        human_required=human_required,
-    )
-
-
-def _workspace_changed_since_writable_attempt(
-    writable_attempt: WritableAttempt,
-    after_workspace: WorkspaceSnapshot | None,
-) -> bool:
-    before = writable_attempt.before_snapshot
-    if before is None or after_workspace is None:
-        return True
-    return not before.matches(after_workspace)
-
-
-def _failed_writable_message(
-    *,
-    operation: str,
-    execution: AgentExecution[ImplementationResult],
-    audit: _FailedWritableAudit,
-    run_dir: Path,
-) -> str:
-    rows = [
-        (
-            "The writable agent invocation did not complete successfully and may "
-            "have left partial source changes. Automation has stopped for human "
-            "inspection."
-        ),
-        (
-            "Agent failure: "
-            f"{_format_failure_category(execution)}: "
-            f"{execution.failure_message or 'unknown failure'}"
-        ),
-        f"Last operation: {operation}",
-        f"Process started: {_yes_no(execution.invocation_started is not False)}",
-        f"Git safety: {_format_failure_safety(audit.safety_violations)}",
-        f"Changed files relative to baseline: {_format_files(audit.changed_files)}",
-    ]
-    rows.extend(_format_agent_artifacts(execution))
-    if audit.workspace_guard is not None and audit.workspace_guard.requires_human:
-        rows.append(
-            writable_worker._format_writable_guard_stop(
-                audit.workspace_guard,
-                operation=operation,
-                run_dir=run_dir,
-                git_safety=_format_failure_safety(audit.safety_violations),
-            )
-        )
-    return " ".join(rows)
+    return expected, ()
 
 
 def _format_failure_safety(
@@ -1152,14 +1005,6 @@ def _format_failure_safety(
     return "; ".join(
         f"{violation.name} expected {violation.expected}, got {violation.actual}"
         for violation in violations
-    )
-
-
-def _format_failure_category(execution: AgentExecution[ImplementationResult]) -> str:
-    return (
-        "UNKNOWN"
-        if execution.failure_category is None
-        else execution.failure_category.value
     )
 
 
@@ -1237,20 +1082,6 @@ def _text_or_default(value: str) -> str:
 
 def _format_optional(value: str | None) -> str:
     return "<detached>" if value is None else value
-
-
-def _format_files(files: tuple[str, ...]) -> str:
-    if not files:
-        return "none"
-    shown = ", ".join(files[:5])
-    hidden_count = len(files) - 5
-    if hidden_count > 0:
-        shown = f"{shown}, and {hidden_count} more"
-    return shown
-
-
-def _yes_no(value: bool) -> str:
-    return "yes" if value else "no"
 
 
 __all__ = [

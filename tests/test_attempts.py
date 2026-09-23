@@ -25,6 +25,12 @@ from ticket_automation.application.agent_execution import (
     RepositoryAccess,
     required_execution_capabilities,
 )
+from ticket_automation.application.guarded_writable_operation import (
+    GuardedWritableOperation,
+    GuardedWritableRequest,
+    WritableBaseline,
+    WritableSucceeded,
+)
 from ticket_automation.attempts import (
     AttemptError,
     attempt_result_path,
@@ -39,6 +45,7 @@ from ticket_automation.domain.task_results import (
     ImplementationStatus,
 )
 from ticket_automation.git import GitRepository
+from ticket_automation.git_safety import WorkspaceSnapshot
 from ticket_automation.models import (
     AttemptPhase,
     AttemptStatus,
@@ -46,7 +53,6 @@ from ticket_automation.models import (
     WorkflowState,
 )
 from ticket_automation.workflow import resume_ticket_lifecycle
-from ticket_automation.writable_worker import run_writable_agent
 
 
 def fixed_clock() -> datetime:
@@ -243,7 +249,9 @@ def test_finish_phase_attempt_rejects_raw_stage_outcome(tmp_path: Path) -> None:
         )
 
 
-def test_writable_worker_rejects_a_non_writable_phase(tmp_path: Path) -> None:
+def test_guarded_writable_operation_rejects_a_non_writable_phase(
+    tmp_path: Path,
+) -> None:
     repository = GitRepository(create_git_repo(tmp_path / "target"))
     run_dir = tmp_path / "run"
     record = start_attempt(
@@ -276,18 +284,20 @@ def test_writable_worker_rejects_a_non_writable_phase(tmp_path: Path) -> None:
                 RepositoryAccess.WORKSPACE_WRITE
             ),
         )
-        run_writable_agent(
-            repository=repository,
-            run_dir=run_dir,
-            operation="invalid-verification-write",
+        snapshot = WorkspaceSnapshot.capture(repository)
+        guarded_request = GuardedWritableRequest(
             phase=AttemptPhase.VERIFYING,
-            attempt_record=record,
-            executor=executor,
-            request=request,
+            execution_request=request,
+            baseline=WritableBaseline(
+                repository.path,
+                snapshot.branch,
+                snapshot.head_sha or "",
+            ),
         )
+        GuardedWritableOperation(executor).execute(guarded_request)
 
 
-def test_writable_worker_does_not_read_or_modify_provider_native_artifacts(
+def test_guarded_writable_operation_does_not_modify_provider_native_artifacts(
     tmp_path: Path,
 ) -> None:
     repository = GitRepository(create_git_repo(tmp_path / "target"))
@@ -323,6 +333,10 @@ def test_writable_worker_does_not_read_or_modify_provider_native_artifacts(
     provider_artifact.write_bytes(original_provider_evidence)
 
     class ProviderNativeEvidenceExecutor:
+        @property
+        def capabilities(self):
+            return inner.capabilities
+
         def execute(self, execution_request, **kwargs):
             execution = inner.execute(execution_request, **kwargs)
             return replace(
@@ -337,23 +351,29 @@ def test_writable_worker_does_not_read_or_modify_provider_native_artifacts(
                 ),
             )
 
-    invocation = run_writable_agent(
-        repository=repository,
-        run_dir=run_dir,
-        operation="implementation",
+    snapshot = WorkspaceSnapshot.capture(repository)
+    guarded_request = GuardedWritableRequest(
         phase=AttemptPhase.IMPLEMENTING,
-        attempt_record=record,
-        executor=ProviderNativeEvidenceExecutor(),
-        request=request,
+        execution_request=request,
+        baseline=WritableBaseline(
+            repository.path,
+            snapshot.branch,
+            snapshot.head_sha or "",
+            snapshot.fingerprint,
+            True,
+        ),
+    )
+    outcome = GuardedWritableOperation(ProviderNativeEvidenceExecutor()).execute(
+        guarded_request
     )
 
-    assert invocation.invocation_permitted
-    assert invocation.execution is not None
-    assert invocation.execution.successful
-    assert invocation.workspace_guard.artifact_path == (
+    assert isinstance(outcome, WritableSucceeded)
+    assert outcome.audit.execution is not None
+    assert outcome.audit.execution.successful
+    assert outcome.audit.workspace_guard.artifact_path == (
         record.artifact_directory / "workspace-guard.json"
     )
-    assert invocation.workspace_guard.artifact_path.is_file()
+    assert outcome.audit.workspace_guard.artifact_path.is_file()
     assert provider_artifact.read_bytes() == original_provider_evidence
 
 

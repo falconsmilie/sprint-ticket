@@ -41,6 +41,10 @@ class InMemoryAgentExecutor:
         self._provider_id = provider_id
         self.requests: list[AgentExecutionRequest[TaskResult]] = []
 
+    @property
+    def capabilities(self) -> frozenset[AgentCapability]:
+        return self._capabilities
+
     def execute(
         self,
         request: AgentExecutionRequest[ResultT],

@@ -7,7 +7,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from . import writable_worker
 from ._verification_artifacts import _baseline_verification_evidence_problem
 from .application.agent_execution import (
     IMPLEMENTATION_RESULT_CONTRACT,
@@ -15,30 +14,33 @@ from .application.agent_execution import (
     AgentExecutionPolicy,
     AgentExecutionRequest,
     AgentExecutor,
-    AgentFailureCategory,
     AgentTaskKind,
     NetworkAccess,
     RepositoryAccess,
     required_execution_capabilities,
 )
-from .attempts import finish_phase_attempt, start_attempt
-from .audit import (
-    changed_files_including_untracked as _changed_files_including_untracked,
+from .application.guarded_writable_operation import (
+    GuardedWritableOperation,
+    GuardedWritableRejectionRequest,
+    GuardedWritableRequest,
+    WritableBaseline,
+    WritableFailedUncertain,
+    WritableFailedUnchanged,
+    WritableRejectedBeforeStart,
+    WritableSafetyStopped,
+    WritableSafetyViolation,
+    WritableSucceeded,
+    format_writable_failure_audit,
+    format_writable_guard_stop,
 )
+from .attempts import finish_phase_attempt, start_attempt
 from .config import AppConfig
 from .domain.task_results import ImplementationResult, ImplementationStatus
-from .failure_classification import classify_writable_failure
-from .git import GitCommandError, GitRepository
-from .git_safety import (
-    WorkspaceChange,
-    WorkspaceSnapshot,
-    workspace_safety_changes,
-)
+from .git import GitRepository
 from .models import (
     ATTEMPT_RESULT_ARTIFACT_NAME,
     AttemptPhase,
     StageOutcome,
-    StopCategory,
     WorkflowState,
 )
 from .resolved_config import config_from_resolved_run_policy
@@ -46,7 +48,6 @@ from .runs import (
     BASELINE_RECORD_FILE,
     RUN_RECORD_FILE,
     RUN_TICKET_FILE,
-    BaselineRecord,
     RunError,
     RunRecord,
     load_baseline_record,
@@ -54,13 +55,6 @@ from .runs import (
 )
 from .task_result_codecs import encode_implementation_result
 from .workspace_guard import WorkspaceGuardInspection
-from .writable_attempts import WritableAttempt
-
-
-class _SafetyInspectionPhase:
-    BEFORE_IMPLEMENTATION = "before implementation"
-    AFTER_IMPLEMENTATION = "after implementation"
-
 
 _TICKET_PLACEHOLDER = "{{SNAPSHOTTED_TICKET}}"
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -98,14 +92,6 @@ class ImplementationStageResult:
         return self.outcome == StageOutcome.COMPLETED
 
 
-@dataclass(frozen=True)
-class _FailedWritableAudit:
-    safety_violations: tuple[_ImplementationSafetyViolation, ...]
-    changed_files: tuple[str, ...]
-    workspace_guard: WorkspaceGuardInspection | None
-    human_required: bool
-
-
 def run_implementation_stage(
     config: AppConfig,
     run_dir: Path | str,
@@ -130,18 +116,23 @@ def run_implementation_stage(
         raise ImplementationError("Run record and baseline HEAD do not match.")
 
     repository = GitRepository(Path(run_record.target_repository_path))
-    try:
-        before_snapshot = WorkspaceSnapshot.capture(repository)
-        before_fingerprint = before_snapshot.fingerprint
-    except (OSError, RuntimeError, ValueError):
-        before_fingerprint = None
+    ticket_text = _read_snapshotted_ticket(run_path / RUN_TICKET_FILE)
+    prompt = _render_implementation_prompt(ticket_text)
     attempt_record = start_attempt(
         run_path,
         phase=AttemptPhase.IMPLEMENTING,
-        before_workspace_fingerprint=before_fingerprint,
+        before_workspace_fingerprint=None,
         clock=clock,
     )
     implementation_dir = attempt_record.artifact_directory
+    baseline = WritableBaseline(
+        repository_path=repository.path,
+        branch=run_record.starting_branch,
+        head_sha=run_record.baseline_sha,
+        expected_workspace_fingerprint=baseline_record.workspace_fingerprint,
+        require_clean_worktree=True,
+    )
+    writable_operation = GuardedWritableOperation(agent_executor, clock=clock)
     evidence_problem = _baseline_verification_evidence_problem(
         run_path,
         run_record,
@@ -149,47 +140,40 @@ def run_implementation_stage(
         verification_commands=config.verification.commands,
     )
     if evidence_problem is not None:
+        rejected = writable_operation.reject_before_start(
+            GuardedWritableRejectionRequest(
+                phase=AttemptPhase.IMPLEMENTING,
+                artifact_directory=implementation_dir,
+                baseline=baseline,
+                failure_message=evidence_problem,
+                safety_violations=(
+                    WritableSafetyViolation(
+                        name="baseline-verification",
+                        expected="persisted passing clean-baseline verification",
+                        actual=evidence_problem,
+                        message="Writable implementation is not authorized.",
+                    ),
+                ),
+            )
+        )
+        audit = rejected.audit
         return _finish(
             run_record=run_record,
             run_dir=run_path,
             artifact_directory=implementation_dir,
             execution=None,
             agent_result=None,
-            safety_violations=(
-                _ImplementationSafetyViolation(
-                    name="baseline-verification",
-                    expected="persisted passing clean-baseline verification",
-                    actual=evidence_problem,
-                    message="Writable implementation is not authorized.",
-                ),
-            ),
-            changed_files=(),
+            safety_violations=_implementation_violations(audit.safety_violations),
+            changed_files=audit.changed_files,
+            workspace_guard=audit.workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=evidence_problem,
+            after_workspace_fingerprint=audit.after_workspace_fingerprint,
+            invocation_started=False,
         )
 
-    starting_violations = _inspect_starting_state(
-        repository,
-        run_record,
-        baseline_record,
-    )
-    if starting_violations:
-        return _finish(
-            run_record=run_record,
-            run_dir=run_path,
-            artifact_directory=implementation_dir,
-            execution=None,
-            agent_result=None,
-            safety_violations=starting_violations,
-            changed_files=(),
-            outcome=StageOutcome.HUMAN_REQUIRED,
-            controller_message="Repository no longer matches the clean implementation baseline.",
-        )
-
-    ticket_text = _read_snapshotted_ticket(run_path / RUN_TICKET_FILE)
     active_record = run_record
-    prompt = _render_implementation_prompt(ticket_text)
-    request = AgentExecutionRequest(
+    execution_request = AgentExecutionRequest(
         task_kind=AgentTaskKind.IMPLEMENTATION,
         repository_path=repository.path,
         repository_access=RepositoryAccess.WORKSPACE_WRITE,
@@ -204,174 +188,92 @@ def run_implementation_stage(
             RepositoryAccess.WORKSPACE_WRITE
         ),
     )
-    writable_invocation = writable_worker.run_writable_agent(
-        repository=repository,
-        run_dir=run_path,
-        operation="implementation",
+    guarded_request = GuardedWritableRequest(
         phase=AttemptPhase.IMPLEMENTING,
-        attempt_record=attempt_record,
-        executor=agent_executor,
-        request=request,
-        clock=clock,
+        execution_request=execution_request,
+        baseline=baseline,
     )
-    workspace_guard = writable_invocation.workspace_guard
-    if not writable_invocation.invocation_permitted:
-        return _finish(
-            run_record=active_record,
-            run_dir=run_path,
-            artifact_directory=implementation_dir,
-            execution=None,
-            agent_result=None,
-            safety_violations=(),
-            changed_files=(),
-            workspace_guard=workspace_guard,
-            outcome=StageOutcome.HUMAN_REQUIRED,
-            controller_message=writable_worker._format_writable_guard_stop(
-                workspace_guard,
-                operation="implementation",
-                run_dir=run_path,
-                git_safety=_format_failure_safety(()),
-            ),
-        )
+    writable_outcome = writable_operation.execute(guarded_request)
+    audit = writable_outcome.audit
+    workspace_guard = audit.workspace_guard
+    safety_violations = _implementation_violations(audit.safety_violations)
 
-    if (
-        writable_invocation.execution is not None
-        and not writable_invocation.execution.successful
-    ):
-        execution = writable_invocation.execution
-        failed_audit = _audit_failed_writable_invocation(
-            repository,
-            run_path,
-            active_record,
-            execution=execution,
-            writable_attempt=writable_invocation.attempt,
-            after_workspace=writable_invocation.after_workspace,
-            workspace_guard=workspace_guard,
-        )
-        decision = classify_writable_failure(
-            repository,
-            attempt=writable_invocation.attempt,
-            message=execution.failure_message or "Agent execution failed.",
-            category_if_safe=StopCategory.EXTERNAL_TOOL_FAILURE,
-            retryable_if_safe=True,
-            malformed_result=execution.failure_category
-            in {
-                AgentFailureCategory.MISSING_RESULT,
-                AgentFailureCategory.INVALID_RESULT,
-            },
-            untrusted_completion=execution.failure_category
-            in {
-                AgentFailureCategory.TIMEOUT,
-            },
-        )
-        outcome = (
-            StageOutcome.HUMAN_REQUIRED
-            if (
-                decision.state == WorkflowState.HUMAN_REQUIRED
-                or workspace_guard.requires_human
-            )
-            else StageOutcome.FAILED
-        )
+    if isinstance(writable_outcome, WritableSafetyStopped):
         message = (
-            _failed_writable_message(
-                operation="implementation",
-                execution=execution,
-                audit=failed_audit,
-                run_dir=run_path,
-            )
-            if outcome == StageOutcome.HUMAN_REQUIRED
-            else decision.reason.message
-        )
-        return _finish(
-            run_record=active_record,
-            run_dir=run_path,
-            artifact_directory=implementation_dir,
-            execution=execution,
-            agent_result=None,
-            safety_violations=failed_audit.safety_violations,
-            changed_files=failed_audit.changed_files,
-            workspace_guard=workspace_guard,
-            outcome=outcome,
-            controller_message=message,
-        )
-
-    execution = writable_invocation.execution
-    if execution is None:
-        raise ImplementationError(
-            "Writable agent boundary returned no execution result."
-        )
-    agent_result = _require_agent_result(execution.result)
-    if writable_invocation.after_workspace is None:
-        return _finish(
-            run_record=active_record,
-            run_dir=run_path,
-            artifact_directory=implementation_dir,
-            execution=execution,
-            agent_result=agent_result,
-            safety_violations=(),
-            changed_files=(),
-            workspace_guard=workspace_guard,
-            outcome=StageOutcome.HUMAN_REQUIRED,
-            controller_message=writable_worker._format_writable_guard_stop(
-                workspace_guard,
-                operation="implementation",
-                run_dir=run_path,
-                git_safety=_format_failure_safety(()),
-            ),
-        )
-    safety_violations = _inspect_safety(
-        repository,
-        active_record,
-        phase=_SafetyInspectionPhase.AFTER_IMPLEMENTATION,
-        snapshot=writable_invocation.after_workspace,
-    )
-    if workspace_guard.requires_human:
-        return _finish(
-            run_record=active_record,
-            run_dir=run_path,
-            artifact_directory=implementation_dir,
-            execution=execution,
-            agent_result=agent_result,
-            safety_violations=safety_violations,
-            changed_files=(),
-            workspace_guard=workspace_guard,
-            outcome=StageOutcome.HUMAN_REQUIRED,
-            controller_message=writable_worker._format_writable_guard_stop(
+            format_writable_guard_stop(
                 workspace_guard,
                 operation="implementation",
                 run_dir=run_path,
                 git_safety=_format_failure_safety(safety_violations),
-            ),
+            )
+            if workspace_guard.requires_human
+            else "Repository no longer matches the clean implementation baseline."
+            if audit.execution is None
+            else "Repository safety invariants were violated."
         )
-    if safety_violations:
         return _finish(
             run_record=active_record,
             run_dir=run_path,
             artifact_directory=implementation_dir,
-            execution=execution,
-            agent_result=agent_result,
+            execution=audit.execution,
+            agent_result=(
+                audit.execution.result
+                if audit.execution is not None and audit.execution.successful
+                else None
+            ),
             safety_violations=safety_violations,
-            changed_files=(),
+            changed_files=audit.changed_files,
             workspace_guard=workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
-            controller_message="Repository safety invariants were violated.",
+            controller_message=message,
+            after_workspace_fingerprint=audit.after_workspace_fingerprint,
+            invocation_started=audit.invocation_started,
         )
 
-    try:
-        changed_files = _changed_files(repository, active_record.baseline_sha)
-    except ImplementationError as error:
+    if isinstance(
+        writable_outcome,
+        (WritableRejectedBeforeStart, WritableFailedUnchanged, WritableFailedUncertain),
+    ):
+        outcome = (
+            StageOutcome.HUMAN_REQUIRED
+            if isinstance(writable_outcome, WritableFailedUncertain)
+            else StageOutcome.FAILED
+        )
+        message = (
+            (
+                "The writable agent invocation did not complete successfully and may "
+                "have left partial source changes. Automation has stopped for human "
+                "inspection. "
+            )
+            + format_writable_failure_audit(
+                audit,
+                operation="implementation",
+                run_dir=run_path,
+            )
+            if outcome == StageOutcome.HUMAN_REQUIRED
+            else audit.failure_message or "Agent execution failed."
+        )
         return _finish(
             run_record=active_record,
             run_dir=run_path,
             artifact_directory=implementation_dir,
-            execution=execution,
-            agent_result=agent_result,
-            safety_violations=(),
-            changed_files=(),
+            execution=audit.execution,
+            agent_result=None,
+            safety_violations=safety_violations,
+            changed_files=audit.changed_files,
             workspace_guard=workspace_guard,
-            outcome=StageOutcome.HUMAN_REQUIRED,
-            controller_message=str(error),
+            outcome=outcome,
+            controller_message=message,
+            after_workspace_fingerprint=audit.after_workspace_fingerprint,
+            invocation_started=audit.invocation_started,
         )
+
+    if not isinstance(writable_outcome, WritableSucceeded):
+        raise ImplementationError("Unknown guarded writable-operation outcome.")
+    execution = audit.execution
+    assert execution is not None
+    agent_result = _require_agent_result(writable_outcome.result)
+    changed_files = audit.changed_files
     if agent_result.status is ImplementationStatus.BLOCKED:
         return _finish(
             run_record=active_record,
@@ -384,6 +286,8 @@ def run_implementation_stage(
             workspace_guard=workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message="Implementation agent returned BLOCKED.",
+            after_workspace_fingerprint=audit.after_workspace_fingerprint,
+            invocation_started=True,
         )
 
     if not changed_files:
@@ -398,6 +302,8 @@ def run_implementation_stage(
             workspace_guard=workspace_guard,
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message="Implementation completed without repository changes.",
+            after_workspace_fingerprint=audit.after_workspace_fingerprint,
+            invocation_started=True,
         )
 
     return _finish(
@@ -411,6 +317,8 @@ def run_implementation_stage(
         workspace_guard=workspace_guard,
         outcome=StageOutcome.COMPLETED,
         controller_message="Implementation completed and Git safety checks passed.",
+        after_workspace_fingerprint=audit.after_workspace_fingerprint,
+        invocation_started=True,
     )
 
 
@@ -465,6 +373,8 @@ def _finish(
     workspace_guard: WorkspaceGuardInspection | None = None,
     outcome: StageOutcome,
     controller_message: str,
+    after_workspace_fingerprint: str | None = None,
+    invocation_started: bool | None = None,
 ) -> ImplementationStageResult:
     _write_agent_result(
         artifact_directory,
@@ -472,19 +382,18 @@ def _finish(
         outcome=outcome,
         controller_message=controller_message,
     )
-    after_fingerprint: str | None = None
-    try:
-        after_fingerprint = WorkspaceSnapshot.capture(
-            GitRepository(Path(run_record.target_repository_path))
-        ).fingerprint
-    except (OSError, RuntimeError, ValueError):
-        pass
     finish_phase_attempt(
         run_dir,
         phase=AttemptPhase.IMPLEMENTING,
         stage_outcome=outcome,
-        after_workspace_fingerprint=after_fingerprint,
-        process_started=(None if execution is None else execution.invocation_started),
+        after_workspace_fingerprint=after_workspace_fingerprint,
+        process_started=(
+            invocation_started
+            if invocation_started is not None
+            else None
+            if execution is None
+            else execution.invocation_started
+        ),
         execution_path=None,
     )
     return ImplementationStageResult(
@@ -542,198 +451,22 @@ def _require_agent_result(value: Any) -> ImplementationResult:
     return value
 
 
-def _inspect_safety(
-    repository: GitRepository,
-    run_record: RunRecord,
-    *,
-    phase: str,
-    require_clean_worktree: bool = False,
-    snapshot: WorkspaceSnapshot | None = None,
-) -> tuple[_ImplementationSafetyViolation, ...]:
-    snapshot = snapshot or WorkspaceSnapshot.capture(repository)
-    changes = workspace_safety_changes(
-        snapshot,
-        expected_repository_path=run_record.target_repository_path,
-        expected_branch=run_record.starting_branch,
-        expected_head_sha=run_record.baseline_sha,
-        require_clean_worktree=require_clean_worktree,
-    )
-    return _implementation_changes(changes, phase=phase)
-
-
-def _inspect_starting_state(
-    repository: GitRepository,
-    run_record: RunRecord,
-    baseline_record: BaselineRecord,
-) -> tuple[_ImplementationSafetyViolation, ...]:
-    snapshot = WorkspaceSnapshot.capture(repository)
-    changes = list(
-        workspace_safety_changes(
-            snapshot,
-            expected_repository_path=run_record.target_repository_path,
-            expected_branch=run_record.starting_branch,
-            expected_head_sha=run_record.baseline_sha,
-            require_clean_worktree=True,
-        )
-    )
-    if snapshot.fingerprint != baseline_record.workspace_fingerprint:
-        changes.append(
-            WorkspaceChange(
-                name="baseline-workspace",
-                expected=baseline_record.workspace_fingerprint,
-                actual=snapshot.fingerprint,
-                message="Workspace no longer matches the verified clean baseline.",
-            )
-        )
-    return _implementation_changes(
-        tuple(changes),
-        phase=_SafetyInspectionPhase.BEFORE_IMPLEMENTATION,
-    )
-
-
-def _implementation_changes(
-    changes: tuple[WorkspaceChange, ...],
-    *,
-    phase: str,
+def _implementation_violations(
+    violations: tuple[WritableSafetyViolation, ...],
 ) -> tuple[_ImplementationSafetyViolation, ...]:
     return tuple(
         _ImplementationSafetyViolation(
-            name=change.name,
-            expected=change.expected,
-            actual=change.actual,
-            message=f"{change.message.rstrip('.')} {phase}.",
+            name=(
+                "baseline-workspace"
+                if violation.name == "workspace-fingerprint"
+                else violation.name
+            ),
+            expected=violation.expected,
+            actual=violation.actual,
+            message=violation.message,
         )
-        for change in changes
+        for violation in violations
     )
-
-
-def _changed_files(repository: GitRepository, baseline_sha: str) -> tuple[str, ...]:
-    try:
-        return _worktree_changed_files(repository, baseline_sha)
-    except GitCommandError as error:
-        raise ImplementationError(
-            f"Could not inspect implementation diff: {error}"
-        ) from error
-
-
-def _audit_failed_writable_invocation(
-    repository: GitRepository,
-    run_path: Path,
-    run_record: RunRecord,
-    *,
-    execution: AgentExecution[ImplementationResult],
-    writable_attempt: WritableAttempt,
-    after_workspace: WorkspaceSnapshot | None,
-    workspace_guard: WorkspaceGuardInspection | None,
-) -> _FailedWritableAudit:
-    violations: list[_ImplementationSafetyViolation] = []
-    if after_workspace is None:
-        violations.append(
-            _ImplementationSafetyViolation(
-                name="workspace-inspection",
-                expected="complete post-call canonical workspace snapshot",
-                actual="unavailable",
-                message="Could not inspect the workspace after writable agent execution.",
-            )
-        )
-    else:
-        violations.extend(
-            _inspect_safety(
-                repository,
-                run_record,
-                phase=_SafetyInspectionPhase.AFTER_IMPLEMENTATION,
-                snapshot=after_workspace,
-            )
-        )
-    changed_files: tuple[str, ...] = ()
-    try:
-        changed_files = _worktree_changed_files(repository, run_record.baseline_sha)
-    except (GitCommandError, OSError, ValueError) as error:
-        violations.append(
-            _ImplementationSafetyViolation(
-                name="worktree-inspection",
-                expected="baseline-relative source diff inspection succeeds",
-                actual=str(error),
-                message=(
-                    "Could not inspect source changes after failed writable agent "
-                    "invocation."
-                ),
-            )
-        )
-
-    if changed_files and _workspace_changed_since_writable_attempt(
-        writable_attempt,
-        after_workspace,
-    ):
-        violations.append(
-            _ImplementationSafetyViolation(
-                name="worktree",
-                expected="no baseline-relative source changes after failed writable invocation",
-                actual=_format_files(changed_files),
-                message=(
-                    "Baseline-relative source changes exist after failed writable "
-                    "agent invocation."
-                ),
-            )
-        )
-
-    human_required = (
-        execution.invocation_started is not False
-        or bool(violations)
-        or bool(workspace_guard is not None and workspace_guard.requires_human)
-    )
-    return _FailedWritableAudit(
-        safety_violations=tuple(violations),
-        changed_files=changed_files,
-        workspace_guard=workspace_guard,
-        human_required=human_required,
-    )
-
-
-def _workspace_changed_since_writable_attempt(
-    writable_attempt: WritableAttempt,
-    after_workspace: WorkspaceSnapshot | None,
-) -> bool:
-    before = writable_attempt.before_snapshot
-    if before is None or after_workspace is None:
-        return True
-    return not before.matches(after_workspace)
-
-
-def _failed_writable_message(
-    *,
-    operation: str,
-    execution: AgentExecution[ImplementationResult],
-    audit: _FailedWritableAudit,
-    run_dir: Path,
-) -> str:
-    rows = [
-        (
-            "The writable agent invocation did not complete successfully and may "
-            "have left partial source changes. Automation has stopped for human "
-            "inspection."
-        ),
-        (
-            "Agent failure: "
-            f"{_format_failure_category(execution)}: "
-            f"{execution.failure_message or 'unknown failure'}"
-        ),
-        f"Last operation: {operation}",
-        f"Process started: {_yes_no(execution.invocation_started is not False)}",
-        f"Git safety: {_format_failure_safety(audit.safety_violations)}",
-        f"Changed files relative to baseline: {_format_files(audit.changed_files)}",
-    ]
-    rows.extend(_format_agent_artifacts(execution))
-    if audit.workspace_guard is not None and audit.workspace_guard.requires_human:
-        rows.append(
-            writable_worker._format_writable_guard_stop(
-                audit.workspace_guard,
-                operation=operation,
-                run_dir=run_dir,
-                git_safety=_format_failure_safety(audit.safety_violations),
-            )
-        )
-    return " ".join(rows)
 
 
 def _format_failure_safety(
@@ -747,14 +480,6 @@ def _format_failure_safety(
     )
 
 
-def _format_failure_category(execution: AgentExecution[ImplementationResult]) -> str:
-    return (
-        "UNKNOWN"
-        if execution.failure_category is None
-        else execution.failure_category.value
-    )
-
-
 def _format_agent_artifacts(
     execution: AgentExecution[ImplementationResult],
 ) -> list[str]:
@@ -764,27 +489,6 @@ def _format_agent_artifacts(
         "Agent artifacts:",
         *(f"  - {artifact.name}: {artifact.path}" for artifact in execution.artifacts),
     ]
-
-
-def _worktree_changed_files(
-    repository: GitRepository,
-    baseline_sha: str,
-) -> tuple[str, ...]:
-    return _changed_files_including_untracked(repository, baseline_sha)
-
-
-def _format_files(files: tuple[str, ...]) -> str:
-    if not files:
-        return "none"
-    shown = ", ".join(files[:5])
-    hidden_count = len(files) - 5
-    if hidden_count > 0:
-        shown = f"{shown}, and {hidden_count} more"
-    return shown
-
-
-def _yes_no(value: bool) -> str:
-    return "yes" if value else "no"
 
 
 __all__ = [

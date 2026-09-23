@@ -342,9 +342,19 @@ def make_config(
 
 
 class _UnexpectedCodexRunner:
-    def run(self, command, *, stdin, timeout_seconds):
-        del command, stdin, timeout_seconds
+    def run(self, command, *, stdin, timeout_seconds, on_process_start=None):
+        del command, stdin, timeout_seconds, on_process_start
         raise AssertionError("This test did not inject a Codex process result.")
+
+    def _run_with_start_tracking(
+        self, command, *, stdin, timeout_seconds, on_process_start
+    ):
+        return self.run(
+            command,
+            stdin=stdin,
+            timeout_seconds=timeout_seconds,
+            on_process_start=on_process_start,
+        )
 
 
 def make_agent_executor(config: AppConfig, *, process_runner=None):

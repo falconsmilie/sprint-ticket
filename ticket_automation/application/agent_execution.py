@@ -352,6 +352,7 @@ class AgentExecution(Generic[ResultT_co]):
                 AgentFailureCategory.PROVIDER_UNAVAILABLE,
                 AgentFailureCategory.INVOCATION_START_FAILURE,
                 AgentFailureCategory.CAPABILITY_OR_CONFIGURATION_FAILURE,
+                AgentFailureCategory.TIMEOUT,
             }
             and self.invocation_start is InvocationStart.NOT_STARTED
         ):
@@ -361,6 +362,9 @@ class AgentExecution(Generic[ResultT_co]):
 
 
 class AgentExecutor(Protocol):
+    @property
+    def capabilities(self) -> frozenset[AgentCapability]: ...
+
     def execute(
         self,
         request: AgentExecutionRequest[ResultT],

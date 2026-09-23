@@ -3,13 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .git import GitRepository
 from .models import StageOutcome, StopCategory, StopReason, WorkflowState
 from .runs import RunRecord
-from .writable_attempts import (
-    WritableAttempt,
-    inspect_writable_attempt_after_failure,
-)
 
 
 @dataclass(frozen=True)
@@ -46,48 +41,6 @@ def classify_stage_stop(
     )
 
 
-def classify_writable_failure(
-    repository: GitRepository,
-    *,
-    attempt: WritableAttempt | None,
-    message: str,
-    category_if_safe: StopCategory,
-    retryable_if_safe: bool,
-    malformed_result: bool = False,
-    untrusted_completion: bool = False,
-) -> TerminalStop:
-    """Decide whether a writable-call failure is safe to call FAILED.
-
-    A complete snapshot on both sides of the invocation is the only proof that
-    allows a started (or indeterminate) writable process to remain a safe
-    automation failure. Structured-result corruption remains a human stop even
-    when the source tree is unchanged because the controller cannot trust the
-    operation's declared completion.
-    """
-
-    inspection = inspect_writable_attempt_after_failure(attempt, repository)
-    process_started = None if attempt is None else attempt.process_started
-    repository_identical = (
-        inspection.before_complete
-        and inspection.after_complete
-        and inspection.workspace_identical
-    )
-    if malformed_result or untrusted_completion or not repository_identical:
-        return _repository_uncertain_stop(
-            message,
-            process_started=process_started,
-            inspection_error=inspection.inspection_error,
-        )
-    return TerminalStop(
-        state=WorkflowState.FAILED,
-        reason=StopReason(
-            category=category_if_safe,
-            message=message,
-            retryable=retryable_if_safe,
-        ),
-    )
-
-
 def classify_unexpected_controller_failure(
     run_dir: Path | str,
     run_record: RunRecord,
@@ -100,14 +53,11 @@ def classify_unexpected_controller_failure(
         WorkflowState.IMPLEMENTING,
         WorkflowState.CORRECTING,
     }:
-        repository = GitRepository(Path(run_record.target_repository_path))
-        attempt = _current_writable_attempt(Path(run_dir), run_record)
-        return classify_writable_failure(
-            repository,
-            attempt=attempt,
+        del run_dir
+        return _repository_uncertain_stop(
             message=message,
-            category_if_safe=StopCategory.CONTROLLER_FAILURE,
-            retryable_if_safe=False,
+            process_started=None,
+            inspection_error=None,
         )
     return TerminalStop(
         state=WorkflowState.FAILED,
@@ -117,16 +67,6 @@ def classify_unexpected_controller_failure(
             retryable=False,
         ),
     )
-
-
-def _current_writable_attempt(
-    run_dir: Path,
-    run_record: RunRecord,
-) -> WritableAttempt | None:
-    # A controller crash during a writable phase is deliberately never
-    # reconstructed from disk. The caller will classify it as HUMAN_REQUIRED.
-    del run_dir, run_record
-    return None
 
 
 def _repository_uncertain_stop(
@@ -160,5 +100,4 @@ __all__ = [
     "TerminalStop",
     "classify_stage_stop",
     "classify_unexpected_controller_failure",
-    "classify_writable_failure",
 ]

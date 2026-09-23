@@ -60,10 +60,7 @@ LIFECYCLE_IMPLEMENTATION_MODULES = frozenset(
         f"{PACKAGE}.workflow",
     }
 )
-LEGACY_APPLICATION_MODULES = LIFECYCLE_IMPLEMENTATION_MODULES | {
-    f"{PACKAGE}.writable_attempts",
-    f"{PACKAGE}.writable_worker",
-}
+LEGACY_APPLICATION_MODULES = LIFECYCLE_IMPLEMENTATION_MODULES
 
 
 @dataclass(frozen=True)
@@ -251,27 +248,6 @@ ARCHITECTURE_DEBT = (
         "_run_baseline_verification_stage",
         "TA-LIFE-002",
         "Invoke verification through the split lifecycle stage API.",
-    ),
-    _private_debt(
-        "ticket_automation.writable_worker",
-        "ticket_automation.workspace_guard",
-        "_compare_workspace_environment_change",
-        "TA-WRITE-001",
-        "Own environment comparison in the guarded writable operation.",
-    ),
-    _private_debt(
-        "ticket_automation.writable_worker",
-        "ticket_automation.workspace_guard",
-        "_format_workspace_environment_inspection_failure",
-        "TA-WRITE-001",
-        "Own environment inspection failures in the guarded writable operation.",
-    ),
-    _private_debt(
-        "ticket_automation.writable_worker",
-        "ticket_automation.writable_attempts",
-        "_capture_writable_attempt",
-        "TA-WRITE-001",
-        "Consolidate writable attempt capture behind the guarded operation.",
     ),
 )
 

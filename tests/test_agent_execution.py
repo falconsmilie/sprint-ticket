@@ -356,7 +356,7 @@ _PRE_INVOCATION_FAILURES = (
 _POST_INVOCATION_FAILURES = tuple(
     category
     for category in AgentFailureCategory
-    if category not in _PRE_INVOCATION_FAILURES
+    if category not in {*_PRE_INVOCATION_FAILURES, AgentFailureCategory.TIMEOUT}
 )
 
 
@@ -411,6 +411,8 @@ def test_post_invocation_failure_rejects_not_started_state(
             (category, InvocationStart.STARTED)
             for category in _POST_INVOCATION_FAILURES
         ),
+        (AgentFailureCategory.TIMEOUT, InvocationStart.NOT_STARTED),
+        (AgentFailureCategory.TIMEOUT, InvocationStart.STARTED),
         (AgentFailureCategory.TIMEOUT, InvocationStart.UNKNOWN),
     ],
 )

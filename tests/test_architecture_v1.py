@@ -93,6 +93,10 @@ class WorkspaceChangingExecutor:
     def __init__(self, inner: InMemoryAgentExecutor) -> None:
         self.inner = inner
 
+    @property
+    def capabilities(self):
+        return self.inner.capabilities
+
     def execute(self, request, *, on_invocation_start=None):
         def start() -> None:
             if on_invocation_start is not None:
@@ -113,8 +117,10 @@ class WorkspaceChangingExecutor:
 class CompletingCodexRunner:
     calls: int = 0
 
-    def run(self, command, *, stdin, timeout_seconds):
+    def run(self, command, *, stdin, timeout_seconds, on_process_start=None):
         del stdin, timeout_seconds
+        if on_process_start is not None:
+            on_process_start()
         self.calls += 1
         is_review = command.argv[command.argv.index("--sandbox") + 1] == "read-only"
         if is_review:
@@ -137,6 +143,16 @@ class CompletingCodexRunner:
         output = Path(command.argv[command.argv.index("--output-last-message") + 1])
         output.write_text(json.dumps(result), encoding="utf-8")
         return CodexProcessResult(returncode=0, stdout="", stderr="")
+
+    def _run_with_start_tracking(
+        self, command, *, stdin, timeout_seconds, on_process_start
+    ):
+        return self.run(
+            command,
+            stdin=stdin,
+            timeout_seconds=timeout_seconds,
+            on_process_start=on_process_start,
+        )
 
 
 def _ticket(tmp_path: Path) -> Path:

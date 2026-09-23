@@ -80,6 +80,7 @@ class FakeRunner:
         *,
         stdin: str,
         timeout_seconds: float | None,
+        on_process_start=None,
     ) -> CodexProcessResult:
         self.calls += 1
         self.command = command
@@ -87,11 +88,28 @@ class FakeRunner:
         self.timeout_seconds = timeout_seconds
         if self.error is not None:
             raise self.error
+        if on_process_start is not None:
+            on_process_start()
         if self.typed_result is not None:
             output = Path(command.argv[command.argv.index("--output-last-message") + 1])
             output.write_text(self.typed_result, encoding="utf-8")
         assert self.result is not None
         return self.result
+
+    def _run_with_start_tracking(
+        self,
+        command: CodexCommand,
+        *,
+        stdin: str,
+        timeout_seconds: float | None,
+        on_process_start,
+    ) -> CodexProcessResult:
+        return self.run(
+            command,
+            stdin=stdin,
+            timeout_seconds=timeout_seconds,
+            on_process_start=on_process_start,
+        )
 
 
 def request(
@@ -364,8 +382,52 @@ def test_review_request_is_read_only(tmp_path: Path) -> None:
     assert "sandbox_workspace_write.network_access=true" not in runner.command.argv
 
 
-def test_invocation_start_is_reported_before_runner_call(tmp_path: Path) -> None:
-    observations: list[str] = []
+def test_legacy_runner_remains_read_only_compatible_and_cannot_claim_write(
+    tmp_path: Path,
+) -> None:
+    @dataclass
+    class LegacyRunner:
+        calls: int = 0
+
+        def run(self, command, *, stdin, timeout_seconds):
+            del stdin, timeout_seconds
+            self.calls += 1
+            output = Path(command.argv[command.argv.index("--output-last-message") + 1])
+            output.write_text(json.dumps(review_payload()), encoding="utf-8")
+            return CodexProcessResult(0, "", "")
+
+    review_repository = tmp_path / "review"
+    review_repository.mkdir()
+    runner = LegacyRunner()
+    executor = CodexCliAgentExecutor(SETTINGS, runner=runner)
+
+    review = executor.execute(request(review_repository, AgentTaskKind.REVIEW))
+
+    assert review.successful
+    assert runner.calls == 1
+    assert AgentCapability.WORKSPACE_WRITE_EXECUTION not in executor.capabilities
+
+    write_repository = tmp_path / "write"
+    write_repository.mkdir()
+    rejected = executor.execute(request(write_repository))
+
+    assert not rejected.successful
+    assert (
+        rejected.failure_category
+        is AgentFailureCategory.CAPABILITY_OR_CONFIGURATION_FAILURE
+    )
+    assert rejected.invocation_start is InvocationStart.NOT_STARTED
+    assert runner.calls == 1
+
+
+def test_invocation_start_is_reported_after_spawn_before_process_completion(
+    tmp_path: Path,
+) -> None:
+    state = {
+        "runner_entered": False,
+        "start_observed": False,
+        "process_completed": False,
+    }
 
     @dataclass
     class ObservingRunner(FakeRunner):
@@ -375,13 +437,23 @@ def test_invocation_start_is_reported_before_runner_call(tmp_path: Path) -> None
             *,
             stdin: str,
             timeout_seconds: float | None,
+            on_process_start=None,
         ) -> CodexProcessResult:
-            observations.append("runner")
-            return super().run(
+            state["runner_entered"] = True
+            if on_process_start is not None:
+                on_process_start()
+            result = super().run(
                 command,
                 stdin=stdin,
                 timeout_seconds=timeout_seconds,
             )
+            state["process_completed"] = True
+            return result
+
+    def observe_start() -> None:
+        assert state["runner_entered"]
+        assert not state["process_completed"]
+        state["start_observed"] = True
 
     tracked = request(tmp_path)
     runner = ObservingRunner(
@@ -391,11 +463,15 @@ def test_invocation_start_is_reported_before_runner_call(tmp_path: Path) -> None
 
     execution = CodexCliAgentExecutor(SETTINGS, runner=runner).execute(
         tracked,
-        on_invocation_start=lambda: observations.append("start"),
+        on_invocation_start=observe_start,
     )
 
     assert execution.successful
-    assert observations == ["start", "runner"]
+    assert state == {
+        "runner_entered": True,
+        "start_observed": True,
+        "process_completed": True,
+    }
 
 
 @pytest.mark.parametrize(
@@ -419,7 +495,7 @@ def test_invocation_start_observer_errors_are_not_mapped_as_provider_failures(
             on_invocation_start=fail_to_record_start,
         )
 
-    assert runner.calls == 0
+    assert runner.calls == 1
 
 
 def test_backward_wall_clock_is_recorded_as_a_zero_duration(tmp_path: Path) -> None:
@@ -645,19 +721,33 @@ def test_subprocess_runner_uses_argv_and_disables_shell(
 ) -> None:
     captured: dict[str, object] = {}
 
-    def fake_run(*args: object, **kwargs: object) -> object:
+    class CompletedProcess:
+        returncode = 0
+
+        def communicate(self, *, input=None, timeout=None):
+            assert captured["process_started"] is True
+            captured["input"] = input
+            captured["timeout"] = timeout
+            return b"diagnostic output\n", b""
+
+        def kill(self) -> None:
+            raise AssertionError("completed process must not be killed")
+
+        def wait(self) -> int:
+            return self.returncode
+
+    def fake_popen(*args: object, **kwargs: object) -> object:
         captured["args"] = args
         captured["kwargs"] = kwargs
+        return CompletedProcess()
 
-        class Completed:
-            returncode = 0
-            stdout = b"diagnostic output\n"
-            stderr = b""
+    monkeypatch.setattr(process_module.subprocess, "Popen", fake_popen)
+    captured["process_started"] = False
 
-        return Completed()
+    def record_start() -> None:
+        captured["process_started"] = True
 
-    monkeypatch.setattr(process_module.subprocess, "run", fake_run)
-    result = SubprocessCodexRunner().run(
+    result = SubprocessCodexRunner()._run_with_start_tracking(
         CodexCommand(
             ("codex", "exec", "-"),
             tmp_path,
@@ -665,6 +755,7 @@ def test_subprocess_runner_uses_argv_and_disables_shell(
         ),
         stdin="prompt",
         timeout_seconds=10,
+        on_process_start=record_start,
     )
 
     assert result.returncode == 0
@@ -672,8 +763,134 @@ def test_subprocess_runner_uses_argv_and_disables_shell(
     kwargs = captured["kwargs"]
     assert isinstance(kwargs, dict)
     assert kwargs["cwd"] == tmp_path
-    assert kwargs["input"] == b"prompt"
+    assert captured["input"] == b"prompt"
+    assert captured["timeout"] == 10
     assert kwargs["shell"] is False
+
+
+def test_tracked_subprocess_timeout_kills_process_and_keeps_final_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class TimedOutProcess:
+        returncode = None
+
+        def __init__(self) -> None:
+            self.communicate_calls = 0
+            self.killed = False
+
+        def communicate(self, *, input=None, timeout=None):
+            self.communicate_calls += 1
+            if self.communicate_calls == 1:
+                assert input == b"prompt"
+                assert timeout == 5
+                raise process_module.subprocess.TimeoutExpired(
+                    cmd=("codex", "exec", "-"),
+                    timeout=5,
+                    output=b"partial stdout\n",
+                    stderr=b"partial stderr\n",
+                )
+            assert self.killed
+            return b"partial stdout\nfinal stdout\n", b"partial stderr\nfinal stderr\n"
+
+        def kill(self) -> None:
+            self.killed = True
+
+        def wait(self) -> int:
+            raise AssertionError("timeout cleanup uses communicate after kill")
+
+    process = TimedOutProcess()
+    monkeypatch.setattr(
+        process_module.subprocess, "Popen", lambda *args, **kwargs: process
+    )
+    starts = 0
+
+    def record_start() -> None:
+        nonlocal starts
+        starts += 1
+
+    with pytest.raises(CodexProcessTimedOut) as raised:
+        SubprocessCodexRunner()._run_with_start_tracking(
+            CodexCommand(("codex", "exec", "-"), tmp_path),
+            stdin="prompt",
+            timeout_seconds=5,
+            on_process_start=record_start,
+        )
+
+    assert starts == 1
+    assert process.killed
+    assert process.communicate_calls == 2
+    assert raised.value.result.stdout == "partial stdout\nfinal stdout\n"
+    assert raised.value.result.stderr == "partial stderr\nfinal stderr\n"
+
+
+def test_tracked_subprocess_stops_child_when_start_observer_is_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class SpawnedProcess:
+        returncode = None
+
+        def __init__(self) -> None:
+            self.killed = False
+            self.waited = False
+
+        def communicate(self, *, input=None, timeout=None):
+            del input, timeout
+            raise AssertionError("observer interruption must stop before communicate")
+
+        def kill(self) -> None:
+            self.killed = True
+
+        def wait(self) -> int:
+            self.waited = True
+            return 1
+
+    process = SpawnedProcess()
+    monkeypatch.setattr(
+        process_module.subprocess, "Popen", lambda *args, **kwargs: process
+    )
+
+    def interrupt() -> None:
+        raise KeyboardInterrupt("interrupted while recording start")
+
+    with pytest.raises(KeyboardInterrupt, match="recording start"):
+        SubprocessCodexRunner()._run_with_start_tracking(
+            CodexCommand(("codex", "exec", "-"), tmp_path),
+            stdin="prompt",
+            timeout_seconds=5,
+            on_process_start=interrupt,
+        )
+
+    assert process.killed
+    assert process.waited
+
+
+def test_subprocess_spawn_failure_does_not_report_process_start(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    started = False
+
+    def fail_spawn(*args: object, **kwargs: object):
+        del args, kwargs
+        raise FileNotFoundError("codex unavailable")
+
+    def record_start() -> None:
+        nonlocal started
+        started = True
+
+    monkeypatch.setattr(process_module.subprocess, "Popen", fail_spawn)
+
+    with pytest.raises(FileNotFoundError, match="codex unavailable"):
+        SubprocessCodexRunner()._run_with_start_tracking(
+            CodexCommand(("codex", "exec", "-"), tmp_path),
+            stdin="prompt",
+            timeout_seconds=10,
+            on_process_start=record_start,
+        )
+
+    assert started is False
 
 
 def test_adapter_rejects_scratch_inside_repository(

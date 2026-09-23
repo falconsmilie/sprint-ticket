@@ -6,10 +6,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from tests.helpers import create_git_repo, make_config
+from tests.helpers import create_git_repo, make_config, run_git
 from ticket_automation.attempts import AttemptRecord, load_attempt_records
 from ticket_automation.config import AppConfig
-from ticket_automation.providers.codex_cli import CodexProcessResult
+from ticket_automation.providers.codex_cli import (
+    CodexProcessResult,
+    CodexProcessTimedOut,
+    CodexProcessTimeout,
+)
 from ticket_automation.providers.codex_cli.identity import PROVIDER_ID
 from ticket_automation.verification import VerificationProcessResult
 
@@ -70,8 +74,10 @@ def configure_fake_codex_actions(
 class ScriptedCodexRunner:
     action_path: Path
 
-    def run(self, command, *, stdin, timeout_seconds):
-        del stdin, timeout_seconds
+    def run(self, command, *, stdin, timeout_seconds, on_process_start=None):
+        del stdin
+        if on_process_start is not None:
+            on_process_start()
         actions = json.loads(self.action_path.read_text(encoding="utf-8"))
         if not isinstance(actions, list) or not actions:
             raise AssertionError("No scripted Codex result remains.")
@@ -87,6 +93,10 @@ class ScriptedCodexRunner:
             return CodexProcessResult(2, "", "fake codex failed\n")
         if action == "missing-result":
             return CodexProcessResult(0, "", "")
+        if action == "timeout":
+            raise CodexProcessTimedOut(
+                CodexProcessTimeout("", "fake timeout\n", timeout_seconds or 0)
+            )
 
         output_path = Path(
             command.argv[command.argv.index("--output-last-message") + 1]
@@ -110,8 +120,37 @@ class ScriptedCodexRunner:
                 command.cwd.joinpath(target).write_text(
                     "implemented by fake codex\n", encoding="utf-8"
                 )
+            elif action == "staging-change":
+                command.cwd.joinpath("file.txt").write_text(
+                    "staged by fake codex\n", encoding="utf-8"
+                )
+                run_git(command.cwd, "add", "file.txt")
+            elif action == "branch-change":
+                run_git(command.cwd, "checkout", "-b", "agent-branch")
+            elif action == "head-change":
+                command.cwd.joinpath("file.txt").write_text(
+                    "committed by fake codex\n", encoding="utf-8"
+                )
+                run_git(command.cwd, "add", "file.txt")
+                run_git(command.cwd, "commit", "-m", "agent commit")
+            elif action == "environment-change":
+                environment = command.cwd / ".venv"
+                environment.mkdir()
+                environment.joinpath("pyvenv.cfg").write_text(
+                    "home = fake\n", encoding="utf-8"
+                )
         output_path.write_text(json.dumps(result), encoding="utf-8")
         return CodexProcessResult(0, "", "")
+
+    def _run_with_start_tracking(
+        self, command, *, stdin, timeout_seconds, on_process_start
+    ):
+        return self.run(
+            command,
+            stdin=stdin,
+            timeout_seconds=timeout_seconds,
+            on_process_start=on_process_start,
+        )
 
 
 def _scripted_implementation_result(action: str) -> dict[str, object]:

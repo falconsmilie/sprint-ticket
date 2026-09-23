@@ -40,8 +40,10 @@ def fixed_clock() -> datetime:
 
 
 class CompletingCodexRunner:
-    def run(self, command, *, stdin, timeout_seconds):
+    def run(self, command, *, stdin, timeout_seconds, on_process_start=None):
         del stdin, timeout_seconds
+        if on_process_start is not None:
+            on_process_start()
         if command.argv[command.argv.index("--sandbox") + 1] == "read-only":
             result = {"verdict": "PASS", "summary": "passed", "findings": []}
         else:
@@ -60,6 +62,16 @@ class CompletingCodexRunner:
             encoding="utf-8",
         )
         return CodexProcessResult(returncode=0, stdout="", stderr="")
+
+    def _run_with_start_tracking(
+        self, command, *, stdin, timeout_seconds, on_process_start
+    ):
+        return self.run(
+            command,
+            stdin=stdin,
+            timeout_seconds=timeout_seconds,
+            on_process_start=on_process_start,
+        )
 
 
 class PassingVerificationRunner:

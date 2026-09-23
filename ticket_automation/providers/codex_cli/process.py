@@ -6,7 +6,7 @@ import os
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,31 +66,81 @@ class SubprocessCodexRunner:
         stdin: str,
         timeout_seconds: float | None,
     ) -> CodexProcessResult:
+        return _run_without_start_tracking(command, stdin, timeout_seconds)
+
+    def _run_with_start_tracking(
+        self,
+        command: CodexCommand,
+        *,
+        stdin: str,
+        timeout_seconds: float | None,
+        on_process_start: Callable[[], None],
+    ) -> CodexProcessResult:
+        process = subprocess.Popen(
+            command.argv,
+            cwd=command.cwd,
+            env=_process_environment(command.environment),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+        )
         try:
-            completed = subprocess.run(
-                command.argv,
-                cwd=command.cwd,
-                env=_process_environment(command.environment),
-                input=stdin.encode("utf-8"),
-                capture_output=True,
-                text=False,
-                check=False,
-                timeout=timeout_seconds,
-                shell=False,
+            on_process_start()
+            stdout, stderr = process.communicate(
+                input=stdin.encode("utf-8"), timeout=timeout_seconds
             )
         except subprocess.TimeoutExpired as error:
+            process.kill()
+            final_stdout, final_stderr = process.communicate()
             raise CodexProcessTimedOut(
                 CodexProcessTimeout(
-                    stdout=decode_human_output(error.stdout),
-                    stderr=decode_human_output(error.stderr),
+                    stdout=decode_human_output(final_stdout),
+                    stderr=decode_human_output(final_stderr),
                     timeout_seconds=float(timeout_seconds or 0),
                 )
             ) from error
+        except BaseException:
+            process.kill()
+            process.wait()
+            raise
         return CodexProcessResult(
-            returncode=completed.returncode,
-            stdout=decode_human_output(completed.stdout),
-            stderr=decode_human_output(completed.stderr),
+            returncode=process.returncode,
+            stdout=decode_human_output(stdout),
+            stderr=decode_human_output(stderr),
         )
+
+
+def _run_without_start_tracking(
+    command: CodexCommand,
+    stdin: str,
+    timeout_seconds: float | None,
+) -> CodexProcessResult:
+    try:
+        completed = subprocess.run(
+            command.argv,
+            cwd=command.cwd,
+            env=_process_environment(command.environment),
+            input=stdin.encode("utf-8"),
+            capture_output=True,
+            text=False,
+            check=False,
+            timeout=timeout_seconds,
+            shell=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise CodexProcessTimedOut(
+            CodexProcessTimeout(
+                stdout=decode_human_output(error.stdout),
+                stderr=decode_human_output(error.stderr),
+                timeout_seconds=float(timeout_seconds or 0),
+            )
+        ) from error
+    return CodexProcessResult(
+        returncode=completed.returncode,
+        stdout=decode_human_output(completed.stdout),
+        stderr=decode_human_output(completed.stderr),
+    )
 
 
 def with_environment(

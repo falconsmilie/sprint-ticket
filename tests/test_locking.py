@@ -111,12 +111,15 @@ class SequencedCodexRunner:
         *,
         stdin: str,
         timeout_seconds: float | None,
+        on_process_start=None,
     ) -> CodexProcessResult:
         del stdin, timeout_seconds
         assert self.steps, "Unexpected Codex invocation."
         step = self.steps.pop(0)
         if step.error is not None:
             raise step.error
+        if on_process_start is not None:
+            on_process_start()
         if step.mutation is not None:
             step.mutation(command.cwd)
         assert step.result is not None
@@ -127,6 +130,21 @@ class SequencedCodexRunner:
             returncode=0,
             stdout=_event_stream(step.result),
             stderr="fake codex progress\n",
+        )
+
+    def _run_with_start_tracking(
+        self,
+        command: CodexCommand,
+        *,
+        stdin: str,
+        timeout_seconds: float | None,
+        on_process_start,
+    ) -> CodexProcessResult:
+        return self.run(
+            command,
+            stdin=stdin,
+            timeout_seconds=timeout_seconds,
+            on_process_start=on_process_start,
         )
 
 
