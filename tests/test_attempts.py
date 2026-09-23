@@ -13,6 +13,7 @@ from tests.helpers import (
     create_trusted_prepared_run,
     make_agent_executors,
     make_config,
+    make_final_patch_capture,
     make_resume_agent_executor_factory,
 )
 from ticket_automation.application.agent_execution import (
@@ -398,6 +399,7 @@ def test_resume_requires_human_inspection_for_invalid_attempt_evidence(
     result = resume_ticket_lifecycle(
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
+        final_patch_capture=make_final_patch_capture(),
         agent_executor_factory=make_resume_agent_executor_factory(
             make_agent_executors(config).implementation
         ),

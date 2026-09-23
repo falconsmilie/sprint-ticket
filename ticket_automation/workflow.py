@@ -9,14 +9,18 @@ from pathlib import Path
 
 from ._verification_artifacts import (
     _baseline_verification_evidence_problem,
-    _read_verification_source_fingerprint,
     _verification_commands_fingerprint,
-    _VerificationArtifactError,
 )
 from .application.agent_execution import (
     AgentExecutorAssignments,
     PersistedAgentExecutorFactory,
 )
+from .application.handoff_acceptance import (
+    HandoffAcceptanceRequest,
+    HandoffAcceptanceService,
+    HandoffAccepted,
+)
+from .application.ports.handoff import FinalPatchCapture
 from .application.ports.preflight import ProviderPreflight
 from .attempts import (
     AttemptError,
@@ -28,14 +32,13 @@ from .attempts import (
     load_attempt_records,
     start_attempt,
 )
-from .audit import diff_including_untracked
 from .config import AppConfig, ConfigError
 from .correction_planner import plan_pending_correction
 from .corrections import (
     CorrectionStageResult,
     run_correction_stage,
 )
-from .domain.task_results import ReviewResult, ReviewVerdict
+from .domain.task_results import ReviewResult
 from .failure_classification import (
     TerminalStop,
     classify_stage_stop,
@@ -60,7 +63,6 @@ from .models import (
 )
 from .preflight import PreflightResult
 from .reporting import (
-    FINAL_PATCH_FILE,
     ReportError,
     ReportStageResult,
     collect_report_context,
@@ -70,7 +72,6 @@ from .reporting import (
 from .resolved_config import ResolvedRunPolicy, config_from_resolved_run_policy
 from .review import (
     ReviewStageResult,
-    _validate_review_result_artifact,
     run_review_stage,
 )
 from .runs import (
@@ -138,6 +139,7 @@ def run_ticket_lifecycle(
     provider_preflight: ProviderPreflight,
     resolved_policy: ResolvedRunPolicy,
     agent_executor_factory: PersistedAgentExecutorFactory,
+    final_patch_capture: FinalPatchCapture,
     verification_runner: VerificationProcessRunner | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> LifecycleResult:
@@ -155,6 +157,7 @@ def run_ticket_lifecycle(
             provider_preflight=provider_preflight,
             resolved_policy=resolved_policy,
             agent_executor_factory=agent_executor_factory,
+            final_patch_capture=final_patch_capture,
             verification_runner=verification_runner,
             clock=clock,
         )
@@ -169,6 +172,7 @@ def _run_ticket_lifecycle_locked(
     provider_preflight: ProviderPreflight,
     resolved_policy: ResolvedRunPolicy,
     agent_executor_factory: PersistedAgentExecutorFactory,
+    final_patch_capture: FinalPatchCapture,
     verification_runner: VerificationProcessRunner | None,
     clock: Callable[[], datetime] | None,
 ) -> LifecycleResult:
@@ -206,6 +210,7 @@ def _run_ticket_lifecycle_locked(
             review_results=review_results,
             correction_results=correction_results,
             agent_executor=agent_executors,
+            final_patch_capture=final_patch_capture,
             verification_runner=verification_runner,
             repository_lock=repository_lock,
             clock=clock,
@@ -257,6 +262,7 @@ def resume_ticket_lifecycle(
     *,
     runs_dir: Path | str,
     agent_executor_factory: PersistedAgentExecutorFactory,
+    final_patch_capture: FinalPatchCapture,
     verification_runner: VerificationProcessRunner | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> LifecycleResult:
@@ -280,6 +286,7 @@ def resume_ticket_lifecycle(
             run_record,
             repository_lock=repository_lock,
             agent_executor_factory=agent_executor_factory,
+            final_patch_capture=final_patch_capture,
             verification_runner=verification_runner,
             clock=clock,
         )
@@ -293,6 +300,7 @@ def _resume_ticket_lifecycle_locked(
     *,
     repository_lock: RepositoryRunLock,
     agent_executor_factory: PersistedAgentExecutorFactory,
+    final_patch_capture: FinalPatchCapture,
     verification_runner: VerificationProcessRunner | None,
     clock: Callable[[], datetime] | None,
 ) -> LifecycleResult:
@@ -421,6 +429,7 @@ def _resume_ticket_lifecycle_locked(
             review_results=review_results,
             correction_results=correction_results,
             agent_executor=agent_executor,
+            final_patch_capture=final_patch_capture,
             verification_runner=verification_runner,
             repository_lock=repository_lock,
             clock=clock,
@@ -554,6 +563,7 @@ def _drive_lifecycle(
     review_results: list[ReviewStageResult],
     correction_results: list[CorrectionStageResult],
     agent_executor: AgentExecutorAssignments,
+    final_patch_capture: FinalPatchCapture,
     verification_runner: VerificationProcessRunner | None,
     repository_lock: RepositoryRunLock,
     clock: Callable[[], datetime] | None,
@@ -679,117 +689,64 @@ def _drive_lifecycle(
             continue
 
         if run_record.state == WorkflowState.REPORTING:
-            try:
-                snapshot = WorkspaceSnapshot.capture(
-                    GitRepository(Path(run_record.target_repository_path))
-                )
-                snapshot_problem: str | None = None
-            except (GitCommandError, OSError, RuntimeError, ValueError) as error:
-                snapshot = None
-                snapshot_problem = (
-                    "Could not inspect the workspace before human handoff: "
-                    f"{type(error).__name__}: {error}"
-                )
             report_attempt = start_attempt(
                 run_dir,
                 phase=AttemptPhase.REPORTING,
-                before_workspace_fingerprint=(
-                    None if snapshot is None else snapshot.fingerprint
-                ),
+                before_workspace_fingerprint=None,
                 clock=clock,
             )
-            handoff_problem = snapshot_problem or _final_handoff_problem(
-                run_dir,
-                run_record,
-                snapshot=snapshot,
+            handoff = HandoffAcceptanceService(
+                patch_capture=final_patch_capture
+            ).accept(
+                HandoffAcceptanceRequest(
+                    run_dir=run_dir,
+                    run_record=run_record,
+                )
             )
-            if handoff_problem is not None:
+            if not isinstance(handoff, HandoffAccepted):
+                run_record = _mark_human_required(
+                    run_dir,
+                    terminal_reason=handoff.reason,
+                    clock=clock,
+                    category=handoff.stop_category,
+                )
+                _update_repository_lock(repository_lock, run_record)
                 _write_attempt_result(
                     report_attempt,
                     status=StageOutcome.HUMAN_REQUIRED.value,
-                    message=handoff_problem,
+                    message=handoff.reason,
                 )
+                final_workspace = handoff.final_workspace
                 finish_phase_attempt(
                     run_dir,
                     phase=AttemptPhase.REPORTING,
                     stage_outcome=StageOutcome.HUMAN_REQUIRED,
                     after_workspace_fingerprint=(
-                        None if snapshot is None else snapshot.fingerprint
+                        None if final_workspace is None else final_workspace.fingerprint
                     ),
-                    metadata={"controller_message": handoff_problem},
+                    metadata={"controller_message": handoff.reason},
                     clock=clock,
                 )
-                run_record = _mark_human_required(
-                    run_dir,
-                    terminal_reason=handoff_problem,
-                    clock=clock,
-                    category=StopCategory.SAFETY_VIOLATION,
-                )
-                _update_repository_lock(repository_lock, run_record)
                 continue
-            assert snapshot is not None
-            try:
-                _capture_final_patch(run_dir, run_record)
-                after_patch_snapshot = WorkspaceSnapshot.capture(
-                    GitRepository(Path(run_record.target_repository_path))
-                )
-            except (GitCommandError, OSError, RuntimeError, ValueError) as error:
-                handoff_problem = (
-                    "Could not capture the final handoff patch safely: "
-                    f"{type(error).__name__}: {error}"
-                )
-            else:
-                if not snapshot.matches(after_patch_snapshot):
-                    handoff_problem = (
-                        "Workspace changed while the final handoff patch was being "
-                        "captured."
-                    )
-                else:
-                    snapshot = after_patch_snapshot
-            if handoff_problem is not None:
-                _write_attempt_result(
-                    report_attempt,
-                    status=StageOutcome.HUMAN_REQUIRED.value,
-                    message=handoff_problem,
-                )
-                finish_phase_attempt(
-                    run_dir,
-                    phase=AttemptPhase.REPORTING,
-                    stage_outcome=StageOutcome.HUMAN_REQUIRED,
-                    after_workspace_fingerprint=snapshot.fingerprint,
-                    metadata={"controller_message": handoff_problem},
-                    clock=clock,
-                )
-                run_record = _mark_human_required(
-                    run_dir,
-                    terminal_reason=handoff_problem,
-                    clock=clock,
-                    category=StopCategory.SAFETY_VIOLATION,
-                )
-                _update_repository_lock(repository_lock, run_record)
-                continue
+            run_record = _persist_stage_outcome(
+                run_dir,
+                run_record,
+                StageOutcome.COMPLETED,
+                terminal_reason=handoff.reason,
+                clock=clock,
+            )
+            _update_repository_lock(repository_lock, run_record)
             _write_attempt_result(
                 report_attempt,
                 status="PASS",
-                message="Final workspace and evidence consistency checks passed.",
+                message=handoff.reason,
             )
             finish_phase_attempt(
                 run_dir,
                 phase=AttemptPhase.REPORTING,
                 stage_outcome=StageOutcome.COMPLETED,
-                after_workspace_fingerprint=snapshot.fingerprint,
-                metadata={
-                    "controller_message": (
-                        "Final workspace and evidence consistency checks passed."
-                    )
-                },
-                clock=clock,
-            )
-            run_record = _persist_stage_outcome(
-                run_dir,
-                run_record,
-                StageOutcome.COMPLETED,
-                terminal_reason="Final workspace and evidence consistency checks passed.",
+                after_workspace_fingerprint=handoff.final_workspace.fingerprint,
+                metadata={"controller_message": handoff.reason},
                 clock=clock,
             )
             try:
@@ -799,7 +756,6 @@ def _drive_lifecycle(
                 # decision. Rendering is retriable presentation work and cannot
                 # move a READY_FOR_HUMAN run to another terminal state.
                 report_result = None
-            _update_repository_lock(repository_lock, run_record)
             continue
 
         raise RunError(
@@ -836,64 +792,6 @@ def _persist_requested_transition(
     )
     save_run_record(updated_record, run_dir / RUN_RECORD_FILE)
     return updated_record
-
-
-def _final_handoff_problem(
-    run_dir: Path,
-    run_record: RunRecord,
-    *,
-    snapshot: WorkspaceSnapshot | None,
-) -> str | None:
-    """Controller-owned acceptance check before moving out of REPORTING."""
-
-    try:
-        load_attempt_records(run_dir)
-    except AttemptError as error:
-        return f"Attempt evidence is invalid before human handoff: {error}"
-    if snapshot is None or not snapshot.inspection_complete:
-        return "Repository safety invariants were violated before human handoff."
-    if snapshot.branch != run_record.starting_branch:
-        return "Repository branch changed before human handoff."
-    if snapshot.head_sha != run_record.baseline_sha:
-        return "Repository HEAD changed before human handoff."
-    if snapshot.staged_paths:
-        return "Repository has staged changes before human handoff."
-    writable = latest_writable_attempt(run_dir)
-    if writable is None or writable.after_workspace_fingerprint is None:
-        return "No completed writable attempt has a workspace fingerprint."
-    if not snapshot.matches_fingerprint(writable.after_workspace_fingerprint):
-        return "Current workspace no longer matches the completed writable attempt."
-    try:
-        _read_verification_source_fingerprint(
-            run_dir,
-            run_record,
-            expected_statuses=frozenset({"PASS"}),
-            verification_commands=run_record.resolved_policy.verification_commands,
-        )
-    except _VerificationArtifactError as error:
-        return f"Deterministic verification evidence is not passing: {error}"
-    review = _attempt_result(run_dir, AttemptPhase.REVIEWING)
-    if review is None:
-        return "Final independent review evidence is missing."
-    try:
-        review = _validate_review_result_artifact(review)
-    except (KeyError, TypeError, ValueError) as error:
-        return f"Final independent review evidence is invalid: {error}"
-    if review.verdict is not ReviewVerdict.PASS:
-        return "Final independent review did not pass."
-    return None
-
-
-def _capture_final_patch(run_dir: Path, run_record: RunRecord) -> None:
-    patch = diff_including_untracked(
-        GitRepository(Path(run_record.target_repository_path)),
-        run_record.baseline_sha,
-    )
-    (run_dir / FINAL_PATCH_FILE).write_text(
-        patch,
-        encoding="utf-8",
-        newline="\n",
-    )
 
 
 def _write_attempt_result(

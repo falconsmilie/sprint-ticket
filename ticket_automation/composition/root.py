@@ -6,11 +6,13 @@ from dataclasses import replace
 from types import MappingProxyType
 
 from ..application.agent_execution import PersistedAgentExecutorFactory, ProviderId
+from ..application.ports.handoff import FinalPatchCapture
 from ..config import (
     AgentSettings,
     AppConfig,
     ConfigError,
 )
+from ..infrastructure.final_patch import FileSystemFinalPatchCapture
 from ..providers.codex_cli.composition import CodexCliProviderRegistration
 from ..providers.codex_cli.identity import PROVIDER_ID
 from ..providers.codex_cli.settings import (
@@ -45,6 +47,10 @@ def prepare_production_agents(config: AppConfig) -> PreparedAgentProviders:
 
 def production_agent_executor_factory() -> PersistedAgentExecutorFactory:
     return RegisteredProviderExecutorFactory(production_provider_registry())
+
+
+def production_final_patch_capture() -> FinalPatchCapture:
+    return FileSystemFinalPatchCapture()
 
 
 def apply_codex_execution_overrides(
@@ -99,4 +105,5 @@ __all__ = [
     "apply_codex_execution_overrides",
     "prepare_production_agents",
     "production_agent_executor_factory",
+    "production_final_patch_capture",
 ]

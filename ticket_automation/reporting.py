@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .application.ports.handoff import FINAL_PATCH_FILE
 from .attempts import (
     AttemptRecord,
     attempt_result_path,
@@ -40,7 +41,6 @@ from .models import (
 from .runs import RUN_RECORD_FILE, RunError, RunRecord, load_run_record
 from .task_result_codecs import decode_implementation_result, decode_review_result
 
-FINAL_PATCH_FILE = "final.patch"
 FINAL_REPORT_FILE = "report.md"
 
 

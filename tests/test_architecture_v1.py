@@ -16,6 +16,7 @@ from tests.helpers import (
     make_agent_executor,
     make_agent_executors,
     make_config,
+    make_final_patch_capture,
     make_resume_agent_executor_factory,
     make_run_dependencies,
 )
@@ -42,6 +43,7 @@ from ticket_automation.git_safety import WorkspaceSnapshot
 from ticket_automation.implementation import run_implementation_stage
 from ticket_automation.models import (
     AttemptPhase,
+    StageOutcome,
     StopCategory,
     StopReason,
     WorkflowState,
@@ -278,6 +280,7 @@ def test_resume_reruns_safe_verification_as_a_new_attempt(tmp_path, monkeypatch)
     resumed = resume_ticket_lifecycle(
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
+        final_patch_capture=make_final_patch_capture(),
         verification_runner=PassingVerificationRunner(),
         agent_executor_factory=make_resume_agent_executor_factory(
             make_agent_executors(
@@ -329,6 +332,7 @@ def test_resume_checks_persisted_compatibility_before_constructing_executors(tmp
     result = resume_ticket_lifecycle(
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
+        final_patch_capture=make_final_patch_capture(),
         agent_executor_factory=make_resume_agent_executor_factory(object()),
         clock=fixed_clock,
     )
@@ -361,6 +365,7 @@ def test_terminal_resume_does_not_construct_provider_runtime(tmp_path):
     result = resume_ticket_lifecycle(
         terminal.run_id,
         runs_dir=tmp_path / "runs",
+        final_patch_capture=make_final_patch_capture(),
         agent_executor_factory=make_resume_agent_executor_factory(object()),
         clock=fixed_clock,
     )
@@ -396,6 +401,7 @@ def test_interrupted_writable_state_requires_human_inspection(tmp_path):
     result = resume_ticket_lifecycle(
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
+        final_patch_capture=make_final_patch_capture(),
         agent_executor_factory=make_resume_agent_executor_factory(
             make_agent_executors(config).implementation
         ),
@@ -457,6 +463,7 @@ def test_resume_restarts_preparation_in_a_new_attempt(tmp_path):
     result = resume_ticket_lifecycle(
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
+        final_patch_capture=make_final_patch_capture(),
         verification_runner=PassingVerificationRunner(),
         agent_executor_factory=make_resume_agent_executor_factory(
             make_agent_executors(
@@ -524,6 +531,7 @@ def test_resume_restarts_review_in_a_new_attempt(tmp_path):
     result = resume_ticket_lifecycle(
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
+        final_patch_capture=make_final_patch_capture(),
         verification_runner=PassingVerificationRunner(),
         agent_executor_factory=make_resume_agent_executor_factory(
             make_agent_executors(
@@ -540,6 +548,82 @@ def test_resume_restarts_review_in_a_new_attempt(tmp_path):
     ]
     assert result.run_record.state == WorkflowState.READY_FOR_HUMAN
     assert [item.status for item in review_attempts] == ["STARTED", "COMPLETED"]
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required")
+def test_resume_retries_a_completed_review_before_its_transition(tmp_path):
+    repository = create_git_repo(tmp_path / "target")
+    config = make_config(repository)
+    snapshot = create_trusted_prepared_run(
+        config,
+        _ticket(tmp_path),
+        runs_dir=tmp_path / "runs",
+        clock=fixed_clock,
+    )
+    implementing = snapshot.run_record.transition_to(
+        WorkflowState.IMPLEMENTING,
+        updated_timestamp="2026-09-14T10:16:00Z",
+    )
+    save_run_record(implementing, snapshot.run_dir / "run.json")
+    implementation = run_implementation_stage(
+        config,
+        snapshot.run_dir,
+        agent_executor=make_agent_executor(
+            config, process_runner=CompletingCodexRunner()
+        ),
+        clock=fixed_clock,
+    )
+    verifying = implementation.run_record.transition_to(
+        WorkflowState.VERIFYING,
+        updated_timestamp="2026-09-14T10:17:00Z",
+    )
+    save_run_record(verifying, snapshot.run_dir / "run.json")
+    verification = run_verification_stage(
+        config,
+        snapshot.run_dir,
+        process_runner=PassingVerificationRunner(),
+        clock=fixed_clock,
+    )
+    reviewing = verification.run_record.transition_to(
+        WorkflowState.REVIEWING,
+        updated_timestamp="2026-09-14T10:18:00Z",
+    )
+    save_run_record(reviewing, snapshot.run_dir / "run.json")
+    first_review = run_review_stage(
+        config,
+        snapshot.run_dir,
+        agent_executor=make_agent_executor(
+            config, process_runner=CompletingCodexRunner()
+        ),
+        clock=fixed_clock,
+    )
+
+    assert first_review.outcome is StageOutcome.COMPLETED
+    assert load_run_record(snapshot.run_dir / "run.json").state is (
+        WorkflowState.REVIEWING
+    )
+
+    result = resume_ticket_lifecycle(
+        snapshot.run_record.run_id,
+        runs_dir=tmp_path / "runs",
+        final_patch_capture=make_final_patch_capture(),
+        verification_runner=PassingVerificationRunner(),
+        agent_executor_factory=make_resume_agent_executor_factory(
+            make_agent_executors(
+                config, process_runner=CompletingCodexRunner()
+            ).implementation
+        ),
+        clock=fixed_clock,
+    )
+
+    review_attempts = [
+        item
+        for item in load_attempt_records(snapshot.run_dir)
+        if item.phase == WorkflowState.REVIEWING.value
+    ]
+    assert result.run_record.state is WorkflowState.READY_FOR_HUMAN
+    assert result.run_record.current_review_round == 1
+    assert [item.status for item in review_attempts] == ["COMPLETED", "COMPLETED"]
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required")
@@ -592,6 +676,7 @@ def test_resume_restarts_reporting_in_a_new_attempt(tmp_path):
     reporting = review.run_record.transition_to(
         WorkflowState.REPORTING,
         updated_timestamp="2026-09-14T10:19:00Z",
+        current_review_round=1,
     )
     save_run_record(reporting, snapshot.run_dir / "run.json")
     start_attempt(
@@ -604,6 +689,7 @@ def test_resume_restarts_reporting_in_a_new_attempt(tmp_path):
     result = resume_ticket_lifecycle(
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
+        final_patch_capture=make_final_patch_capture(),
         verification_runner=PassingVerificationRunner(),
         agent_executor_factory=make_resume_agent_executor_factory(
             make_agent_executors(

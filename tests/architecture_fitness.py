@@ -145,6 +145,20 @@ def _provider_debt(
 
 ARCHITECTURE_DEBT = (
     _private_debt(
+        "ticket_automation.application.handoff_acceptance",
+        "ticket_automation._verification_artifacts",
+        "_read_verification_source_fingerprint",
+        "TA-EVID-001",
+        "Move verification evidence access behind its public codec contract.",
+    ),
+    _private_debt(
+        "ticket_automation.application.handoff_acceptance",
+        "ticket_automation._verification_artifacts",
+        "_VerificationArtifactError",
+        "TA-EVID-001",
+        "Move verification evidence errors into the public codec contract.",
+    ),
+    _private_debt(
         "ticket_automation.corrections",
         "ticket_automation._verification_artifacts",
         "_baseline_verification_evidence_problem",
@@ -217,30 +231,9 @@ ARCHITECTURE_DEBT = (
     _private_debt(
         "ticket_automation.workflow",
         "ticket_automation._verification_artifacts",
-        "_read_verification_source_fingerprint",
-        "TA-EVID-001",
-        "Move verification evidence access behind its public codec contract.",
-    ),
-    _private_debt(
-        "ticket_automation.workflow",
-        "ticket_automation._verification_artifacts",
         "_verification_commands_fingerprint",
         "TA-EVID-001",
         "Move evidence fingerprints behind the public codec contract.",
-    ),
-    _private_debt(
-        "ticket_automation.workflow",
-        "ticket_automation._verification_artifacts",
-        "_VerificationArtifactError",
-        "TA-EVID-001",
-        "Move verification evidence errors into the public codec contract.",
-    ),
-    _private_debt(
-        "ticket_automation.workflow",
-        "ticket_automation.review",
-        "_validate_review_result_artifact",
-        "TA-LIFE-002",
-        "Invoke review through the split lifecycle stage API.",
     ),
     _private_debt(
         "ticket_automation.workflow",

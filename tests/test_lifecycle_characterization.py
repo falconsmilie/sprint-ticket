@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import FrozenInstanceError, dataclass, replace
+from pathlib import Path
 
 import pytest
 
 import ticket_automation.corrections as corrections_module
-from tests.helpers import GIT, make_run_dependencies, run_git
+from tests.helpers import (
+    GIT,
+    create_trusted_prepared_run,
+    make_agent_executor,
+    make_run_dependencies,
+    run_git,
+)
 from tests.lifecycle_characterization_fixtures import (
     ScriptedVerificationRunner,
     TickingClock,
@@ -14,13 +21,32 @@ from tests.lifecycle_characterization_fixtures import (
     build_lifecycle_workspace,
     configure_fake_codex_actions,
 )
-from ticket_automation.attempts import latest_writable_attempt
+from ticket_automation.application.handoff_acceptance import (
+    HandoffAcceptanceRequest,
+    HandoffAcceptanceService,
+    HandoffAccepted,
+    HandoffRejected,
+)
+from ticket_automation.application.ports.handoff import (
+    FinalPatchCaptureRequest,
+    FinalPatchReference,
+)
+from ticket_automation.attempts import (
+    latest_writable_attempt,
+    load_attempt_records,
+    start_attempt,
+)
 from ticket_automation.domain.task_results import ImplementationResult, ReviewResult
 from ticket_automation.git import GitRepository
 from ticket_automation.git_safety import WorkspaceSnapshot
-from ticket_automation.models import StopCategory, WorkflowState
+from ticket_automation.implementation import run_implementation_stage
+from ticket_automation.infrastructure.final_patch import FileSystemFinalPatchCapture
+from ticket_automation.models import AttemptPhase, StopCategory, WorkflowState
 from ticket_automation.reporting import collect_report_context
-from ticket_automation.workflow import run_ticket_lifecycle
+from ticket_automation.review import run_review_stage
+from ticket_automation.runs import load_run_record, save_run_record
+from ticket_automation.verification import run_verification_stage
+from ticket_automation.workflow import resume_ticket_lifecycle, run_ticket_lifecycle
 
 pytestmark = pytest.mark.skipif(GIT is None, reason="git executable is required")
 
@@ -511,47 +537,580 @@ def test_final_handoff_rejects_repository_drift(tmp_path, monkeypatch, drift):
         monkeypatch,
         tmp_path,
         "modify",
-        "review-pass-arm",
+        "review-pass",
     )
-    arm_path = tmp_path / "handoff-drift.arm"
-    monkeypatch.setenv("TA_FAKE_CODEX_ARM_FILE", str(arm_path))
-    original_capture = WorkspaceSnapshot.capture
-    armed_capture_count = 0
-    drift_applied = False
+    clock = TickingClock()
+    reporting_run = _prepare_reporting_run(
+        workspace,
+        codex_runner=codex_runner,
+        clock=clock,
+    )
+    start_attempt(
+        reporting_run.run_dir,
+        phase=AttemptPhase.REPORTING,
+        before_workspace_fingerprint=None,
+        clock=clock,
+    )
 
-    def capture_with_drift(repository):
-        nonlocal armed_capture_count, drift_applied
-        if arm_path.is_file() and not drift_applied:
-            armed_capture_count += 1
-        if armed_capture_count == 2 and not drift_applied:
-            drift_applied = True
-            apply_drift()
-        return original_capture(repository)
+    if drift == "branch":
+        run_git(workspace.repository, "checkout", "-b", "handoff-drift")
+    elif drift == "head":
+        (workspace.repository / "head.txt").write_text(
+            "head drift\n", encoding="utf-8"
+        )
+        run_git(workspace.repository, "add", "head.txt")
+        run_git(workspace.repository, "commit", "-m", "handoff drift")
+    elif drift == "staging":
+        (workspace.repository / "staged.txt").write_text(
+            "staged drift\n", encoding="utf-8"
+        )
+        run_git(workspace.repository, "add", "staged.txt")
+    else:
+        (workspace.repository / "untracked.txt").write_text(
+            "fingerprint drift\n", encoding="utf-8"
+        )
 
-    def apply_drift():
-        if drift == "branch":
-            run_git(workspace.repository, "checkout", "-b", "handoff-drift")
-        elif drift == "head":
-            (workspace.repository / "head.txt").write_text(
-                "head drift\n", encoding="utf-8"
+    result = HandoffAcceptanceService(
+        patch_capture=FileSystemFinalPatchCapture(),
+    ).accept(
+        HandoffAcceptanceRequest(
+            run_dir=reporting_run.run_dir,
+            run_record=reporting_run.run_record,
+        )
+    )
+
+    assert isinstance(result, HandoffRejected)
+    assert result.stop_category is StopCategory.SAFETY_VIOLATION
+    assert load_run_record(reporting_run.run_dir / "run.json").state is (
+        WorkflowState.REPORTING
+    )
+    writable = latest_writable_attempt(reporting_run.run_dir)
+    assert writable is not None
+    current = WorkspaceSnapshot.capture(GitRepository(workspace.repository))
+    assert not current.matches_fingerprint(writable.after_workspace_fingerprint)
+    if drift == "branch":
+        assert current.branch != reporting_run.run_record.starting_branch
+    elif drift == "head":
+        assert current.head_sha != reporting_run.run_record.baseline_sha
+    elif drift == "staging":
+        assert current.staged_paths
+    else:
+        assert current.branch == reporting_run.run_record.starting_branch
+        assert current.head_sha == reporting_run.run_record.baseline_sha
+        assert not current.staged_paths
+    assert not (reporting_run.run_dir / "final.patch").exists()
+
+
+@pytest.mark.parametrize(
+    ("evidence_change", "reason"),
+    [
+        ("stale-verification", "verification evidence is stale"),
+        ("malformed-verification", "lowercase SHA-256 digest"),
+        ("missing-verification", "verification evidence is not passing"),
+        ("incomplete-verification", "verification evidence is incomplete"),
+        (
+            "contradictory-verification",
+            "Verification command evidence is not passing",
+        ),
+        ("verification-safety", "contains safety violations"),
+        ("verification-missing-safety", "invalid safety evidence"),
+        ("verification-corrections", "contains correction reasons"),
+        ("verification-missing-corrections", "invalid correction evidence"),
+        ("verification-cwd", "unexpected working directory"),
+        ("verification-round", "does not match the final correction round"),
+        ("stale-review", "review did not pass for the verified final source"),
+        ("malformed-review", "lowercase SHA-256 digest"),
+        ("missing-review", "review evidence is missing"),
+    ],
+)
+def test_final_handoff_rejects_stale_or_missing_evidence(
+    tmp_path,
+    monkeypatch,
+    evidence_change,
+    reason,
+):
+    workspace = build_lifecycle_workspace(tmp_path)
+    codex_runner = configure_fake_codex_actions(
+        monkeypatch,
+        tmp_path,
+        "modify",
+        "review-pass",
+    )
+    clock = TickingClock()
+    reporting = _prepare_reporting_run(
+        workspace,
+        codex_runner=codex_runner,
+        clock=clock,
+    )
+    attempts = load_attempt_records(reporting.run_dir)
+    if evidence_change == "incomplete-verification":
+        start_attempt(
+            reporting.run_dir,
+            phase=AttemptPhase.VERIFYING,
+            before_workspace_fingerprint=WorkspaceSnapshot.capture(
+                GitRepository(workspace.repository)
+            ).fingerprint,
+            clock=clock,
+        )
+    elif evidence_change.startswith("verification") or evidence_change in {
+        "stale-verification",
+        "malformed-verification",
+        "missing-verification",
+        "contradictory-verification",
+    }:
+        attempt = next(item for item in attempts if item.phase == "VERIFYING")
+        if evidence_change == "missing-verification":
+            attempt.path.unlink()
+        elif evidence_change in {"stale-verification", "malformed-verification"}:
+            data = json.loads(attempt.path.read_text(encoding="utf-8"))
+            data["after_workspace_fingerprint"] = (
+                "invalid" if evidence_change == "malformed-verification" else "0" * 64
             )
-            run_git(workspace.repository, "add", "head.txt")
-            run_git(workspace.repository, "commit", "-m", "handoff drift")
-        elif drift == "staging":
-            (workspace.repository / "staged.txt").write_text(
-                "staged drift\n", encoding="utf-8"
-            )
-            run_git(workspace.repository, "add", "staged.txt")
+            attempt.path.write_text(json.dumps(data), encoding="utf-8")
         else:
-            (workspace.repository / "untracked.txt").write_text(
-                "fingerprint drift\n", encoding="utf-8"
+            result_path = attempt.artifact_directory / "result.json"
+            data = json.loads(result_path.read_text(encoding="utf-8"))
+            if evidence_change == "contradictory-verification":
+                data["commands"][0]["status"] = "FAIL"
+                data["commands"][0]["exit_code"] = 1
+            elif evidence_change == "verification-safety":
+                data["safety_violations"] = [{"name": "branch"}]
+            elif evidence_change == "verification-missing-safety":
+                data.pop("safety_violations")
+            elif evidence_change == "verification-corrections":
+                data["correction_reasons"] = [{"kind": "VerificationFailure"}]
+            elif evidence_change == "verification-missing-corrections":
+                data.pop("correction_reasons")
+            elif evidence_change == "verification-round":
+                data["round_index"] = 99
+            else:
+                data["commands"][0]["cwd"] = str(tmp_path / "other")
+            result_path.write_text(json.dumps(data), encoding="utf-8")
+    else:
+        attempt = next(item for item in attempts if item.phase == "REVIEWING")
+        if evidence_change == "missing-review":
+            attempt.path.unlink()
+        else:
+            data = json.loads(attempt.path.read_text(encoding="utf-8"))
+            fingerprint = "invalid" if evidence_change == "malformed-review" else "0" * 64
+            data["before_workspace_fingerprint"] = fingerprint
+            data["after_workspace_fingerprint"] = fingerprint
+            attempt.path.write_text(json.dumps(data), encoding="utf-8")
+
+    dependencies = make_run_dependencies(
+        workspace.config,
+        process_runner=codex_runner,
+    )
+    result = resume_ticket_lifecycle(
+        reporting.run_record.run_id,
+        runs_dir=workspace.runs_dir,
+        agent_executor_factory=dependencies["agent_executor_factory"],
+        final_patch_capture=dependencies["final_patch_capture"],
+        verification_runner=ScriptedVerificationRunner([]),
+        clock=clock,
+    )
+
+    assert result.run_record.state is WorkflowState.HUMAN_REQUIRED
+    assert result.run_record.stop_reason is not None
+    assert result.run_record.stop_reason.category is StopCategory.SAFETY_VIOLATION
+    assert reason in result.run_record.terminal_reason
+    assert not (result.run_dir / "final.patch").exists()
+
+
+def _prepare_reporting_run(workspace, *, codex_runner, clock):
+    snapshot = create_trusted_prepared_run(
+        workspace.config,
+        workspace.ticket,
+        runs_dir=workspace.runs_dir,
+        verification_runner=ScriptedVerificationRunner([0]),
+        clock=clock,
+    )
+    implementing = snapshot.run_record.transition_to(
+        WorkflowState.IMPLEMENTING,
+        updated_timestamp=clock().isoformat(),
+    )
+    save_run_record(implementing, snapshot.run_dir / "run.json")
+    implementation = run_implementation_stage(
+        workspace.config,
+        snapshot.run_dir,
+        agent_executor=make_agent_executor(
+            workspace.config,
+            process_runner=codex_runner,
+        ),
+        clock=clock,
+    )
+    verifying = implementation.run_record.transition_to(
+        WorkflowState.VERIFYING,
+        updated_timestamp=clock().isoformat(),
+    )
+    save_run_record(verifying, snapshot.run_dir / "run.json")
+    verification = run_verification_stage(
+        workspace.config,
+        snapshot.run_dir,
+        process_runner=ScriptedVerificationRunner([0]),
+        clock=clock,
+    )
+    reviewing = verification.run_record.transition_to(
+        WorkflowState.REVIEWING,
+        updated_timestamp=clock().isoformat(),
+    )
+    save_run_record(reviewing, snapshot.run_dir / "run.json")
+    review = run_review_stage(
+        workspace.config,
+        snapshot.run_dir,
+        agent_executor=make_agent_executor(
+            workspace.config,
+            process_runner=codex_runner,
+        ),
+        clock=clock,
+    )
+    reporting_record = review.run_record.transition_to(
+        WorkflowState.REPORTING,
+        updated_timestamp=clock().isoformat(),
+        current_review_round=1,
+    )
+    save_run_record(reporting_record, snapshot.run_dir / "run.json")
+    return replace(snapshot, run_record=reporting_record)
+
+
+def test_handoff_service_uses_persisted_attempt_and_does_not_transition_run(
+    tmp_path,
+    monkeypatch,
+):
+    workspace = build_lifecycle_workspace(tmp_path)
+    codex_runner = configure_fake_codex_actions(
+        monkeypatch,
+        tmp_path,
+        "modify",
+        "review-pass",
+    )
+    clock = TickingClock()
+    reporting = _prepare_reporting_run(
+        workspace,
+        codex_runner=codex_runner,
+        clock=clock,
+    )
+    start_attempt(
+        reporting.run_dir,
+        phase=AttemptPhase.REPORTING,
+        before_workspace_fingerprint=None,
+        clock=clock,
+    )
+    request = HandoffAcceptanceRequest(
+        run_dir=reporting.run_dir,
+        run_record=reporting.run_record,
+    )
+
+    result = HandoffAcceptanceService(
+        patch_capture=FileSystemFinalPatchCapture(),
+    ).accept(request)
+
+    assert isinstance(result, HandoffAccepted)
+    assert load_run_record(reporting.run_dir / "run.json").state is (
+        WorkflowState.REPORTING
+    )
+    persisted_reporting = load_attempt_records(reporting.run_dir)[-1]
+    assert persisted_reporting.before_workspace_fingerprint == (
+        result.initial_workspace.fingerprint
+    )
+    with pytest.raises(FrozenInstanceError):
+        request.run_dir = tmp_path  # type: ignore[misc]
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        HandoffAcceptanceRequest(
+            run_dir=reporting.run_dir,
+            run_record=reporting.run_record,
+            reporting_attempt=persisted_reporting,  # type: ignore[call-arg]
+        )
+
+
+@pytest.mark.parametrize("request_problem", ["state", "run-directory"])
+def test_handoff_service_rejects_invalid_request_context(
+    tmp_path,
+    monkeypatch,
+    request_problem,
+):
+    workspace = build_lifecycle_workspace(tmp_path)
+    codex_runner = configure_fake_codex_actions(
+        monkeypatch,
+        tmp_path,
+        "modify",
+        "review-pass",
+    )
+    reporting = _prepare_reporting_run(
+        workspace,
+        codex_runner=codex_runner,
+        clock=TickingClock(),
+    )
+    run_dir = reporting.run_dir
+    run_record = reporting.run_record
+    if request_problem == "state":
+        run_record = replace(run_record, state=WorkflowState.REVIEWING)
+    else:
+        run_dir = reporting.run_dir.with_name("foreign-run")
+
+    result = HandoffAcceptanceService(
+        patch_capture=FileSystemFinalPatchCapture(),
+    ).accept(HandoffAcceptanceRequest(run_dir=run_dir, run_record=run_record))
+
+    assert isinstance(result, HandoffRejected)
+    assert result.stop_category is StopCategory.SAFETY_VIOLATION
+
+
+def test_final_handoff_rejects_patch_capture_failure(tmp_path, monkeypatch):
+    workspace = build_lifecycle_workspace(tmp_path)
+    codex_runner = configure_fake_codex_actions(
+        monkeypatch,
+        tmp_path,
+        "modify",
+        "review-pass",
+    )
+    class FailingPatchCapture:
+        def capture(self, request: FinalPatchCaptureRequest) -> FinalPatchReference:
+            del request
+            raise OSError("patch storage unavailable")
+
+    dependencies = make_run_dependencies(
+        workspace.config,
+        process_runner=codex_runner,
+    )
+    dependencies["final_patch_capture"] = FailingPatchCapture()
+    result = run_ticket_lifecycle(
+        workspace.config,
+        workspace.ticket,
+        runs_dir=workspace.runs_dir,
+        **dependencies,
+        verification_runner=ScriptedVerificationRunner([0, 0]),
+        clock=TickingClock(),
+    )
+
+    assert result.run_record.state is WorkflowState.HUMAN_REQUIRED
+    assert result.run_record.stop_reason is not None
+    assert result.run_record.stop_reason.category is StopCategory.SAFETY_VIOLATION
+    assert "Could not capture the final handoff patch safely" in (
+        result.run_record.terminal_reason
+    )
+    assert not (result.run_dir / "final.patch").exists()
+    reporting = load_attempt_records(result.run_dir)[-1]
+    assert reporting.before_workspace_fingerprint is not None
+
+
+@pytest.mark.parametrize("accepted", [True, False], ids=["accepted", "rejected"])
+def test_reporting_attempt_write_failure_cannot_reclassify_handoff_decision(
+    tmp_path,
+    monkeypatch,
+    accepted,
+):
+    workspace = build_lifecycle_workspace(tmp_path)
+    codex_runner = configure_fake_codex_actions(
+        monkeypatch,
+        tmp_path,
+        "modify",
+        "review-pass",
+    )
+    original_write_text = Path.write_text
+
+    def fail_reporting_attempt_write(path, data, *args, **kwargs):
+        if path.name == "result.json" and path.parent.name.endswith("-reporting"):
+            raise OSError("reporting attempt storage unavailable")
+        return original_write_text(path, data, *args, **kwargs)
+
+    class FailingPatchCapture:
+        def capture(self, request: FinalPatchCaptureRequest) -> FinalPatchReference:
+            del request
+            raise OSError("patch storage unavailable")
+
+    monkeypatch.setattr(Path, "write_text", fail_reporting_attempt_write)
+    dependencies = make_run_dependencies(
+        workspace.config,
+        process_runner=codex_runner,
+    )
+    if not accepted:
+        dependencies["final_patch_capture"] = FailingPatchCapture()
+
+    result = run_ticket_lifecycle(
+        workspace.config,
+        workspace.ticket,
+        runs_dir=workspace.runs_dir,
+        **dependencies,
+        verification_runner=ScriptedVerificationRunner([0, 0]),
+        clock=TickingClock(),
+    )
+
+    assert result.controller_error is not None
+    assert "reporting attempt storage unavailable" in result.controller_error
+    persisted = load_run_record(result.run_dir / "run.json")
+    if accepted:
+        assert result.run_record.state is WorkflowState.READY_FOR_HUMAN
+        assert persisted.state is WorkflowState.READY_FOR_HUMAN
+        assert result.run_record.stop_reason is None
+    else:
+        assert result.run_record.state is WorkflowState.HUMAN_REQUIRED
+        assert persisted.state is WorkflowState.HUMAN_REQUIRED
+        assert result.run_record.stop_reason is not None
+        assert result.run_record.stop_reason.category is StopCategory.SAFETY_VIOLATION
+        assert "Could not capture the final handoff patch safely" in (
+            result.run_record.terminal_reason
+        )
+
+
+@pytest.mark.parametrize(
+    "reference_problem",
+    ["missing", "wrong-type", "wrong-path", "wrong-digest", "wrong-size"],
+)
+def test_final_handoff_rejects_invalid_patch_reference(
+    tmp_path,
+    monkeypatch,
+    reference_problem,
+):
+    workspace = build_lifecycle_workspace(tmp_path)
+    codex_runner = configure_fake_codex_actions(
+        monkeypatch,
+        tmp_path,
+        "modify",
+        "review-pass",
+    )
+
+    class InvalidPatchCapture:
+        def capture(self, request: FinalPatchCaptureRequest) -> FinalPatchReference:
+            if reference_problem == "missing":
+                return FinalPatchReference(request.destination, "0" * 64, 0)
+            if reference_problem == "wrong-type":
+                return None  # type: ignore[return-value]
+            reference = FileSystemFinalPatchCapture().capture(request)
+            if reference_problem == "wrong-path":
+                return replace(reference, path=request.destination.with_suffix(".other"))
+            if reference_problem == "wrong-digest":
+                return replace(reference, sha256="0" * 64)
+            return replace(reference, size_bytes=reference.size_bytes + 1)
+
+    dependencies = make_run_dependencies(
+        workspace.config,
+        process_runner=codex_runner,
+    )
+    dependencies["final_patch_capture"] = InvalidPatchCapture()
+    result = run_ticket_lifecycle(
+        workspace.config,
+        workspace.ticket,
+        runs_dir=workspace.runs_dir,
+        **dependencies,
+        verification_runner=ScriptedVerificationRunner([0, 0]),
+        clock=TickingClock(),
+    )
+
+    assert result.run_record.state is WorkflowState.HUMAN_REQUIRED
+    assert result.run_record.stop_reason is not None
+    assert result.run_record.stop_reason.category is StopCategory.SAFETY_VIOLATION
+    assert "Could not capture the final handoff patch safely" in (
+        result.run_record.terminal_reason
+    )
+    if reference_problem == "missing":
+        assert not (result.run_dir / "final.patch").exists()
+
+
+def test_final_handoff_rejects_workspace_change_during_patch_capture(
+    tmp_path,
+    monkeypatch,
+):
+    workspace = build_lifecycle_workspace(tmp_path)
+    codex_runner = configure_fake_codex_actions(
+        monkeypatch,
+        tmp_path,
+        "modify",
+        "review-pass",
+    )
+
+    class MutatingPatchCapture:
+        def capture(self, request: FinalPatchCaptureRequest) -> FinalPatchReference:
+            reference = FileSystemFinalPatchCapture().capture(request)
+            (request.repository_path / "late-change.txt").write_text(
+                "changed during capture\n",
+                encoding="utf-8",
             )
+            return reference
+
+    dependencies = make_run_dependencies(
+        workspace.config,
+        process_runner=codex_runner,
+    )
+    dependencies["final_patch_capture"] = MutatingPatchCapture()
+    result = run_ticket_lifecycle(
+        workspace.config,
+        workspace.ticket,
+        runs_dir=workspace.runs_dir,
+        **dependencies,
+        verification_runner=ScriptedVerificationRunner([0, 0]),
+        clock=TickingClock(),
+    )
+
+    assert result.run_record.state is WorkflowState.HUMAN_REQUIRED
+    assert result.run_record.stop_reason is not None
+    assert result.run_record.stop_reason.category is StopCategory.SAFETY_VIOLATION
+    assert "Workspace changed while" in result.run_record.terminal_reason
+
+
+def test_final_handoff_rejects_post_capture_inspection_failure(
+    tmp_path,
+    monkeypatch,
+):
+    workspace = build_lifecycle_workspace(tmp_path)
+    codex_runner = configure_fake_codex_actions(
+        monkeypatch,
+        tmp_path,
+        "modify",
+        "review-pass",
+    )
+    patch_was_captured = False
+    original_capture = WorkspaceSnapshot.capture
+
+    class CapturingPatch:
+        def capture(self, request: FinalPatchCaptureRequest) -> FinalPatchReference:
+            nonlocal patch_was_captured
+            reference = FileSystemFinalPatchCapture().capture(request)
+            patch_was_captured = True
+            return reference
+
+    def fail_after_patch(repository):
+        if patch_was_captured:
+            raise OSError("workspace inspection unavailable")
+        return original_capture(repository)
 
     monkeypatch.setattr(
         WorkspaceSnapshot,
         "capture",
-        staticmethod(capture_with_drift),
+        staticmethod(fail_after_patch),
     )
+    dependencies = make_run_dependencies(
+        workspace.config,
+        process_runner=codex_runner,
+    )
+    dependencies["final_patch_capture"] = CapturingPatch()
+    result = run_ticket_lifecycle(
+        workspace.config,
+        workspace.ticket,
+        runs_dir=workspace.runs_dir,
+        **dependencies,
+        verification_runner=ScriptedVerificationRunner([0, 0]),
+        clock=TickingClock(),
+    )
+
+    assert patch_was_captured
+    assert result.run_record.state is WorkflowState.HUMAN_REQUIRED
+    assert result.run_record.stop_reason is not None
+    assert result.run_record.stop_reason.category is StopCategory.SAFETY_VIOLATION
+    assert "Could not capture the final handoff patch safely" in (
+        result.run_record.terminal_reason
+    )
+
+
+def test_final_handoff_accepts_current_matching_evidence(tmp_path, monkeypatch):
+    workspace = build_lifecycle_workspace(tmp_path)
+    codex_runner = configure_fake_codex_actions(
+        monkeypatch,
+        tmp_path,
+        "modify",
+        "review-pass",
+    )
+
     result = run_ticket_lifecycle(
         workspace.config,
         workspace.ticket,
@@ -561,39 +1120,13 @@ def test_final_handoff_rejects_repository_drift(tmp_path, monkeypatch, drift):
         clock=TickingClock(),
     )
 
-    assert json.loads(codex_runner.action_path.read_text(encoding="utf-8")) == []
-    assert drift_applied
-    assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
-    assert result.run_record.stop_reason is not None
-    assert result.run_record.stop_reason.category == StopCategory.SAFETY_VIOLATION
-    attempts = assert_attempt_ledger(
-        result.run_dir,
-        [
-            ("PREPARING", "COMPLETED"),
-            ("IMPLEMENTING", "COMPLETED"),
-            ("VERIFYING", "COMPLETED"),
-            ("REVIEWING", "COMPLETED"),
-            ("REPORTING", "HUMAN_REQUIRED"),
-        ],
+    assert result.run_record.state is WorkflowState.READY_FOR_HUMAN
+    assert result.run_record.stop_reason is None
+    assert (result.run_dir / "final.patch").is_file()
+    reporting = load_attempt_records(result.run_dir)[-1]
+    assert reporting.phase == "REPORTING"
+    assert reporting.status == "COMPLETED"
+    assert reporting.before_workspace_fingerprint is not None
+    assert reporting.after_workspace_fingerprint == (
+        reporting.before_workspace_fingerprint
     )
-    reporting = attempts[-1]
-    assert reporting.process_started is False
-    reporting_evidence = json.loads(
-        (reporting.artifact_directory / "result.json").read_text(encoding="utf-8")
-    )
-    assert reporting_evidence["status"] == "HUMAN_REQUIRED"
-    writable = latest_writable_attempt(result.run_dir)
-    assert writable is not None
-    current = WorkspaceSnapshot.capture(GitRepository(workspace.repository))
-    assert not current.matches_fingerprint(writable.after_workspace_fingerprint)
-    if drift == "branch":
-        assert current.branch != result.run_record.starting_branch
-    elif drift == "head":
-        assert current.head_sha != result.run_record.baseline_sha
-    elif drift == "staging":
-        assert current.staged_paths
-    else:
-        assert current.branch == result.run_record.starting_branch
-        assert current.head_sha == result.run_record.baseline_sha
-        assert not current.staged_paths
-    assert not (result.run_dir / "final.patch").exists()

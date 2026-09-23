@@ -15,7 +15,10 @@ from ticket_automation.application.agent_execution import (
     AgentExecutorAssignments,
     AgentTaskKind,
 )
-from ticket_automation.composition import prepare_production_agents
+from ticket_automation.composition import (
+    prepare_production_agents,
+    production_final_patch_capture,
+)
 from ticket_automation.composition.providers import RegisteredProviderExecutorFactory
 from ticket_automation.config import (
     AgentSettings,
@@ -400,6 +403,12 @@ def make_resume_agent_executor_factory(agent_executor):
     )
 
 
+def make_final_patch_capture():
+    """Build the final-patch adapter used by lifecycle tests."""
+
+    return production_final_patch_capture()
+
+
 def make_run_dependencies(
     config: AppConfig, *, process_runner=None, agent_executor=None
 ) -> dict[str, object]:
@@ -424,6 +433,7 @@ def make_run_dependencies(
         "provider_preflight": prepared.run_preflight,
         "resolved_policy": resolved_policy,
         "agent_executor_factory": factory,
+        "final_patch_capture": production_final_patch_capture(),
     }
 
 

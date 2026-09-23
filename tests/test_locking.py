@@ -18,6 +18,7 @@ from tests.helpers import (
     create_test_run_snapshot,
     make_agent_executors,
     make_config,
+    make_final_patch_capture,
     make_resume_agent_executor_factory,
     make_run_dependencies,
 )
@@ -288,6 +289,7 @@ def test_second_resume_against_same_repository_is_blocked(tmp_path):
             resume_ticket_lifecycle(
                 snapshot.run_record.run_id,
                 runs_dir=runs_dir,
+                final_patch_capture=make_final_patch_capture(),
                 agent_executor_factory=make_resume_agent_executor_factory(
                     make_agent_executors(
                         config, process_runner=SequencedCodexRunner([])

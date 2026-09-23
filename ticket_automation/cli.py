@@ -8,6 +8,7 @@ from .composition import (
     apply_codex_execution_overrides,
     prepare_production_agents,
     production_agent_executor_factory,
+    production_final_patch_capture,
 )
 from .config import (
     ConfigError,
@@ -164,6 +165,7 @@ def _handle_run(args: argparse.Namespace) -> int:
             provider_preflight=providers.run_preflight,
             resolved_policy=resolved_policy,
             agent_executor_factory=providers,
+            final_patch_capture=production_final_patch_capture(),
         )
     except TicketInputError as error:
         print(f"Ticket input error: {error}", file=sys.stderr)
@@ -206,6 +208,7 @@ def _handle_resume(args: argparse.Namespace) -> int:
             args.run_id,
             runs_dir=runs_dir,
             agent_executor_factory=production_agent_executor_factory(),
+            final_patch_capture=production_final_patch_capture(),
         )
     except RunError as error:
         print(f"Run error: {error}", file=sys.stderr)

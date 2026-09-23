@@ -29,6 +29,11 @@ def _read_verification_source_fingerprint(
     *,
     expected_statuses: frozenset[str],
     verification_commands: tuple[VerificationCommand, ...],
+    require_all_commands_pass: bool = False,
+    require_authoritative_pass: bool = False,
+    expected_command_cwd: Path | None = None,
+    expected_attempt_sequence: int | None = None,
+    expected_round_index: int | None = None,
 ) -> str:
     try:
         record = latest_attempt(
@@ -40,11 +45,23 @@ def _read_verification_source_fingerprint(
             raise _VerificationArtifactError(
                 "No completed verification attempt exists."
             )
+        if (
+            expected_attempt_sequence is not None
+            and record.sequence != expected_attempt_sequence
+        ):
+            raise _VerificationArtifactError(
+                "Completed verification evidence is not the current verification "
+                "attempt."
+            )
         data = _read_result(run_path, record)
         _validate_verification_result(
             data,
             expected_statuses=expected_statuses,
             verification_commands=verification_commands,
+            require_all_commands_pass=require_all_commands_pass,
+            require_authoritative_pass=require_authoritative_pass,
+            expected_command_cwd=expected_command_cwd,
+            expected_round_index=expected_round_index,
         )
         fingerprint = record.after_workspace_fingerprint
         if not isinstance(fingerprint, str):
@@ -124,6 +141,9 @@ def _validate_verification_result(
     expected_statuses: frozenset[str],
     verification_commands: tuple[VerificationCommand, ...],
     require_all_commands_pass: bool = False,
+    require_authoritative_pass: bool = False,
+    expected_command_cwd: Path | None = None,
+    expected_round_index: int | None = None,
 ) -> None:
     if data.get("schema_version") != VERIFICATION_SCHEMA_VERSION:
         raise _VerificationArtifactError(
@@ -159,9 +179,105 @@ def _validate_verification_result(
             or result.get("error_kind") is not None
             or result.get("error_message") is not None
         ):
-            raise _VerificationArtifactError(
-                "Baseline verification command evidence is not passing."
+            message = (
+                "Verification command evidence is not passing."
+                if require_authoritative_pass
+                else "Baseline verification command evidence is not passing."
             )
+            raise _VerificationArtifactError(message)
+        if require_authoritative_pass:
+            _validate_authoritative_command_evidence(
+                result,
+                expected_command_cwd=expected_command_cwd,
+            )
+    if require_authoritative_pass:
+        _validate_authoritative_round_evidence(
+            data,
+            expected_round_index=expected_round_index,
+        )
+
+
+def _validate_authoritative_command_evidence(
+    data: dict[str, Any],
+    *,
+    expected_command_cwd: Path | None,
+) -> None:
+    cwd = data.get("cwd")
+    if not isinstance(cwd, str) or not cwd:
+        raise _VerificationArtifactError(
+            "Verification command evidence has no working directory."
+        )
+    if expected_command_cwd is None:
+        raise _VerificationArtifactError(
+            "Authoritative verification requires an expected working directory."
+        )
+    if Path(cwd).resolve(strict=False) != expected_command_cwd.resolve(strict=False):
+        raise _VerificationArtifactError(
+            "Verification command evidence has an unexpected working directory."
+        )
+    for field in ("started_at", "ended_at"):
+        if not isinstance(data.get(field), str) or not data[field]:
+            raise _VerificationArtifactError(
+                f"Verification command evidence has invalid {field}."
+            )
+    duration = data.get("duration_seconds")
+    if (
+        not isinstance(duration, int | float)
+        or isinstance(duration, bool)
+        or duration < 0
+    ):
+        raise _VerificationArtifactError(
+            "Verification command evidence has invalid duration_seconds."
+        )
+    if not isinstance(data.get("stdout"), str) or not isinstance(
+        data.get("stderr"), str
+    ):
+        raise _VerificationArtifactError(
+            "Verification command evidence has invalid process output."
+        )
+
+
+def _validate_authoritative_round_evidence(
+    data: dict[str, Any],
+    *,
+    expected_round_index: int | None,
+) -> None:
+    round_index = data.get("round_index")
+    if (
+        not isinstance(round_index, int)
+        or isinstance(round_index, bool)
+        or round_index < 0
+    ):
+        raise _VerificationArtifactError(
+            "Verification result has an invalid round index."
+        )
+    if expected_round_index is None or round_index != expected_round_index:
+        raise _VerificationArtifactError(
+            "Verification result round does not match the final correction round."
+        )
+    for field in ("started_at", "ended_at"):
+        if not isinstance(data.get(field), str) or not data[field]:
+            raise _VerificationArtifactError(
+                f"Verification result has invalid {field}."
+            )
+    duration = data.get("duration_seconds")
+    if (
+        not isinstance(duration, int | float)
+        or isinstance(duration, bool)
+        or duration < 0
+    ):
+        raise _VerificationArtifactError(
+            "Verification result has invalid duration_seconds."
+        )
+    if data.get("safety_violations") != []:
+        raise _VerificationArtifactError(
+            "Verification result contains safety violations or invalid safety evidence."
+        )
+    if data.get("correction_reasons") != []:
+        raise _VerificationArtifactError(
+            "Verification result contains correction reasons or invalid correction "
+            "evidence."
+        )
 
 
 def _verification_commands_fingerprint(

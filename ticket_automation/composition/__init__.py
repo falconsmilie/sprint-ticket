@@ -8,6 +8,7 @@ from .root import (
     apply_codex_execution_overrides,
     prepare_production_agents,
     production_agent_executor_factory,
+    production_final_patch_capture,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "prepare_agent_providers",
     "prepare_production_agents",
     "production_agent_executor_factory",
+    "production_final_patch_capture",
 ]
