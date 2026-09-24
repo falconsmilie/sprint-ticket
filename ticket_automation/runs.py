@@ -1,18 +1,14 @@
 from __future__ import annotations
 
 import hashlib
-import json
-import os
 import re
 import shutil
-import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ._verification_artifacts import _verification_commands_fingerprint
 from .application.ports.preflight import ProviderPreflight
 from .config import AppConfig
 from .git import GitCommandError, GitRepository
@@ -23,11 +19,19 @@ from .models import (
     WorkflowState,
     _validate_workflow_transition,
 )
+from .persistence import (
+    CodecError,
+    atomic_write_json,
+    parse_timestamp,
+    read_json_object,
+    timestamp_now,
+)
 from .preflight import PreflightResult, run_preflight
 from .resolved_config import (
     ResolvedRunPolicy,
     ResolvedRunPolicyError,
 )
+from .verification_evidence import verification_commands_fingerprint
 
 RUN_SCHEMA_VERSION = 5
 BASELINE_SCHEMA_VERSION = 2
@@ -346,7 +350,7 @@ def create_run_snapshot(
         repository,
         snapshot_timestamp=timestamp,
         ticket_sha256=hashlib.sha256(source_ticket.contents).hexdigest(),
-        verification_commands_fingerprint=_verification_commands_fingerprint(
+        verification_commands_fingerprint=verification_commands_fingerprint(
             config.verification.commands
         ),
     )
@@ -434,7 +438,7 @@ def load_run_record(path: Path | str) -> RunRecord:
 
 
 def save_run_record(record: RunRecord, path: Path | str) -> None:
-    _atomic_write_json(Path(path), record.to_dict())
+    atomic_write_json(Path(path), record.to_dict())
 
 
 def load_baseline_record(path: Path | str) -> BaselineRecord:
@@ -443,7 +447,7 @@ def load_baseline_record(path: Path | str) -> BaselineRecord:
 
 
 def save_baseline_record(record: BaselineRecord, path: Path | str) -> None:
-    _atomic_write_json(Path(path), record.to_dict())
+    atomic_write_json(Path(path), record.to_dict())
 
 
 def list_run_records(runs_dir: Path | str) -> tuple[RunRecord, ...]:
@@ -516,14 +520,11 @@ def _ownership_value(ownership: object, key: str) -> object:
 
 
 def _timestamp(clock: Callable[[], datetime] | None) -> str:
-    now = datetime.now(UTC) if clock is None else clock()
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=UTC)
-    return now.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return timestamp_now(clock)
 
 
 def _run_id_prefix(timestamp: str) -> str:
-    parsed = datetime.fromisoformat(timestamp)
+    parsed = parse_timestamp(timestamp, field="run timestamp")
     return parsed.strftime("%Y%m%d-%H%M%S")
 
 
@@ -596,41 +597,10 @@ def _remove_incomplete_run_directory(run_dir: Path) -> None:
 
 
 def _load_json_object(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as record_file:
-        data = json.load(record_file)
-    if not isinstance(data, dict):
-        raise RunError(f"JSON record must be an object: {path}")
-    return data
-
-
-def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(data, indent=2, sort_keys=True)
-    temp_path: Path | None = None
-    file_descriptor = -1
     try:
-        file_descriptor, temp_name = tempfile.mkstemp(
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            text=True,
-        )
-        temp_path = Path(temp_name)
-        with os.fdopen(
-            file_descriptor, "w", encoding="utf-8", newline="\n"
-        ) as temp_file:
-            file_descriptor = -1
-            temp_file.write(payload)
-            temp_file.write("\n")
-            temp_file.flush()
-            os.fsync(temp_file.fileno())
-        os.replace(temp_path, path)
-    except Exception:
-        if file_descriptor != -1:
-            os.close(file_descriptor)
-        if temp_path is not None:
-            temp_path.unlink(missing_ok=True)
-        raise
+        return read_json_object(path)
+    except CodecError as error:
+        raise RunError(str(error)) from error
 
 
 def _require_string(data: dict[str, Any], key: str) -> str:

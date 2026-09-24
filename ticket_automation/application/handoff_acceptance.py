@@ -3,21 +3,17 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from dataclasses import InitVar, dataclass, field
 from pathlib import Path
 from typing import TypeAlias, final
 
-from .._verification_artifacts import (
-    _read_verification_source_fingerprint,
-    _VerificationArtifactError,
-)
 from ..attempts import (
     AttemptError,
     AttemptRecord,
-    attempt_result_path,
+    StageAttempt,
     load_attempt_records,
+    require_stage_attempt,
     update_attempt,
 )
 from ..domain.task_results import ResultValidationError, ReviewVerdict
@@ -30,8 +26,10 @@ from ..models import (
     StopCategory,
     WorkflowState,
 )
+from ..persistence_codecs import PersistenceCodecError, read_attempt_result_value
 from ..runs import RunRecord
 from ..task_result_codecs import decode_review_result
+from ..verification_evidence import read_verification_source_fingerprint
 from .ports.handoff import (
     FINAL_PATCH_FILE,
     FinalPatchCapture,
@@ -48,12 +46,15 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 class HandoffAcceptanceRequest:
     run_dir: Path
     run_record: RunRecord
+    attempt: StageAttempt | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.run_dir, Path):
             raise TypeError("run_dir must be a Path.")
         if not isinstance(self.run_record, RunRecord):
             raise TypeError("run_record must be a RunRecord.")
+        if self.attempt is not None and not isinstance(self.attempt, StageAttempt):
+            raise TypeError("attempt must be a StageAttempt or None.")
 
 
 @dataclass(frozen=True)
@@ -157,9 +158,7 @@ class HandoffPolicyRequest:
             self.verification,
             VerificationHandoffEvidence,
         ):
-            raise TypeError(
-                "verification must be VerificationHandoffEvidence or None."
-            )
+            raise TypeError("verification must be VerificationHandoffEvidence or None.")
         if self.review is not None and not isinstance(
             self.review,
             ReviewHandoffEvidence,
@@ -266,11 +265,27 @@ class HandoffAcceptanceService:
             )
 
         try:
-            reporting_attempt = _load_current_reporting_attempt(request.run_dir)
-            update_attempt(
-                reporting_attempt,
-                before_workspace_fingerprint=initial_workspace.fingerprint,
-            )
+            if request.attempt is None:
+                # Preserve the established direct-service call shape. Lifecycle
+                # orchestration always supplies the exact controller-owned attempt.
+                reporting_attempt = _load_current_reporting_attempt(request.run_dir)
+                update_attempt(
+                    reporting_attempt,
+                    before_workspace_fingerprint=initial_workspace.fingerprint,
+                )
+            else:
+                reporting_attempt = require_stage_attempt(
+                    request.run_dir,
+                    request.attempt,
+                    phase=AttemptPhase.REPORTING,
+                )
+                if (
+                    reporting_attempt.before_workspace_fingerprint
+                    != initial_workspace.fingerprint
+                ):
+                    raise AttemptError(
+                        "Workspace changed after the controller started reporting."
+                    )
         except (AttemptError, OSError, RuntimeError, TypeError, ValueError) as error:
             return HandoffRejected(
                 stop_category=StopCategory.SAFETY_VIOLATION,
@@ -445,14 +460,9 @@ def evaluate_handoff_policy(
         return reject(
             "Deterministic verification evidence is stale for the final source."
         )
-    if (
-        not workspace.matches_fingerprint(
-            verification.before_workspace_fingerprint
-        )
-        or not workspace.matches_fingerprint(
-            verification.after_workspace_fingerprint
-        )
-    ):
+    if not workspace.matches_fingerprint(
+        verification.before_workspace_fingerprint
+    ) or not workspace.matches_fingerprint(verification.after_workspace_fingerprint):
         return reject(
             "Deterministic verification evidence is stale for the final source."
         )
@@ -483,8 +493,7 @@ def evaluate_handoff_policy(
     if review.attempt_sequence >= reporting.sequence:
         return reject("Final independent review evidence is contradictory.")
     if (
-        review.before_workspace_fingerprint
-        != verification.after_workspace_fingerprint
+        review.before_workspace_fingerprint != verification.after_workspace_fingerprint
         or review.after_workspace_fingerprint
         != verification.after_workspace_fingerprint
     ):
@@ -541,16 +550,13 @@ def _read_policy_request(
         verification_attempt = _latest_attempt(attempts, AttemptPhase.VERIFYING)
         if verification_attempt is None:
             verification_problem = (
-                "Deterministic verification evidence is not passing: "
-                "missing evidence."
+                "Deterministic verification evidence is not passing: missing evidence."
             )
         elif verification_attempt.status is not AttemptStatus.COMPLETED:
-            verification_problem = (
-                "Deterministic verification evidence is incomplete."
-            )
+            verification_problem = "Deterministic verification evidence is incomplete."
         else:
             try:
-                source_fingerprint = _read_verification_source_fingerprint(
+                source_fingerprint = read_verification_source_fingerprint(
                     request.run_dir,
                     run_record,
                     expected_statuses=frozenset({"PASS"}),
@@ -572,10 +578,9 @@ def _read_policy_request(
                     ),
                     after_workspace_fingerprint=source_fingerprint,
                 )
-            except (_VerificationArtifactError, TypeError, ValueError) as error:
+            except (TypeError, ValueError) as error:
                 verification_problem = (
-                    "Deterministic verification evidence is not passing: "
-                    + str(error)
+                    "Deterministic verification evidence is not passing: " + str(error)
                 )
     if attempt_problem is None:
         review_attempt = _latest_attempt(attempts, AttemptPhase.REVIEWING)
@@ -585,18 +590,18 @@ def _read_policy_request(
             review_problem = "Final independent review evidence is incomplete."
         else:
             try:
-                payload = json.loads(
-                    attempt_result_path(
-                        request.run_dir,
-                        next(
-                            item
-                            for item in attempt_records
-                            if item.sequence == review_attempt.sequence
-                        ),
-                    ).read_text(
-                        encoding="utf-8"
-                    )
+                payload = read_attempt_result_value(
+                    request.run_dir,
+                    next(
+                        item
+                        for item in attempt_records
+                        if item.sequence == review_attempt.sequence
+                    ),
                 )
+                if payload is None:
+                    raise PersistenceCodecError(
+                        "Final independent review result artifact is missing."
+                    )
                 result = decode_review_result(payload)
                 review = ReviewHandoffEvidence(
                     attempt_sequence=review_attempt.sequence,
@@ -610,14 +615,14 @@ def _read_policy_request(
                 )
             except (
                 AttemptError,
-                json.JSONDecodeError,
                 OSError,
+                PersistenceCodecError,
                 ResultValidationError,
                 TypeError,
                 ValueError,
             ) as error:
-                review_problem = (
-                    "Final independent review evidence is invalid: " + str(error)
+                review_problem = "Final independent review evidence is invalid: " + str(
+                    error
                 )
     return HandoffPolicyRequest(
         repository_path=Path(run_record.target_repository_path).resolve(strict=False),
@@ -667,11 +672,7 @@ def _acceptance_request_problem(request: HandoffAcceptanceRequest) -> str | None
 def _load_current_reporting_attempt(run_dir: Path) -> AttemptRecord:
     attempts = load_attempt_records(run_dir)
     reporting_attempt = next(
-        (
-            item
-            for item in reversed(attempts)
-            if item.phase is AttemptPhase.REPORTING
-        ),
+        (item for item in reversed(attempts) if item.phase is AttemptPhase.REPORTING),
         None,
     )
     if reporting_attempt is None:

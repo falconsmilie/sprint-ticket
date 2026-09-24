@@ -20,7 +20,7 @@ from ticket_automation.domain.task_results import (
     ReviewVerdict,
 )
 from ticket_automation.models import AttemptPhase, AttemptStatus
-from ticket_automation.reporting import latest_review_result
+from ticket_automation.presentation.reporting import latest_review_result
 from ticket_automation.task_result_codecs import (
     decode_implementation_result,
     decode_review_result,
@@ -229,9 +229,7 @@ def test_review_result_enforces_verdict_finding_consistency() -> None:
         ReviewResult(
             verdict=ReviewVerdict.CORRECTIONS_REQUIRED,
             summary="Contradictory correction request.",
-            findings=(
-                review_finding(disposition=FindingDisposition.ADVISORY),
-            ),
+            findings=(review_finding(disposition=FindingDisposition.ADVISORY),),
         )
     with pytest.raises(ResultValidationError, match="review verdict"):
         ReviewResult(
@@ -331,14 +329,18 @@ def test_review_codec_rejects_malformed_or_inconsistent_data(value: object) -> N
 def test_review_codec_rejects_absent_fields() -> None:
     value = review_json()
     del value["findings"]
-    with pytest.raises(ResultValidationError, match="missing required fields: findings"):
+    with pytest.raises(
+        ResultValidationError, match="missing required fields: findings"
+    ):
         decode_review_result(value)
 
 
 def test_review_codec_rejects_absent_nested_finding_fields() -> None:
     finding = finding_json()
     del finding["evidence"]
-    with pytest.raises(ResultValidationError, match="missing required fields: evidence"):
+    with pytest.raises(
+        ResultValidationError, match="missing required fields: evidence"
+    ):
         decode_review_result(review_json(findings=[finding]))
 
 

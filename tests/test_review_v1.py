@@ -10,6 +10,7 @@ from tests.helpers import (
     create_trusted_prepared_run,
     make_agent_executor,
     make_config,
+    run_test_stage,
 )
 from ticket_automation.application.agent_execution import (
     AgentExecution,
@@ -129,7 +130,9 @@ def test_review_snapshot_failure_is_recorded_as_human_required(
         updated_timestamp="2026-09-14T10:16:00Z",
     )
     save_run_record(implementing, snapshot.run_dir / "run.json")
-    implementation = run_implementation_stage(
+    implementation = run_test_stage(
+        run_implementation_stage,
+        AttemptPhase.IMPLEMENTING,
         config,
         snapshot.run_dir,
         agent_executor=make_agent_executor(
@@ -142,7 +145,9 @@ def test_review_snapshot_failure_is_recorded_as_human_required(
         updated_timestamp="2026-09-14T10:17:00Z",
     )
     save_run_record(verifying, snapshot.run_dir / "run.json")
-    verification = run_verification_stage(
+    verification = run_test_stage(
+        run_verification_stage,
+        AttemptPhase.VERIFYING,
         config,
         snapshot.run_dir,
         process_runner=PassingVerificationRunner(),
@@ -195,7 +200,9 @@ def test_invalid_review_result_without_provider_artifacts_requires_human(
         updated_timestamp="2026-09-14T10:16:00Z",
     )
     save_run_record(implementing, snapshot.run_dir / "run.json")
-    implementation = run_implementation_stage(
+    implementation = run_test_stage(
+        run_implementation_stage,
+        AttemptPhase.IMPLEMENTING,
         config,
         snapshot.run_dir,
         agent_executor=make_agent_executor(
@@ -208,7 +215,9 @@ def test_invalid_review_result_without_provider_artifacts_requires_human(
         updated_timestamp="2026-09-14T10:17:00Z",
     )
     save_run_record(verifying, snapshot.run_dir / "run.json")
-    verification = run_verification_stage(
+    verification = run_test_stage(
+        run_verification_stage,
+        AttemptPhase.VERIFYING,
         config,
         snapshot.run_dir,
         process_runner=PassingVerificationRunner(),
@@ -237,7 +246,9 @@ def test_invalid_review_result_without_provider_artifacts_requires_human(
                 failure_message="Invalid review result.",
             )
 
-    result = run_review_stage(
+    result = run_test_stage(
+        run_review_stage,
+        AttemptPhase.REVIEWING,
         config,
         snapshot.run_dir,
         agent_executor=InvalidResultExecutor(),

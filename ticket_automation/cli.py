@@ -17,6 +17,8 @@ from .config import (
 )
 from .locking import RepositoryLockError, active_repository_locks
 from .preflight import format_preflight_result, run_preflight
+from .presentation.lifecycle import format_lifecycle_result
+from .presentation.reporting import FilesystemTerminalReportPublisher
 from .providers.codex_cli import CodexExecutionOverrides
 from .providers.codex_cli.composition import CodexCliConfiguredSettings
 from .providers.codex_cli.identity import PROVIDER_ID as CODEX_CLI_PROVIDER_ID
@@ -28,11 +30,7 @@ from .runs import (
     format_status,
     list_run_records,
 )
-from .workflow import (
-    format_lifecycle_result,
-    resume_ticket_lifecycle,
-    run_ticket_lifecycle,
-)
+from .workflow import resume_ticket_lifecycle, run_ticket_lifecycle
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -166,6 +164,7 @@ def _handle_run(args: argparse.Namespace) -> int:
             resolved_policy=resolved_policy,
             agent_executor_factory=providers,
             final_patch_capture=production_final_patch_capture(),
+            report_publisher=FilesystemTerminalReportPublisher(),
         )
     except TicketInputError as error:
         print(f"Ticket input error: {error}", file=sys.stderr)
@@ -209,6 +208,7 @@ def _handle_resume(args: argparse.Namespace) -> int:
             runs_dir=runs_dir,
             agent_executor_factory=production_agent_executor_factory(),
             final_patch_capture=production_final_patch_capture(),
+            report_publisher=FilesystemTerminalReportPublisher(),
         )
     except RunError as error:
         print(f"Run error: {error}", file=sys.stderr)

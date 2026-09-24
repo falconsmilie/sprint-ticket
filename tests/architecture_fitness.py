@@ -54,13 +54,36 @@ LIFECYCLE_IMPLEMENTATION_MODULES = frozenset(
         f"{PACKAGE}.corrections",
         f"{PACKAGE}.implementation",
         f"{PACKAGE}.preflight",
-        f"{PACKAGE}.reporting",
         f"{PACKAGE}.review",
         f"{PACKAGE}.verification",
         f"{PACKAGE}.workflow",
     }
 )
 LEGACY_APPLICATION_MODULES = LIFECYCLE_IMPLEMENTATION_MODULES
+PRESENTATION_COMPATIBILITY_IMPORTS = frozenset(
+    {
+        (
+            f"{PACKAGE}.implementation",
+            f"{PACKAGE}.presentation.stages",
+            "format_implementation_result",
+        ),
+        (
+            f"{PACKAGE}.review",
+            f"{PACKAGE}.presentation.stages",
+            "format_review_result",
+        ),
+        (
+            f"{PACKAGE}.verification",
+            f"{PACKAGE}.presentation.stages",
+            "format_verification_result",
+        ),
+        (
+            f"{PACKAGE}.corrections",
+            f"{PACKAGE}.presentation.stages",
+            "format_correction_result",
+        ),
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -145,48 +168,6 @@ def _provider_debt(
 
 ARCHITECTURE_DEBT = (
     _private_debt(
-        "ticket_automation.application.handoff_acceptance",
-        "ticket_automation._verification_artifacts",
-        "_read_verification_source_fingerprint",
-        "TA-EVID-001",
-        "Move verification evidence access behind its public codec contract.",
-    ),
-    _private_debt(
-        "ticket_automation.application.handoff_acceptance",
-        "ticket_automation._verification_artifacts",
-        "_VerificationArtifactError",
-        "TA-EVID-001",
-        "Move verification evidence errors into the public codec contract.",
-    ),
-    _private_debt(
-        "ticket_automation.corrections",
-        "ticket_automation._verification_artifacts",
-        "_baseline_verification_evidence_problem",
-        "TA-EVID-001",
-        "Move verification evidence access behind its public codec contract.",
-    ),
-    _private_debt(
-        "ticket_automation.corrections",
-        "ticket_automation._verification_artifacts",
-        "_read_verification_source_fingerprint",
-        "TA-EVID-001",
-        "Move verification evidence access behind its public codec contract.",
-    ),
-    _private_debt(
-        "ticket_automation.corrections",
-        "ticket_automation._verification_artifacts",
-        "_VerificationArtifactError",
-        "TA-EVID-001",
-        "Move verification evidence errors into the public codec contract.",
-    ),
-    _private_debt(
-        "ticket_automation.implementation",
-        "ticket_automation._verification_artifacts",
-        "_baseline_verification_evidence_problem",
-        "TA-EVID-001",
-        "Move verification evidence access behind its public codec contract.",
-    ),
-    _private_debt(
         "ticket_automation.resolved_config",
         "ticket_automation",
         "__version__",
@@ -194,53 +175,11 @@ ARCHITECTURE_DEBT = (
         "Replace the package-private version dependency during legacy surface cleanup.",
     ),
     _private_debt(
-        "ticket_automation.review",
-        "ticket_automation._verification_artifacts",
-        "_read_verification_source_fingerprint",
-        "TA-EVID-001",
-        "Move verification evidence access behind its public codec contract.",
-    ),
-    _private_debt(
-        "ticket_automation.review",
-        "ticket_automation._verification_artifacts",
-        "_VerificationArtifactError",
-        "TA-EVID-001",
-        "Move verification evidence errors into the public codec contract.",
-    ),
-    _private_debt(
-        "ticket_automation.runs",
-        "ticket_automation._verification_artifacts",
-        "_verification_commands_fingerprint",
-        "TA-EVID-001",
-        "Move evidence fingerprints behind the public codec contract.",
-    ),
-    _private_debt(
         "ticket_automation.runs",
         "ticket_automation.models",
         "_validate_workflow_transition",
         "TA-DOM-003",
         "Expose transition validation through the domain lifecycle model.",
-    ),
-    _private_debt(
-        "ticket_automation.workflow",
-        "ticket_automation._verification_artifacts",
-        "_baseline_verification_evidence_problem",
-        "TA-EVID-001",
-        "Move verification evidence access behind its public codec contract.",
-    ),
-    _private_debt(
-        "ticket_automation.workflow",
-        "ticket_automation._verification_artifacts",
-        "_verification_commands_fingerprint",
-        "TA-EVID-001",
-        "Move evidence fingerprints behind the public codec contract.",
-    ),
-    _private_debt(
-        "ticket_automation.workflow",
-        "ticket_automation.verification",
-        "_run_baseline_verification_stage",
-        "TA-LIFE-002",
-        "Invoke verification through the split lifecycle stage API.",
     ),
 )
 
@@ -324,6 +263,12 @@ def _edge_violation(edge: ImportEdge, rule: str, detail: str) -> Violation:
         symbol=edge.symbol,
         line=edge.line,
         detail=detail,
+    )
+
+
+def _is_presentation_compatibility_import(edge: ImportEdge) -> bool:
+    return (edge.importer, edge.imported_module, edge.symbol) in (
+        PRESENTATION_COMPATIBILITY_IMPORTS
     )
 
 
@@ -434,7 +379,9 @@ def _import_violations(edge: ImportEdge) -> list[Violation]:
     if (
         layer in {"application", "domain", "infrastructure", "providers"}
         or edge.importer in LEGACY_APPLICATION_MODULES
-    ) and (_targets_layer(edge, "presentation") or _targets_layer(edge, "composition")):
+    ) and (
+        _targets_layer(edge, "presentation") or _targets_layer(edge, "composition")
+    ) and not _is_presentation_compatibility_import(edge):
         violations.append(
             _edge_violation(
                 edge,

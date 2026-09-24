@@ -28,6 +28,7 @@ from ticket_automation.config import (
     VerificationCommand,
     VerificationSettings,
 )
+from ticket_automation.presentation.reporting import FilesystemTerminalReportPublisher
 from ticket_automation.providers.codex_cli import (
     DEFAULT_CODEX_MODEL,
     DEFAULT_CODEX_REASONING_EFFORT,
@@ -409,6 +410,70 @@ def make_final_patch_capture():
     return production_final_patch_capture()
 
 
+def make_report_publisher():
+    """Build the filesystem report adapter used by lifecycle tests."""
+
+    return FilesystemTerminalReportPublisher()
+
+
+def run_test_stage(stage, phase, config, run_dir, **kwargs):
+    """Execute one stage with the same controller-owned attempt protocol as production."""
+
+    from ticket_automation.attempts import (
+        AttemptMetadata,
+        StageAttempt,
+        complete_stage_attempt,
+        start_attempt,
+        update_attempt,
+    )
+    from ticket_automation.git import GitRepository
+    from ticket_automation.git_safety import WorkspaceSnapshot
+    from ticket_automation.models import AttemptPhase
+    from ticket_automation.runs import RUN_RECORD_FILE, load_run_record
+
+    run_path = Path(run_dir)
+    before = None
+    if phase in {
+        AttemptPhase.PREPARING,
+        AttemptPhase.VERIFYING,
+        AttemptPhase.REVIEWING,
+    }:
+        record = load_run_record(run_path / RUN_RECORD_FILE)
+        try:
+            before = WorkspaceSnapshot.capture(
+                GitRepository(Path(record.target_repository_path))
+            ).fingerprint
+        except (OSError, RuntimeError, ValueError):
+            before = None
+    clock = kwargs.get("clock")
+    attempt = start_attempt(
+        run_path,
+        phase=phase,
+        before_workspace_fingerprint=before,
+        clock=clock,
+    )
+    if phase is AttemptPhase.REVIEWING:
+        kwargs["mark_process_started"] = lambda: update_attempt(
+            attempt, process_started=True
+        )
+    result = stage(
+        config,
+        run_path,
+        attempt_record=StageAttempt.from_record(attempt),
+        **kwargs,
+    )
+    complete_stage_attempt(
+        run_path,
+        attempt,
+        stage_outcome=result.outcome,
+        after_workspace_fingerprint=result.after_workspace_fingerprint,
+        process_started=result.process_started,
+        metadata=AttemptMetadata(controller_message=result.controller_message),
+        clock=clock,
+    )
+    return result
+
+
 def make_run_dependencies(
     config: AppConfig, *, process_runner=None, agent_executor=None
 ) -> dict[str, object]:
@@ -434,6 +499,7 @@ def make_run_dependencies(
         "resolved_policy": resolved_policy,
         "agent_executor_factory": factory,
         "final_patch_capture": production_final_patch_capture(),
+        "report_publisher": make_report_publisher(),
     }
 
 
@@ -470,11 +536,11 @@ def create_trusted_prepared_run(
     clock: Callable[[], datetime] | None = None,
 ) -> RunCreationResult:
     """Build a PREPARED run through the real baseline-verification boundary."""
-    from ticket_automation.models import WorkflowState
+    from ticket_automation.models import AttemptPhase, WorkflowState
     from ticket_automation.runs import save_run_record
     from ticket_automation.verification import (
         VerificationProcessResult,
-        _run_baseline_verification_stage,
+        run_baseline_verification_stage,
     )
 
     class PassingBaselineRunner:
@@ -488,7 +554,9 @@ def create_trusted_prepared_run(
         runs_dir=runs_dir,
         clock=clock,
     )
-    verification = _run_baseline_verification_stage(
+    verification = run_test_stage(
+        run_baseline_verification_stage,
+        AttemptPhase.PREPARING,
         config,
         snapshot.run_dir,
         process_runner=verification_runner or PassingBaselineRunner(),

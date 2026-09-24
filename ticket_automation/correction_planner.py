@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from typing import Any
 
-from .attempts import attempt_result_path, latest_attempt
+from .attempts import latest_attempt
 from .corrections import (
     CorrectionCauseSet,
     CorrectionError,
@@ -16,6 +14,7 @@ from .corrections import (
 )
 from .domain.task_results import ReviewResult, ReviewVerdict
 from .models import AttemptPhase, AttemptStatus
+from .persistence_codecs import PersistenceCodecError, read_attempt_result_value
 from .task_result_codecs import decode_review_result
 from .verification import VerificationError, VerificationFailure
 
@@ -108,10 +107,9 @@ def _load_latest_verification_failures(
     )
     if attempt is None:
         return ()
-    result_path = attempt_result_path(run_path, attempt)
-    if not result_path.is_file():
+    data = _read_correction_source_object(run_path, attempt)
+    if data is None:
         return ()
-    data = _read_json_object(result_path)
     if data.get("status") != "FAIL":
         return ()
 
@@ -140,26 +138,26 @@ def _load_latest_review_result(run_path: Path) -> ReviewResult | None:
     )
     if attempt is None:
         return None
-    result_path = attempt_result_path(run_path, attempt)
-    if not result_path.is_file():
-        return None
     try:
-        return decode_review_result(_read_json_object(result_path))
+        data = _read_correction_source_object(run_path, attempt)
+        return None if data is None else decode_review_result(data)
     except ValueError as error:
         raise CorrectionError(
             f"Review correction source is invalid: {error}"
         ) from error
 
 
-def _read_json_object(path: Path) -> dict[str, Any]:
+def _read_correction_source_object(run_path: Path, attempt) -> dict | None:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        data = read_attempt_result_value(run_path, attempt)
+    except PersistenceCodecError as error:
         raise CorrectionError(
-            f"Could not read correction source data: {path}: {error}"
+            f"Could not read correction source data: {error}"
         ) from error
+    if data is None:
+        return None
     if not isinstance(data, dict):
-        raise CorrectionError(f"Correction source data must be an object: {path}")
+        raise CorrectionError("Correction source data must be an object.")
     return data
 
 

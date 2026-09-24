@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -11,15 +10,19 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
-from ._verification_artifacts import (
-    VERIFICATION_ROUND_FORMAT,
-    VERIFICATION_SCHEMA_VERSION,
+from .attempts import (
+    AttemptMetadata,
+    StageAttempt,
+    attempt_result_path,
+    complete_stage_attempt,
+    require_stage_attempt,
+    start_attempt,
 )
-from .attempts import attempt_result_path, finish_phase_attempt, start_attempt
 from .config import AppConfig, VerificationCommand
 from .git import GitRepository
 from .git_safety import WorkspaceChange, WorkspaceSnapshot, workspace_safety_changes
-from .models import AttemptPhase, StageOutcome, WorkflowState
+from .models import PHASE_DEFINITIONS, AttemptPhase, StageOutcome, WorkflowState
+from .persistence import atomic_write_json, format_timestamp
 from .process_output import decode_human_output
 from .resolved_config import config_from_resolved_run_policy
 from .runs import (
@@ -31,6 +34,10 @@ from .runs import (
     RunRecord,
     load_baseline_record,
     load_run_record,
+)
+from .verification_evidence import (
+    VERIFICATION_ROUND_FORMAT,
+    VERIFICATION_SCHEMA_VERSION,
 )
 
 
@@ -343,17 +350,25 @@ class VerificationStageResult:
     artifact_directory: Path
     round_result: VerificationRound
     controller_message: str
+    attempt_phase: AttemptPhase
+    after_workspace_fingerprint: str | None
+    process_started: bool
+
+    @property
+    def source_state(self) -> WorkflowState:
+        return PHASE_DEFINITIONS[self.attempt_phase].active_state
 
     @property
     def successful(self) -> bool:
         return self.outcome == StageOutcome.COMPLETED
 
 
-def _run_baseline_verification_stage(
+def run_baseline_verification_stage(
     config: AppConfig,
     run_dir: Path | str,
     *,
     process_runner: VerificationProcessRunner | None = None,
+    attempt_record: StageAttempt,
     clock: Callable[[], datetime] | None = None,
 ) -> VerificationStageResult:
     run_path = Path(run_dir)
@@ -364,6 +379,11 @@ def _run_baseline_verification_stage(
     config = config_from_resolved_run_policy(run_record.resolved_policy)
     if run_record.state != WorkflowState.PREPARING:
         raise VerificationError("Baseline verification requires PREPARING state.")
+    attempt = require_stage_attempt(
+        run_path,
+        attempt_record,
+        phase=AttemptPhase.PREPARING,
+    )
     baseline = load_baseline_record(run_path / BASELINE_RECORD_FILE)
     repository = GitRepository(Path(run_record.target_repository_path))
     try:
@@ -381,12 +401,15 @@ def _run_baseline_verification_stage(
                 "Clean baseline repository inspection failed.",
             ),
         )
-    attempt = start_attempt(
-        run_path,
-        phase=AttemptPhase.PREPARING,
-        before_workspace_fingerprint=before,
-        clock=clock,
-    )
+    if before != attempt.before_workspace_fingerprint:
+        violations += (
+            VerificationSafetyViolation(
+                "attempt-workspace",
+                str(attempt.before_workspace_fingerprint),
+                str(before),
+                "Workspace changed after the controller started preparation.",
+            ),
+        )
     result_path = attempt_result_path(run_path, attempt)
     if violations:
         round_result = _controller_error_round(result_path, 0, violations, clock=clock)
@@ -419,6 +442,61 @@ def run_verification_stage(
     *,
     process_runner: VerificationProcessRunner | None = None,
     round_index: int | None = None,
+    attempt_record: StageAttempt | None = None,
+    clock: Callable[[], datetime] | None = None,
+) -> VerificationStageResult:
+    run_path = Path(run_dir)
+    if attempt_record is not None:
+        return _run_verification_stage(
+            config,
+            run_path,
+            process_runner=process_runner,
+            round_index=round_index,
+            attempt_record=attempt_record,
+            clock=clock,
+        )
+    run_record = load_run_record(run_path / RUN_RECORD_FILE)
+    if run_record.state is not WorkflowState.VERIFYING:
+        raise VerificationError("Verification requires VERIFYING state.")
+    try:
+        before = WorkspaceSnapshot.capture(
+            GitRepository(Path(run_record.target_repository_path))
+        ).fingerprint
+    except (OSError, RuntimeError, ValueError):
+        before = None
+    owned_attempt = start_attempt(
+        run_path,
+        phase=AttemptPhase.VERIFYING,
+        before_workspace_fingerprint=before,
+        clock=clock,
+    )
+    result = _run_verification_stage(
+        config,
+        run_path,
+        process_runner=process_runner,
+        round_index=round_index,
+        attempt_record=StageAttempt.from_record(owned_attempt),
+        clock=clock,
+    )
+    complete_stage_attempt(
+        run_path,
+        owned_attempt,
+        stage_outcome=result.outcome,
+        after_workspace_fingerprint=result.after_workspace_fingerprint,
+        process_started=result.process_started,
+        metadata=AttemptMetadata(controller_message=result.controller_message),
+        clock=clock,
+    )
+    return result
+
+
+def _run_verification_stage(
+    config: AppConfig,
+    run_dir: Path | str,
+    *,
+    process_runner: VerificationProcessRunner | None = None,
+    round_index: int | None = None,
+    attempt_record: StageAttempt,
     clock: Callable[[], datetime] | None = None,
 ) -> VerificationStageResult:
     run_path = Path(run_dir)
@@ -426,6 +504,11 @@ def run_verification_stage(
     config = config_from_resolved_run_policy(run_record.resolved_policy)
     if run_record.state != WorkflowState.VERIFYING:
         raise VerificationError("Verification requires VERIFYING state.")
+    attempt = require_stage_attempt(
+        run_path,
+        attempt_record,
+        phase=AttemptPhase.VERIFYING,
+    )
     repository = GitRepository(Path(run_record.target_repository_path))
     selected_round = (
         run_record.current_correction_round if round_index is None else round_index
@@ -445,12 +528,15 @@ def run_verification_stage(
                 "Repository inspection failed before deterministic verification.",
             ),
         )
-    attempt = start_attempt(
-        run_path,
-        phase=AttemptPhase.VERIFYING,
-        before_workspace_fingerprint=before,
-        clock=clock,
-    )
+    if before != attempt.before_workspace_fingerprint:
+        violations += (
+            VerificationSafetyViolation(
+                "attempt-workspace",
+                str(attempt.before_workspace_fingerprint),
+                str(before),
+                "Workspace changed after the controller started verification.",
+            ),
+        )
     result_path = attempt_result_path(run_path, attempt)
     if violations:
         round_result = _controller_error_round(
@@ -550,13 +636,7 @@ def _finish_stage(
         ).fingerprint
     except (OSError, RuntimeError, ValueError):
         after = None
-    finish_phase_attempt(
-        run_path,
-        phase=attempt_phase,
-        stage_outcome=outcome,
-        after_workspace_fingerprint=after,
-        process_started=_round_process_started(round_result.commands),
-    )
+    process_started = _round_process_started(round_result.commands)
     return VerificationStageResult(
         run_dir=run_path,
         run_record=run_record,
@@ -564,6 +644,9 @@ def _finish_stage(
         artifact_directory=artifact_directory,
         round_result=round_result,
         controller_message=message,
+        attempt_phase=attempt_phase,
+        after_workspace_fingerprint=after,
+        process_started=process_started,
     )
 
 
@@ -795,8 +878,7 @@ def _excerpt(value: str, limit: int = 4000) -> str:
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    atomic_write_json(path, data)
 
 
 def _process_text(value: bytes | str | None) -> str:
@@ -811,17 +893,13 @@ def _utcnow(clock: Callable[[], datetime] | None) -> datetime:
 
 
 def _timestamp(value: datetime) -> str:
-    return value.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return format_timestamp(value)
 
 
 def format_verification_result(result: VerificationStageResult) -> str:
-    return "\n".join(
-        [
-            f"Verification state: {result.run_record.state.value}",
-            f"Artifacts: {result.artifact_directory}",
-            result.controller_message,
-        ]
-    )
+    from .presentation.stages import format_verification_result as format_result
+
+    return format_result(result)
 
 
 __all__ = [
@@ -840,5 +918,6 @@ __all__ = [
     "VerificationStageResult",
     "VerificationStatus",
     "format_verification_result",
+    "run_baseline_verification_stage",
     "run_verification_stage",
 ]

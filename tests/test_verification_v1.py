@@ -10,6 +10,7 @@ from tests.helpers import (
     create_test_run_snapshot,
     create_trusted_prepared_run,
     make_config,
+    run_test_stage,
 )
 from ticket_automation.attempts import latest_attempt
 from ticket_automation.config import VerificationCommand
@@ -17,7 +18,7 @@ from ticket_automation.models import AttemptPhase, StageOutcome, WorkflowState
 from ticket_automation.runs import save_run_record
 from ticket_automation.verification import (
     VerificationProcessResult,
-    _run_baseline_verification_stage,
+    run_baseline_verification_stage,
     run_verification_stage,
 )
 
@@ -61,7 +62,9 @@ def test_baseline_verification_uses_the_persisted_resolved_commands(
     )
     runner = RecordingVerificationRunner([])
 
-    result = _run_baseline_verification_stage(
+    result = run_test_stage(
+        run_baseline_verification_stage,
+        AttemptPhase.PREPARING,
         changed_local_config,
         snapshot.run_dir,
         process_runner=runner,
@@ -105,7 +108,13 @@ def test_verification_snapshot_failure_is_recorded_without_starting_a_process(
         "capture",
         staticmethod(fail_capture),
     )
-    result = run_verification_stage(config, snapshot.run_dir, clock=fixed_clock)
+    result = run_test_stage(
+        run_verification_stage,
+        AttemptPhase.VERIFYING,
+        config,
+        snapshot.run_dir,
+        clock=fixed_clock,
+    )
 
     attempt = latest_attempt(snapshot.run_dir, phases=(AttemptPhase.VERIFYING,))
     assert result.outcome is StageOutcome.HUMAN_REQUIRED
@@ -142,7 +151,9 @@ def test_verification_process_start_failure_is_not_recorded_as_a_started_process
             del command, timeout_seconds
             raise FileNotFoundError("missing verifier")
 
-    result = run_verification_stage(
+    result = run_test_stage(
+        run_verification_stage,
+        AttemptPhase.VERIFYING,
         config,
         snapshot.run_dir,
         process_runner=UnavailableRunner(),

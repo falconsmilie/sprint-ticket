@@ -2,24 +2,27 @@
 
 from __future__ import annotations
 
-import json
-import os
-import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
-from ...application.agent_execution import ArtifactReference
+from ...application.agent_execution import (
+    ArtifactReference,
+    ArtifactRole,
+    AttemptArtifactLayout,
+)
+from ...persistence import JsonValue, atomic_write_json
 
 PROMPT_ARTIFACT = "prompt.md"
 EVENTS_ARTIFACT = "events.jsonl"
 STDERR_ARTIFACT = "stderr.log"
-EXECUTION_ARTIFACT = "execution.json"
+EXECUTION_ARTIFACT = "codex-execution.json"
 RESULT_ARTIFACT = "codex-result.json"
 
 
 @dataclass(frozen=True)
 class CodexArtifactPaths:
+    layout: AttemptArtifactLayout
     directory: Path
     prompt: Path
     events: Path
@@ -28,9 +31,12 @@ class CodexArtifactPaths:
     result: Path
 
     @classmethod
-    def create(cls, directory: Path) -> CodexArtifactPaths:
-        directory = Path(directory)
+    def create(cls, layout: AttemptArtifactLayout) -> CodexArtifactPaths:
+        if not isinstance(layout, AttemptArtifactLayout):
+            raise TypeError("layout must be an AttemptArtifactLayout.")
+        directory = layout.attempt_root
         return cls(
+            layout=layout,
             directory=directory,
             prompt=directory / PROMPT_ARTIFACT,
             events=directory / EVENTS_ARTIFACT,
@@ -40,13 +46,29 @@ class CodexArtifactPaths:
         )
 
     def references(self) -> tuple[ArtifactReference, ...]:
-        return (
-            ArtifactReference("prompt", self.prompt, "text/markdown"),
-            ArtifactReference("events", self.events, "application/x-ndjson"),
-            ArtifactReference("standard-error", self.stderr, "text/plain"),
-            ArtifactReference("execution-details", self.execution, "application/json"),
-            ArtifactReference("structured-result", self.result, "application/json"),
-        )
+        references = [
+            self.layout.reference(ArtifactRole.PROMPT, self.prompt, "text/markdown"),
+            self.layout.reference(
+                ArtifactRole.PROVIDER_EVENTS,
+                self.events,
+                "application/x-ndjson",
+            ),
+            self.layout.reference(
+                ArtifactRole.STANDARD_ERROR, self.stderr, "text/plain"
+            ),
+            self.layout.reference(
+                ArtifactRole.PROVIDER_EXECUTION_DETAILS,
+                self.execution,
+                "application/json",
+            ),
+        ]
+        if self.result.is_file():
+            references.append(
+                self.layout.reference(
+                    ArtifactRole.TYPED_RESULT, self.result, "application/json"
+                )
+            )
+        return tuple(references)
 
 
 def prepare(paths: CodexArtifactPaths, prompt: str) -> None:
@@ -67,36 +89,8 @@ def write_process_output(
     paths.stderr.write_text(stderr, encoding="utf-8", newline="\n")
 
 
-def write_execution(paths: CodexArtifactPaths, record: dict[str, Any]) -> None:
-    _atomic_write_json(paths.execution, record)
-
-
-def _atomic_write_json(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(data, indent=2, sort_keys=True)
-    temporary: Path | None = None
-    descriptor = -1
-    try:
-        descriptor, name = tempfile.mkstemp(
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            text=True,
-        )
-        temporary = Path(name)
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as output:
-            descriptor = -1
-            output.write(payload)
-            output.write("\n")
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, path)
-    except Exception:
-        if descriptor != -1:
-            os.close(descriptor)
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-        raise
+def write_execution(paths: CodexArtifactPaths, record: Mapping[str, JsonValue]) -> None:
+    atomic_write_json(paths.execution, record)
 
 
 __all__ = [

@@ -467,7 +467,7 @@ def test_guard_artifact_persistence_failure_stops_successful_execution(
         request.execution_request.artifact_directory / "workspace-guard.json"
     ).exists()
     persisted_attempt = load_attempt_records(tmp_path / "run")[-1]
-    assert persisted_attempt.execution_path is None
+    assert persisted_attempt.execution_path == "execution.json"
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required")

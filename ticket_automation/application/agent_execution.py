@@ -7,11 +7,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from math import isclose, isfinite
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 from typing import Generic, Protocol, TypeAlias, TypeVar
 
 from ..domain.task_results import ImplementationResult, ReviewResult, TaskResult
+from ..models import ATTEMPT_RESULT_ARTIFACT_NAME
 
 
 class AgentContractError(ValueError):
@@ -83,6 +84,124 @@ class AgentFailureCategory(StrEnum):
     MISSING_RESULT = "missing-result"
     INVALID_RESULT = "invalid-result"
     CAPABILITY_OR_CONFIGURATION_FAILURE = "capability-or-configuration-failure"
+
+
+class ArtifactRole(StrEnum):
+    """Stable provider-neutral meanings for attempt-owned artifacts."""
+
+    EXECUTION_EVIDENCE = "execution-evidence"
+    TYPED_RESULT = "typed-result"
+    PROMPT = "prompt"
+    PROVIDER_EVENTS = "provider-events"
+    STANDARD_ERROR = "standard-error"
+    PROVIDER_EXECUTION_DETAILS = "provider-execution-details"
+    WORKSPACE_GUARD = "workspace-guard"
+    CORRECTION_TICKET = "correction-ticket"
+
+
+EXECUTION_EVIDENCE_FILE = "execution.json"
+WORKSPACE_GUARD_FILE = "workspace-guard.json"
+CORRECTION_TICKET_FILE = "correction-ticket.md"
+
+
+@dataclass(frozen=True)
+class AttemptArtifactLayout:
+    """Confine all artifact paths to one trusted run and attempt root."""
+
+    run_root: Path
+    attempt_root: Path
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.run_root, Path) or not isinstance(
+            self.attempt_root, Path
+        ):
+            raise AgentContractError("artifact layout roots must be Path values.")
+        run_root = self.run_root.resolve(strict=False)
+        attempt_root = self.attempt_root.resolve(strict=False)
+        try:
+            relative = attempt_root.relative_to(run_root)
+        except ValueError as error:
+            raise AgentContractError(
+                "attempt artifact root must remain inside the owning run."
+            ) from error
+        if not relative.parts:
+            raise AgentContractError(
+                "attempt artifact root must be below the run root."
+            )
+        object.__setattr__(self, "run_root", run_root)
+        object.__setattr__(self, "attempt_root", attempt_root)
+
+    @property
+    def attempt_id(self) -> str:
+        return self.attempt_root.name
+
+    @property
+    def artifact_directory(self) -> Path:
+        return self.attempt_root
+
+    def path(self, relative_path: str | PurePosixPath) -> Path:
+        relative = _validated_artifact_path(relative_path)
+        candidate = (self.attempt_root / Path(*relative.parts)).resolve(strict=False)
+        try:
+            candidate.relative_to(self.attempt_root)
+        except ValueError as error:
+            raise AgentContractError(
+                "artifact path must remain inside the owning attempt."
+            ) from error
+        return candidate
+
+    def named_path(self, role: ArtifactRole) -> Path:
+        filenames = {
+            ArtifactRole.EXECUTION_EVIDENCE: EXECUTION_EVIDENCE_FILE,
+            ArtifactRole.TYPED_RESULT: ATTEMPT_RESULT_ARTIFACT_NAME,
+            ArtifactRole.WORKSPACE_GUARD: WORKSPACE_GUARD_FILE,
+            ArtifactRole.CORRECTION_TICKET: CORRECTION_TICKET_FILE,
+        }
+        try:
+            return self.path(filenames[role])
+        except KeyError as error:
+            raise AgentContractError(
+                f"artifact role {role.value!r} has no provider-neutral filename."
+            ) from error
+
+    def reference(
+        self,
+        role: ArtifactRole,
+        path: Path,
+        media_type: str | None = None,
+        *,
+        require_exists: bool = False,
+    ) -> ArtifactReference:
+        if not isinstance(role, ArtifactRole):
+            raise AgentContractError("artifact role must be an ArtifactRole value.")
+        resolved = path.resolve(strict=False)
+        try:
+            resolved.relative_to(self.attempt_root)
+            run_relative = resolved.relative_to(self.run_root).as_posix()
+        except ValueError as error:
+            raise AgentContractError(
+                "artifact reference must remain inside the owning attempt."
+            ) from error
+        if require_exists and not resolved.is_file():
+            raise AgentContractError(f"referenced artifact does not exist: {resolved}")
+        return ArtifactReference(role, run_relative, media_type)
+
+    def resolve(
+        self, reference: ArtifactReference, *, require_exists: bool = False
+    ) -> Path:
+        if not isinstance(reference, ArtifactReference):
+            raise AgentContractError("reference must be an ArtifactReference.")
+        relative = _validated_artifact_path(reference.run_relative_path)
+        resolved = (self.run_root / Path(*relative.parts)).resolve(strict=False)
+        try:
+            resolved.relative_to(self.attempt_root)
+        except ValueError as error:
+            raise AgentContractError(
+                "artifact reference does not belong to the owning attempt."
+            ) from error
+        if require_exists and not resolved.is_file():
+            raise AgentContractError(f"referenced artifact does not exist: {resolved}")
+        return resolved
 
 
 def _result_type_for(
@@ -162,6 +281,7 @@ class AgentExecutionRequest(Generic[ResultT_co]):
     artifact_directory: Path
     policy: AgentExecutionPolicy
     required_capabilities: frozenset[AgentCapability]
+    artifact_layout: AttemptArtifactLayout | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.task_kind, AgentTaskKind):
@@ -182,6 +302,21 @@ class AgentExecutionRequest(Generic[ResultT_co]):
             )
         if not isinstance(self.artifact_directory, Path):
             raise AgentContractError("artifact_directory must be a Path.")
+        layout = self.artifact_layout
+        if layout is None:
+            layout = AttemptArtifactLayout(
+                self.artifact_directory.parent,
+                self.artifact_directory,
+            )
+            object.__setattr__(self, "artifact_layout", layout)
+        elif not isinstance(layout, AttemptArtifactLayout):
+            raise AgentContractError(
+                "artifact_layout must be an AttemptArtifactLayout."
+            )
+        elif layout.attempt_root != self.artifact_directory.resolve(strict=False):
+            raise AgentContractError(
+                "artifact_directory must match the artifact layout attempt root."
+            )
         if not isinstance(self.policy, AgentExecutionPolicy):
             raise AgentContractError("policy must be an AgentExecutionPolicy.")
         capabilities = _capability_set(self.required_capabilities)
@@ -213,19 +348,29 @@ class AgentExecutionRequest(Generic[ResultT_co]):
 class ArtifactReference:
     """A provider-neutral pointer to evidence captured for an invocation."""
 
-    name: str
-    path: Path
+    role: ArtifactRole
+    run_relative_path: str
     media_type: str | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.name, str) or not self.name.strip():
-            raise AgentContractError("artifact name must be a non-empty string.")
-        if not isinstance(self.path, Path):
-            raise AgentContractError("artifact path must be a Path.")
+        if not isinstance(self.role, ArtifactRole):
+            raise AgentContractError("artifact role must be an ArtifactRole value.")
+        normalized = _validated_artifact_path(self.run_relative_path).as_posix()
+        object.__setattr__(self, "run_relative_path", normalized)
         if self.media_type is not None and (
             not isinstance(self.media_type, str) or not self.media_type.strip()
         ):
             raise AgentContractError("artifact media_type must be non-empty when set.")
+
+    @property
+    def name(self) -> str:
+        return self.role.value
+
+    @property
+    def path(self) -> Path:
+        """Return the run-relative path as a Path for compatibility at boundaries."""
+
+        return Path(*PurePosixPath(self.run_relative_path).parts)
 
 
 ProviderMetadataScalar: TypeAlias = str | int | float | bool | None
@@ -435,6 +580,24 @@ def _validate_timestamp(value: object, *, field_name: str) -> None:
         raise AgentContractError(f"{field_name} must be a timezone-aware datetime.")
 
 
+def _validated_artifact_path(value: object) -> PurePosixPath:
+    if not isinstance(value, str | PurePosixPath):
+        raise AgentContractError("artifact path must be a POSIX relative path.")
+    text = str(value)
+    if not text or "\\" in text:
+        raise AgentContractError(
+            "artifact path must be a non-empty POSIX relative path."
+        )
+    path = PurePosixPath(text)
+    if (
+        path.is_absolute()
+        or PureWindowsPath(text).is_absolute()
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        raise AgentContractError("artifact path must be relative without traversal.")
+    return path
+
+
 def _freeze_metadata(
     value: Mapping[str, ProviderMetadataValue],
 ) -> Mapping[str, ProviderMetadataValue]:
@@ -463,8 +626,11 @@ def _freeze_metadata_value(value: object) -> ProviderMetadataValue:
 
 __all__ = [
     "CORRECTION_RESULT_CONTRACT",
+    "CORRECTION_TICKET_FILE",
+    "EXECUTION_EVIDENCE_FILE",
     "IMPLEMENTATION_RESULT_CONTRACT",
     "REVIEW_RESULT_CONTRACT",
+    "WORKSPACE_GUARD_FILE",
     "AgentCapability",
     "AgentContractError",
     "AgentExecution",
@@ -477,6 +643,8 @@ __all__ = [
     "AgentResultContract",
     "AgentTaskKind",
     "ArtifactReference",
+    "ArtifactRole",
+    "AttemptArtifactLayout",
     "InvocationStart",
     "NetworkAccess",
     "PersistedAgentExecutorFactory",

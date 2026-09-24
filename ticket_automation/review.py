@@ -7,10 +7,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ._verification_artifacts import (
-    _read_verification_source_fingerprint,
-    _VerificationArtifactError,
-)
 from .application.agent_execution import (
     REVIEW_RESULT_CONTRACT,
     AgentExecution,
@@ -19,14 +15,18 @@ from .application.agent_execution import (
     AgentExecutor,
     AgentFailureCategory,
     AgentTaskKind,
+    AttemptArtifactLayout,
     NetworkAccess,
     RepositoryAccess,
     required_execution_capabilities,
 )
 from .attempts import (
+    AttemptMetadata,
+    StageAttempt,
     attempt_result_path,
-    finish_phase_attempt,
+    complete_stage_attempt,
     latest_attempt,
+    require_stage_attempt,
     start_attempt,
     update_attempt,
 )
@@ -39,6 +39,7 @@ from .domain.task_results import (
     ReviewResultConsistencyError,
     ReviewVerdict,
 )
+from .execution_evidence import evidence_from_execution, write_execution_evidence
 from .git import GitRepository
 from .git_safety import (
     WorkspaceChange,
@@ -51,6 +52,12 @@ from .models import (
     AttemptStatus,
     StageOutcome,
     WorkflowState,
+)
+from .persistence_codecs import (
+    PersistenceCodecError,
+    read_attempt_result_value,
+    write_review_result,
+    write_stage_message,
 )
 from .resolved_config import config_from_resolved_run_policy
 from .runs import (
@@ -65,8 +72,8 @@ from .runs import (
 from .task_result_codecs import (
     decode_implementation_result,
     decode_review_result,
-    encode_review_result,
 )
+from .verification_evidence import read_verification_source_fingerprint
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _REVIEW_PROMPT_TEMPLATE = _PROJECT_ROOT / "prompts" / "review.md"
@@ -96,6 +103,12 @@ class ReviewStageResult:
     safety_violations: tuple[ReviewSafetyViolation, ...]
     processing_error: str | None
     controller_message: str
+    after_workspace_fingerprint: str | None
+    process_started: bool
+
+    @property
+    def source_state(self) -> WorkflowState:
+        return WorkflowState.REVIEWING
 
     @property
     def successful(self) -> bool:
@@ -113,6 +126,70 @@ def run_review_stage(
     run_dir: Path | str,
     *,
     agent_executor: AgentExecutor,
+    attempt_record: StageAttempt | None = None,
+    mark_process_started: Callable[[], None] | None = None,
+    clock: Callable[[], datetime] | None = None,
+) -> ReviewStageResult:
+    run_path = Path(run_dir)
+    if attempt_record is not None:
+        if mark_process_started is None:
+            raise ReviewError(
+                "Controller-owned review attempts require a process-start callback."
+            )
+        return _run_review_stage(
+            config,
+            run_path,
+            agent_executor=agent_executor,
+            attempt_record=attempt_record,
+            mark_process_started=mark_process_started,
+            clock=clock,
+        )
+    run_record = load_run_record(run_path / RUN_RECORD_FILE)
+    if run_record.state is not WorkflowState.REVIEWING:
+        raise ReviewError(
+            f"Review requires run state REVIEWING; found {run_record.state.value}."
+        )
+    try:
+        before = WorkspaceSnapshot.capture(
+            GitRepository(Path(run_record.target_repository_path))
+        ).fingerprint
+    except (OSError, RuntimeError, ValueError):
+        before = None
+    owned_attempt = start_attempt(
+        run_path,
+        phase=AttemptPhase.REVIEWING,
+        before_workspace_fingerprint=before,
+        clock=clock,
+    )
+    result = _run_review_stage(
+        config,
+        run_path,
+        agent_executor=agent_executor,
+        attempt_record=StageAttempt.from_record(owned_attempt),
+        mark_process_started=lambda: update_attempt(
+            owned_attempt, process_started=True
+        ),
+        clock=clock,
+    )
+    complete_stage_attempt(
+        run_path,
+        owned_attempt,
+        stage_outcome=result.outcome,
+        after_workspace_fingerprint=result.after_workspace_fingerprint,
+        process_started=result.process_started,
+        metadata=AttemptMetadata(controller_message=result.controller_message),
+        clock=clock,
+    )
+    return result
+
+
+def _run_review_stage(
+    config: AppConfig,
+    run_dir: Path | str,
+    *,
+    agent_executor: AgentExecutor,
+    attempt_record: StageAttempt,
+    mark_process_started: Callable[[], None],
     clock: Callable[[], datetime] | None = None,
 ) -> ReviewStageResult:
     run_path = Path(run_dir)
@@ -124,6 +201,11 @@ def run_review_stage(
         raise ReviewError(
             f"Review requires run state REVIEWING; found {run_record.state.value}."
         )
+    attempt = require_stage_attempt(
+        run_path,
+        attempt_record,
+        phase=AttemptPhase.REVIEWING,
+    )
 
     baseline_record = load_baseline_record(run_path / BASELINE_RECORD_FILE)
     if baseline_record.branch != run_record.starting_branch:
@@ -145,13 +227,14 @@ def run_review_stage(
             actual=f"{type(error).__name__}: {error}",
             message="Repository inspection failed before independent review.",
         )
-    attempt_record = start_attempt(
-        run_path,
-        phase=AttemptPhase.REVIEWING,
-        before_workspace_fingerprint=before_workspace_fingerprint,
-        clock=clock,
-    )
-    artifact_directory = attempt_record.artifact_directory
+    if before_workspace_fingerprint != attempt.before_workspace_fingerprint:
+        snapshot_error = ReviewSafetyViolation(
+            name="attempt-workspace",
+            expected=str(attempt.before_workspace_fingerprint),
+            actual=str(before_workspace_fingerprint),
+            message="Workspace changed after the controller started review.",
+        )
+    artifact_directory = attempt.artifact_directory
     if snapshot_error is not None:
         return _finish(
             run_record=run_record,
@@ -236,7 +319,7 @@ def run_review_stage(
         )
 
     def mark_invocation_started() -> None:
-        update_attempt(attempt_record, process_started=True)
+        mark_process_started()
 
     request = AgentExecutionRequest(
         task_kind=AgentTaskKind.REVIEW,
@@ -245,6 +328,7 @@ def run_review_stage(
         prompt=prompt,
         result_contract=REVIEW_RESULT_CONTRACT,
         artifact_directory=artifact_directory,
+        artifact_layout=AttemptArtifactLayout(run_path, artifact_directory),
         policy=AgentExecutionPolicy(
             timeout_seconds=_AGENT_TIMEOUT_SECONDS,
             network_access=NetworkAccess.DENIED,
@@ -256,6 +340,11 @@ def run_review_stage(
     execution = agent_executor.execute(
         request,
         on_invocation_start=mark_invocation_started,
+    )
+    assert request.artifact_layout is not None
+    write_execution_evidence(
+        request.artifact_layout,
+        evidence_from_execution(request, execution),
     )
     if not execution.successful:
         safety_violations = _inspect_review_invariants(
@@ -324,24 +413,9 @@ def _validate_review_result_artifact(value: Any) -> ReviewResult:
 
 
 def format_review_result(result: ReviewStageResult) -> str:
-    rows = [
-        f"Review state: {result.run_record.state.value}",
-        f"Artifacts: {result.artifact_directory}",
-        result.controller_message,
-    ]
-    if result.review_result is not None:
-        rows.append(f"Verdict: {result.review_result.verdict.value}")
-        rows.append(f"Findings: {len(result.review_result.findings)}")
-        rows.append(f"Required findings: {len(result.required_findings)}")
-    if result.processing_error:
-        rows.append(f"Processing error: {result.processing_error}")
-    if result.safety_violations:
-        rows.append("Safety violations:")
-        rows.extend(
-            f"  - {violation.name}: expected {violation.expected}, got {violation.actual}"
-            for violation in result.safety_violations
-        )
-    return "\n".join(rows)
+    from .presentation.stages import format_review_result as format_result
+
+    return format_result(result)
 
 
 def _finish_valid_review_result(
@@ -417,14 +491,7 @@ def _finish(
         ).fingerprint
     except (OSError, RuntimeError, ValueError):
         pass
-    finish_phase_attempt(
-        run_dir,
-        phase=AttemptPhase.REVIEWING,
-        stage_outcome=outcome,
-        after_workspace_fingerprint=after_fingerprint,
-        process_started=(None if execution is None else execution.invocation_started),
-        execution_path=None,
-    )
+    process_started = False if execution is None else execution.invocation_started
     return ReviewStageResult(
         run_dir=run_dir,
         run_record=run_record,
@@ -435,6 +502,8 @@ def _finish(
         safety_violations=safety_violations,
         processing_error=processing_error,
         controller_message=controller_message,
+        after_workspace_fingerprint=after_fingerprint,
+        process_started=process_started,
     )
 
 
@@ -446,16 +515,10 @@ def _write_review_result(
     controller_message: str,
 ) -> None:
     path = artifact_directory / ATTEMPT_RESULT_ARTIFACT_NAME
-    payload = (
-        encode_review_result(result)
-        if result is not None
-        else {"status": outcome.value, "message": controller_message}
-    )
-    path.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
+    if result is not None:
+        write_review_result(path, result)
+    else:
+        write_stage_message(path, status=outcome.value, message=controller_message)
 
 
 def _render_review_prompt(
@@ -510,15 +573,15 @@ def _read_verification_results(run_path: Path, run_record: RunRecord) -> str:
         raise ReviewError("Missing deterministic verification results.")
     verification_path = attempt_result_path(run_path, attempt)
     try:
-        data = json.loads(verification_path.read_text(encoding="utf-8"))
-    except FileNotFoundError as error:
-        raise ReviewError(
-            f"Missing deterministic verification results: {verification_path}"
-        ) from error
-    except (OSError, json.JSONDecodeError) as error:
+        data = read_attempt_result_value(run_path, attempt)
+    except PersistenceCodecError as error:
         raise ReviewError(
             f"Could not read deterministic verification results: {verification_path}: {error}"
         ) from error
+    if data is None:
+        raise ReviewError(
+            f"Missing deterministic verification results: {verification_path}"
+        )
     _require_passing_verification_round(data, verification_path)
     return json.dumps(data, indent=2, sort_keys=True)
 
@@ -544,16 +607,15 @@ def _read_implementation_summary(run_path: Path) -> str:
     )
     if attempt is None:
         return "No implementation summary is available."
-    result_path = attempt_result_path(run_path, attempt)
     try:
-        data = json.loads(result_path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return "No implementation summary is available."
-    except (OSError, json.JSONDecodeError):
+        data = read_attempt_result_value(run_path, attempt)
+    except PersistenceCodecError:
         return (
             "Implementation summary is unavailable because the result artifact "
             "could not be read."
         )
+    if data is None:
+        return "No implementation summary is available."
 
     try:
         result = decode_implementation_result(data)
@@ -610,13 +672,13 @@ def _inspect_review_source_fingerprint(
     verification_commands: tuple[VerificationCommand, ...],
 ) -> tuple[ReviewSafetyViolation, ...]:
     try:
-        expected = _read_verification_source_fingerprint(
+        expected = read_verification_source_fingerprint(
             run_path,
             run_record,
             expected_statuses=frozenset({"PASS"}),
             verification_commands=verification_commands,
         )
-    except _VerificationArtifactError as error:
+    except ValueError as error:
         return (
             ReviewSafetyViolation(
                 name="verification-evidence",

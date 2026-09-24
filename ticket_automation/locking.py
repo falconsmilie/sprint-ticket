@@ -2,16 +2,16 @@ from __future__ import annotations
 
 import errno
 import hashlib
-import json
 import os
 import socket
 import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Self
 
+from .persistence import CodecError, atomic_write_json, read_json_object, timestamp_now
 from .process_output import run_human_text_command
 
 if os.name == "nt":
@@ -341,15 +341,7 @@ def _lock_root() -> Path:
 
 
 def _write_metadata(path: Path, data: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(dict(data), indent=2, sort_keys=True)
-    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        temp_path.write_text(f"{payload}\n", encoding="utf-8", newline="\n")
-        os.replace(temp_path, path)
-    except Exception:
-        temp_path.unlink(missing_ok=True)
-        raise
+    atomic_write_json(path, dict(data))
 
 
 def _read_metadata(
@@ -358,10 +350,8 @@ def _read_metadata(
     lock_file: Path,
 ) -> RepositoryLockMetadata | None:
     try:
-        data = json.loads(metadata_file.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(data, dict):
+        data = read_json_object(metadata_file)
+    except (FileNotFoundError, CodecError):
         return None
     return RepositoryLockMetadata.from_dict(
         data,
@@ -398,10 +388,7 @@ def _format_lock_error(
 
 
 def _timestamp(clock: Callable[[], datetime] | None) -> str:
-    now = datetime.now(UTC) if clock is None else clock()
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=UTC)
-    return now.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return timestamp_now(clock)
 
 
 __all__ = [

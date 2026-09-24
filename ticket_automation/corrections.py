@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -8,18 +7,15 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from ._verification_artifacts import (
-    _baseline_verification_evidence_problem,
-    _read_verification_source_fingerprint,
-    _VerificationArtifactError,
-)
 from .application.agent_execution import (
     CORRECTION_RESULT_CONTRACT,
+    CORRECTION_TICKET_FILE,
     AgentExecution,
     AgentExecutionPolicy,
     AgentExecutionRequest,
     AgentExecutor,
     AgentTaskKind,
+    AttemptArtifactLayout,
     NetworkAccess,
     RepositoryAccess,
     required_execution_capabilities,
@@ -39,7 +35,10 @@ from .application.guarded_writable_operation import (
     format_writable_guard_stop,
 )
 from .attempts import (
-    finish_phase_attempt,
+    AttemptMetadata,
+    StageAttempt,
+    complete_stage_attempt,
+    require_stage_attempt,
     start_attempt,
 )
 from .audit import (
@@ -58,6 +57,10 @@ from .models import (
     StageOutcome,
     WorkflowState,
 )
+from .persistence_codecs import (
+    write_implementation_result,
+    write_stage_message,
+)
 from .resolved_config import config_from_resolved_run_policy
 from .runs import (
     BASELINE_RECORD_FILE,
@@ -68,7 +71,10 @@ from .runs import (
     load_baseline_record,
     load_run_record,
 )
-from .task_result_codecs import encode_implementation_result
+from .verification_evidence import (
+    baseline_verification_evidence_problem,
+    read_verification_source_fingerprint,
+)
 from .workspace_guard import WorkspaceGuardInspection
 
 CORRECTIONS_DIR_NAME = "corrections"
@@ -211,6 +217,12 @@ class CorrectionStageResult:
     correction_causes: tuple[CorrectionCause, ...]
     workspace_guard: WorkspaceGuardInspection | None
     controller_message: str
+    after_workspace_fingerprint: str | None
+    process_started: bool
+
+    @property
+    def source_state(self) -> WorkflowState:
+        return WorkflowState.CORRECTING
 
     @property
     def successful(self) -> bool:
@@ -223,6 +235,57 @@ def run_correction_stage(
     *,
     cause_set: CorrectionCauseSet,
     agent_executor: AgentExecutor,
+    attempt_record: StageAttempt | None = None,
+    clock: Callable[[], datetime] | None = None,
+) -> CorrectionStageResult:
+    run_path = Path(run_dir)
+    if attempt_record is not None:
+        return _run_correction_stage(
+            config,
+            run_path,
+            cause_set=cause_set,
+            agent_executor=agent_executor,
+            attempt_record=attempt_record,
+            clock=clock,
+        )
+    run_record = load_run_record(run_path / RUN_RECORD_FILE)
+    if run_record.state is not WorkflowState.CORRECTING:
+        raise CorrectionError(
+            f"Correction requires run state CORRECTING; found {run_record.state.value}."
+        )
+    owned_attempt = start_attempt(
+        run_path,
+        phase=AttemptPhase.CORRECTING,
+        before_workspace_fingerprint=None,
+        clock=clock,
+    )
+    result = _run_correction_stage(
+        config,
+        run_path,
+        cause_set=cause_set,
+        agent_executor=agent_executor,
+        attempt_record=StageAttempt.from_record(owned_attempt),
+        clock=clock,
+    )
+    complete_stage_attempt(
+        run_path,
+        owned_attempt,
+        stage_outcome=result.outcome,
+        after_workspace_fingerprint=result.after_workspace_fingerprint,
+        process_started=result.process_started,
+        metadata=AttemptMetadata(controller_message=result.controller_message),
+        clock=clock,
+    )
+    return result
+
+
+def _run_correction_stage(
+    config: AppConfig,
+    run_dir: Path | str,
+    *,
+    cause_set: CorrectionCauseSet,
+    agent_executor: AgentExecutor,
+    attempt_record: StageAttempt,
     clock: Callable[[], datetime] | None = None,
 ) -> CorrectionStageResult:
     run_path = Path(run_dir)
@@ -233,6 +296,11 @@ def run_correction_stage(
         raise CorrectionError(
             f"Correction requires run state CORRECTING; found {run_record.state.value}."
         )
+    attempt = require_stage_attempt(
+        run_path,
+        attempt_record,
+        phase=AttemptPhase.CORRECTING,
+    )
 
     baseline_record = load_baseline_record(run_path / BASELINE_RECORD_FILE)
     if baseline_record.branch != run_record.starting_branch:
@@ -242,13 +310,7 @@ def run_correction_stage(
 
     correction_round = run_record.current_correction_round + 1
     repository = GitRepository(Path(run_record.target_repository_path))
-    attempt_record = start_attempt(
-        run_path,
-        phase=AttemptPhase.CORRECTING,
-        before_workspace_fingerprint=None,
-        clock=clock,
-    )
-    artifact_directory = attempt_record.artifact_directory
+    artifact_directory = attempt.artifact_directory
     baseline_identity = WritableBaseline(
         repository_path=repository.path,
         branch=run_record.starting_branch,
@@ -284,7 +346,7 @@ def run_correction_stage(
             invocation_started=False,
         )
 
-    evidence_problem = _baseline_verification_evidence_problem(
+    evidence_problem = baseline_verification_evidence_problem(
         run_path,
         run_record,
         baseline_record,
@@ -439,6 +501,7 @@ def run_correction_stage(
         prompt=prompt,
         result_contract=CORRECTION_RESULT_CONTRACT,
         artifact_directory=artifact_directory,
+        artifact_layout=AttemptArtifactLayout(run_path, artifact_directory),
         policy=AgentExecutionPolicy(
             timeout_seconds=_AGENT_TIMEOUT_SECONDS,
             network_access=NetworkAccess.ALLOWED,
@@ -641,38 +704,9 @@ def render_correction_prompt(
 
 
 def format_correction_result(result: CorrectionStageResult) -> str:
-    rows = [
-        f"Correction state: {result.run_record.state.value}",
-        f"Correction round: {result.correction_round}",
-        f"Artifacts: {result.artifact_directory}",
-        result.controller_message,
-    ]
-    if result.ticket_path is not None:
-        rows.append(f"Correction ticket: {result.ticket_path}")
-    if result.agent_execution is not None and not result.agent_execution.successful:
-        rows.extend(_format_agent_artifacts(result.agent_execution))
-    if result.workspace_guard is not None and result.workspace_guard.requires_human:
-        if result.workspace_guard.artifact_path is not None:
-            rows.append(f"Workspace guard: {result.workspace_guard.artifact_path}")
-        if result.workspace_guard.has_violation:
-            rows.append("Workspace hygiene violations:")
-            rows.extend(
-                "  - "
-                f"{environment.root_path.relative_to(result.workspace_guard.after.repository_path)}: "
-                f"marker {environment.primary_marker_path.relative_to(result.workspace_guard.after.repository_path)}"
-                for environment in result.workspace_guard.new_environments
-            )
-        if result.workspace_guard.has_inspection_failure:
-            rows.append("Workspace environment inspection was incomplete.")
-    if result.agent_result is not None:
-        rows.append(f"Agent status: {result.agent_result.status.value}")
-    if result.safety_violations:
-        rows.append("Safety violations:")
-        rows.extend(
-            f"  - {violation.name}: expected {violation.expected}, got {violation.actual}"
-            for violation in result.safety_violations
-        )
-    return "\n".join(rows)
+    from .presentation.stages import format_correction_result as format_result
+
+    return format_result(result)
 
 
 def _finish(
@@ -699,19 +733,12 @@ def _finish(
         outcome=outcome,
         controller_message=controller_message,
     )
-    finish_phase_attempt(
-        run_dir,
-        phase=AttemptPhase.CORRECTING,
-        stage_outcome=outcome,
-        after_workspace_fingerprint=after_workspace_fingerprint,
-        process_started=(
-            invocation_started
-            if invocation_started is not None
-            else None
-            if execution is None
-            else execution.invocation_started
-        ),
-        execution_path=None,
+    process_started = (
+        invocation_started
+        if invocation_started is not None
+        else False
+        if execution is None
+        else execution.invocation_started
     )
     return CorrectionStageResult(
         run_dir=run_dir,
@@ -727,6 +754,8 @@ def _finish(
         correction_causes=correction_causes,
         workspace_guard=workspace_guard,
         controller_message=controller_message,
+        after_workspace_fingerprint=after_workspace_fingerprint,
+        process_started=process_started,
     )
 
 
@@ -738,16 +767,10 @@ def _write_agent_result(
     controller_message: str,
 ) -> None:
     path = artifact_directory / ATTEMPT_RESULT_ARTIFACT_NAME
-    payload = (
-        encode_implementation_result(result)
-        if result is not None
-        else {"status": outcome.value, "message": controller_message}
-    )
-    path.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
+    if result is not None:
+        write_implementation_result(path, result)
+    else:
+        write_stage_message(path, status=outcome.value, message=controller_message)
 
 
 def _write_correction_ticket(
@@ -757,7 +780,7 @@ def _write_correction_ticket(
     round_number: int,
     markdown: str,
 ) -> Path:
-    path = artifact_directory / "correction-ticket.md"
+    path = artifact_directory / CORRECTION_TICKET_FILE
     if path.exists():
         raise CorrectionError(f"Correction ticket already exists: {path}")
     path.write_text(markdown, encoding="utf-8", newline="\n")
@@ -976,13 +999,13 @@ def _correction_source_fingerprint(
     verification_commands: tuple[VerificationCommand, ...],
 ) -> tuple[str | None, tuple[CorrectionSafetyViolation, ...]]:
     try:
-        expected = _read_verification_source_fingerprint(
+        expected = read_verification_source_fingerprint(
             run_path,
             run_record,
             expected_statuses=frozenset({"FAIL", "PASS"}),
             verification_commands=verification_commands,
         )
-    except _VerificationArtifactError as error:
+    except ValueError as error:
         return (
             None,
             (
@@ -1006,17 +1029,6 @@ def _format_failure_safety(
         f"{violation.name} expected {violation.expected}, got {violation.actual}"
         for violation in violations
     )
-
-
-def _format_agent_artifacts(
-    execution: AgentExecution[ImplementationResult],
-) -> list[str]:
-    if not execution.artifacts:
-        return ["Agent artifacts: none"]
-    return [
-        "Agent artifacts:",
-        *(f"  - {artifact.name}: {artifact.path}" for artifact in execution.artifacts),
-    ]
 
 
 def _worktree_changed_files(

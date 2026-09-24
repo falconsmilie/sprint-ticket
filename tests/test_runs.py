@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import ticket_automation.persistence as persistence_module
 import ticket_automation.runs as runs_module
 from tests.helpers import (
     GIT,
@@ -18,6 +19,7 @@ from tests.helpers import (
 )
 from ticket_automation.config import ConfigError, VerificationCommand
 from ticket_automation.models import StopCategory, StopReason, WorkflowState
+from ticket_automation.persistence import PersistenceError
 from ticket_automation.resolved_config import RESOLVED_RUN_POLICY_SCHEMA_VERSION
 from ticket_automation.runs import (
     BASELINE_RECORD_FORMAT,
@@ -784,9 +786,9 @@ def test_atomic_run_persistence_keeps_previous_record_when_replace_fails(
     def fail_replace(source: Path | str, destination: Path | str) -> None:
         raise OSError(f"cannot replace {source} -> {destination}")
 
-    monkeypatch.setattr(runs_module.os, "replace", fail_replace)
+    monkeypatch.setattr(persistence_module.os, "replace", fail_replace)
 
-    with pytest.raises(OSError):
+    with pytest.raises(PersistenceError):
         save_run_record(changed_record, record_path)
 
     assert load_run_record(record_path) == original_record

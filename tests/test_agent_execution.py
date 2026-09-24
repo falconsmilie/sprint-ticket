@@ -21,6 +21,7 @@ from ticket_automation.application.agent_execution import (
     AgentResultContract,
     AgentTaskKind,
     ArtifactReference,
+    ArtifactRole,
     InvocationStart,
     NetworkAccess,
     ProviderId,
@@ -209,15 +210,15 @@ def test_result_contract_rejects_wrong_domain_type_for_task():
 @pytest.mark.parametrize(
     "changes",
     [
-        {"name": ""},
-        {"path": "events.log"},
+        {"role": "diagnostics"},
+        {"run_relative_path": "../events.log"},
         {"media_type": ""},
     ],
 )
 def test_artifact_reference_rejects_invalid_values(changes: dict[str, object]):
     values: dict[str, object] = {
-        "name": "diagnostics",
-        "path": Path("events.log"),
+        "role": ArtifactRole.PROVIDER_EVENTS,
+        "run_relative_path": "attempts/001-review/events.log",
         "media_type": "text/plain",
     }
     values.update(changes)
@@ -296,12 +297,16 @@ def test_in_memory_executor_writes_every_referenced_artifact(tmp_path: Path):
     execution = executor.execute(request)
 
     assert execution.artifacts
-    assert all(artifact.path.is_file() for artifact in execution.artifacts)
+    assert request.artifact_layout is not None
+    assert all(
+        request.artifact_layout.resolve(artifact, require_exists=True).is_file()
+        for artifact in execution.artifacts
+    )
     assert {artifact.name for artifact in execution.artifacts} == {
-        "request-copy",
-        "in-memory-log",
-        "in-memory-details",
-        "typed-output",
+        "prompt",
+        "provider-events",
+        "provider-execution-details",
+        "typed-result",
     }
 
 
@@ -476,12 +481,18 @@ def test_artifacts_and_provider_metadata_are_generic_and_immutable():
         ended_at=now,
         duration_seconds=0,
         result=_review_result(),
-        artifacts=(ArtifactReference("diagnostics", Path("events.log"), "text/plain"),),
+        artifacts=(
+            ArtifactReference(
+                ArtifactRole.PROVIDER_EVENTS,
+                "attempts/001-review/events.log",
+                "text/plain",
+            ),
+        ),
         provider_metadata={"native": native_metadata, "arguments": ("run",)},
     )
 
     native_metadata["exit_code"] = 1
-    assert execution.artifacts[0].name == "diagnostics"
+    assert execution.artifacts[0].role is ArtifactRole.PROVIDER_EVENTS
     assert execution.provider_metadata["arguments"] == ("run",)
     assert execution.provider_metadata["native"] == {"exit_code": 0}
     with pytest.raises(TypeError):

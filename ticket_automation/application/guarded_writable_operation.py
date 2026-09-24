@@ -5,11 +5,13 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import InitVar, dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Generic, TypeAlias, TypeVar, final
 
 from ..application.agent_execution import (
+    EXECUTION_EVIDENCE_FILE,
+    WORKSPACE_GUARD_FILE,
     AgentCapability,
     AgentExecution,
     AgentExecutionRequest,
@@ -19,12 +21,19 @@ from ..application.agent_execution import (
     InvocationStart,
     RepositoryAccess,
 )
-from ..attempts import AttemptRecord, load_attempt_records, update_attempt
+from ..attempts import (
+    AttemptMetadata,
+    AttemptRecord,
+    load_attempt_records,
+    update_attempt,
+)
 from ..audit import changed_files_including_untracked
 from ..domain.task_results import TaskResult
+from ..execution_evidence import evidence_from_execution, write_execution_evidence
 from ..git import GitRepository
 from ..git_safety import WorkspaceChange, WorkspaceSnapshot, workspace_safety_changes
 from ..models import AttemptPhase, AttemptStatus
+from ..persistence import timestamp_now
 from ..workspace_guard import (
     WorkspaceEnvironmentSnapshot,
     WorkspaceGuardInspection,
@@ -395,7 +404,9 @@ class _AttemptTracker:
         if self.record is None:
             return
         detail = error or "Could not capture a post-call canonical workspace snapshot."
-        self._update(metadata={**self.record.metadata, "after_workspace_error": detail})
+        self._update(
+            metadata=replace(self.record.metadata, after_workspace_error=detail)
+        )
 
     def _update(self, *, propagate_interrupt: bool = False, **changes: object) -> None:
         if self.record is None:
@@ -489,6 +500,13 @@ class GuardedWritableOperation:
                 request.execution_request,
                 on_invocation_start=tracker.mark_started,
             )
+            layout = request.execution_request.artifact_layout
+            assert layout is not None
+            write_execution_evidence(
+                layout,
+                evidence_from_execution(request.execution_request, execution),
+            )
+            tracker._update(execution_path=EXECUTION_EVIDENCE_FILE)
             if execution.invocation_start is not InvocationStart.UNKNOWN:
                 tracker.record_started(
                     execution.invocation_start is InvocationStart.STARTED
@@ -669,9 +687,9 @@ class GuardedWritableOperation:
             capture_error=error,
             point="before",
         )
-        metadata = {} if record is None else record.metadata
+        metadata = AttemptMetadata() if record is None else record.metadata
         if error is not None and record is not None:
-            metadata = {**metadata, "before_workspace_error": error}
+            metadata = replace(metadata, before_workspace_error=error)
         tracker = _AttemptTracker(artifact_directory, record, snapshot, error)
         if association_error is not None:
             tracker.evidence_errors.append(association_error)
@@ -812,7 +830,7 @@ class GuardedWritableOperation:
     ) -> WorkspaceGuardInspection:
         if tracker.record is None:
             return _with_guard_evidence_errors(inspection, tracker.evidence_errors)
-        path = tracker.artifact_directory / "workspace-guard.json"
+        path = tracker.artifact_directory / WORKSPACE_GUARD_FILE
         persisted = replace(inspection, artifact_path=path)
         persisted = _with_guard_evidence_errors(persisted, tracker.evidence_errors)
         try:
@@ -823,9 +841,6 @@ class GuardedWritableOperation:
             )
             return _with_guard_evidence_errors(inspection, tracker.evidence_errors)
         evidence_error_count = len(tracker.evidence_errors)
-        tracker._update(
-            execution_path=path.relative_to(tracker.artifact_directory).as_posix()
-        )
         if len(tracker.evidence_errors) != evidence_error_count:
             persisted = _with_guard_evidence_errors(persisted, tracker.evidence_errors)
             try:
@@ -1188,10 +1203,7 @@ def _format_files(files: tuple[str, ...]) -> str:
 
 
 def _timestamp(clock: Callable[[], datetime] | None) -> str:
-    now = datetime.now(UTC) if clock is None else clock()
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=UTC)
-    return now.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return timestamp_now(clock)
 
 
 def _relative_path(path: Path, root: Path) -> str:

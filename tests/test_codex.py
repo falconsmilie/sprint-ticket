@@ -279,7 +279,7 @@ def test_failure_mapping_is_deterministic(
     assert execution.status is AgentExecutionStatus.FAILED
     assert execution.failure_category is expected
     assert execution.provider_metadata["native_failure_reason"]
-    assert (tmp_path / "artifacts" / "execution.json").is_file()
+    assert (tmp_path / "artifacts" / "codex-execution.json").is_file()
 
 
 def test_unavailable_executable_is_process_not_started(tmp_path: Path) -> None:

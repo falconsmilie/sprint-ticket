@@ -17,8 +17,10 @@ from tests.helpers import (
     make_agent_executors,
     make_config,
     make_final_patch_capture,
+    make_report_publisher,
     make_resume_agent_executor_factory,
     make_run_dependencies,
+    run_test_stage,
 )
 from ticket_automation.application.agent_execution import (
     AgentTaskKind,
@@ -26,6 +28,7 @@ from ticket_automation.application.agent_execution import (
     required_execution_capabilities,
 )
 from ticket_automation.attempts import (
+    AttemptMetadata,
     attempt_result_path,
     latest_writable_attempt,
     load_attempt_records,
@@ -48,8 +51,8 @@ from ticket_automation.models import (
     StopReason,
     WorkflowState,
 )
+from ticket_automation.presentation.reporting import run_report_stage
 from ticket_automation.providers.codex_cli import CodexProcessResult
-from ticket_automation.reporting import run_report_stage
 from ticket_automation.review import run_review_stage
 from ticket_automation.runs import load_run_record, save_run_record
 from ticket_automation.verification import (
@@ -205,7 +208,9 @@ def test_lifecycle_writes_only_numbered_attempt_evidence(tmp_path, monkeypatch):
     assert "workspace_guard" not in execution_metadata
     guard_metadata = json.loads((implementation / "workspace-guard.json").read_text())
     assert guard_metadata["new_environments"] == []
-    assert "workspace_guard" not in attempts[1].metadata
+    assert attempts[1].metadata == AttemptMetadata(
+        controller_message="Implementation completed and Git safety checks passed."
+    )
     verification = attempts[2].artifact_directory
     verification_result = json.loads((verification / "result.json").read_text())
     assert verification_result["commands"][0]["stdout"] == "verification passed\n"
@@ -281,6 +286,7 @@ def test_resume_reruns_safe_verification_as_a_new_attempt(tmp_path, monkeypatch)
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
         final_patch_capture=make_final_patch_capture(),
+        report_publisher=make_report_publisher(),
         verification_runner=PassingVerificationRunner(),
         agent_executor_factory=make_resume_agent_executor_factory(
             make_agent_executors(
@@ -333,6 +339,7 @@ def test_resume_checks_persisted_compatibility_before_constructing_executors(tmp
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
         final_patch_capture=make_final_patch_capture(),
+        report_publisher=make_report_publisher(),
         agent_executor_factory=make_resume_agent_executor_factory(object()),
         clock=fixed_clock,
     )
@@ -366,6 +373,7 @@ def test_terminal_resume_does_not_construct_provider_runtime(tmp_path):
         terminal.run_id,
         runs_dir=tmp_path / "runs",
         final_patch_capture=make_final_patch_capture(),
+        report_publisher=make_report_publisher(),
         agent_executor_factory=make_resume_agent_executor_factory(object()),
         clock=fixed_clock,
     )
@@ -402,6 +410,7 @@ def test_interrupted_writable_state_requires_human_inspection(tmp_path):
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
         final_patch_capture=make_final_patch_capture(),
+        report_publisher=make_report_publisher(),
         agent_executor_factory=make_resume_agent_executor_factory(
             make_agent_executors(config).implementation
         ),
@@ -464,6 +473,7 @@ def test_resume_restarts_preparation_in_a_new_attempt(tmp_path):
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
         final_patch_capture=make_final_patch_capture(),
+        report_publisher=make_report_publisher(),
         verification_runner=PassingVerificationRunner(),
         agent_executor_factory=make_resume_agent_executor_factory(
             make_agent_executors(
@@ -497,7 +507,9 @@ def test_resume_restarts_review_in_a_new_attempt(tmp_path):
         updated_timestamp="2026-09-14T10:16:00Z",
     )
     save_run_record(implementing, snapshot.run_dir / "run.json")
-    implementation = run_implementation_stage(
+    implementation = run_test_stage(
+        run_implementation_stage,
+        AttemptPhase.IMPLEMENTING,
         config,
         snapshot.run_dir,
         agent_executor=make_agent_executor(
@@ -510,7 +522,9 @@ def test_resume_restarts_review_in_a_new_attempt(tmp_path):
         updated_timestamp="2026-09-14T10:17:00Z",
     )
     save_run_record(verifying, snapshot.run_dir / "run.json")
-    verification = run_verification_stage(
+    verification = run_test_stage(
+        run_verification_stage,
+        AttemptPhase.VERIFYING,
         config,
         snapshot.run_dir,
         process_runner=PassingVerificationRunner(),
@@ -532,6 +546,7 @@ def test_resume_restarts_review_in_a_new_attempt(tmp_path):
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
         final_patch_capture=make_final_patch_capture(),
+        report_publisher=make_report_publisher(),
         verification_runner=PassingVerificationRunner(),
         agent_executor_factory=make_resume_agent_executor_factory(
             make_agent_executors(
@@ -565,7 +580,9 @@ def test_resume_retries_a_completed_review_before_its_transition(tmp_path):
         updated_timestamp="2026-09-14T10:16:00Z",
     )
     save_run_record(implementing, snapshot.run_dir / "run.json")
-    implementation = run_implementation_stage(
+    implementation = run_test_stage(
+        run_implementation_stage,
+        AttemptPhase.IMPLEMENTING,
         config,
         snapshot.run_dir,
         agent_executor=make_agent_executor(
@@ -578,7 +595,9 @@ def test_resume_retries_a_completed_review_before_its_transition(tmp_path):
         updated_timestamp="2026-09-14T10:17:00Z",
     )
     save_run_record(verifying, snapshot.run_dir / "run.json")
-    verification = run_verification_stage(
+    verification = run_test_stage(
+        run_verification_stage,
+        AttemptPhase.VERIFYING,
         config,
         snapshot.run_dir,
         process_runner=PassingVerificationRunner(),
@@ -589,7 +608,9 @@ def test_resume_retries_a_completed_review_before_its_transition(tmp_path):
         updated_timestamp="2026-09-14T10:18:00Z",
     )
     save_run_record(reviewing, snapshot.run_dir / "run.json")
-    first_review = run_review_stage(
+    first_review = run_test_stage(
+        run_review_stage,
+        AttemptPhase.REVIEWING,
         config,
         snapshot.run_dir,
         agent_executor=make_agent_executor(
@@ -607,6 +628,7 @@ def test_resume_retries_a_completed_review_before_its_transition(tmp_path):
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
         final_patch_capture=make_final_patch_capture(),
+        report_publisher=make_report_publisher(),
         verification_runner=PassingVerificationRunner(),
         agent_executor_factory=make_resume_agent_executor_factory(
             make_agent_executors(
@@ -641,7 +663,9 @@ def test_resume_restarts_reporting_in_a_new_attempt(tmp_path):
         updated_timestamp="2026-09-14T10:16:00Z",
     )
     save_run_record(implementing, snapshot.run_dir / "run.json")
-    implementation = run_implementation_stage(
+    implementation = run_test_stage(
+        run_implementation_stage,
+        AttemptPhase.IMPLEMENTING,
         config,
         snapshot.run_dir,
         agent_executor=make_agent_executor(
@@ -654,7 +678,9 @@ def test_resume_restarts_reporting_in_a_new_attempt(tmp_path):
         updated_timestamp="2026-09-14T10:17:00Z",
     )
     save_run_record(verifying, snapshot.run_dir / "run.json")
-    verification = run_verification_stage(
+    verification = run_test_stage(
+        run_verification_stage,
+        AttemptPhase.VERIFYING,
         config,
         snapshot.run_dir,
         process_runner=PassingVerificationRunner(),
@@ -665,7 +691,9 @@ def test_resume_restarts_reporting_in_a_new_attempt(tmp_path):
         updated_timestamp="2026-09-14T10:18:00Z",
     )
     save_run_record(reviewing, snapshot.run_dir / "run.json")
-    review = run_review_stage(
+    review = run_test_stage(
+        run_review_stage,
+        AttemptPhase.REVIEWING,
         config,
         snapshot.run_dir,
         agent_executor=make_agent_executor(
@@ -690,6 +718,7 @@ def test_resume_restarts_reporting_in_a_new_attempt(tmp_path):
         snapshot.run_record.run_id,
         runs_dir=tmp_path / "runs",
         final_patch_capture=make_final_patch_capture(),
+        report_publisher=make_report_publisher(),
         verification_runner=PassingVerificationRunner(),
         agent_executor_factory=make_resume_agent_executor_factory(
             make_agent_executors(

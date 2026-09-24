@@ -20,6 +20,7 @@ from ...application.agent_execution import (
     RepositoryAccess,
 )
 from ...domain.task_results import ResultValidationError, TaskResult
+from ...persistence import JsonObject, format_timestamp
 from .command import build_command, sandbox_for
 from .evidence import (
     CodexArtifactPaths,
@@ -105,7 +106,8 @@ class CodexCliAgentExecutor:
         *,
         on_invocation_start: Callable[[], None] | None = None,
     ) -> AgentExecution[ResultT]:
-        paths = CodexArtifactPaths.create(request.artifact_directory)
+        assert request.artifact_layout is not None
+        paths = CodexArtifactPaths.create(request.artifact_layout)
         started = self._clock()
         prepare(paths, request.prompt)
 
@@ -497,7 +499,7 @@ def _metadata(
     }
 
 
-def _execution_record(execution: AgentExecution[TaskResult]) -> dict[str, object]:
+def _execution_record(execution: AgentExecution[TaskResult]) -> JsonObject:
     metadata = execution.provider_metadata
     return {
         "schema_version": 1,
@@ -515,12 +517,8 @@ def _execution_record(execution: AgentExecution[TaskResult]) -> dict[str, object
             else execution.failure_category.value
         ),
         "failure_message": execution.failure_message,
-        "started_at": execution.started_at.astimezone(UTC)
-        .isoformat()
-        .replace("+00:00", "Z"),
-        "ended_at": execution.ended_at.astimezone(UTC)
-        .isoformat()
-        .replace("+00:00", "Z"),
+        "started_at": format_timestamp(execution.started_at),
+        "ended_at": format_timestamp(execution.ended_at),
         "duration_seconds": execution.duration_seconds,
         "sandbox": metadata.get("sandbox"),
         "codex": {
@@ -532,11 +530,11 @@ def _execution_record(execution: AgentExecution[TaskResult]) -> dict[str, object
         "output_schema_path": metadata.get("output_schema_path"),
         "structured_result_present": metadata.get("structured_result_present", False),
         "result_json_present": any(
-            artifact.name == "structured-result" and artifact.path.is_file()
-            for artifact in execution.artifacts
+            artifact.name == "typed-result" for artifact in execution.artifacts
         ),
         "artifact_paths": {
-            artifact.name: str(artifact.path) for artifact in execution.artifacts
+            artifact.name: artifact.run_relative_path
+            for artifact in execution.artifacts
         },
     }
 

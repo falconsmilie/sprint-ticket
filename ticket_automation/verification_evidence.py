@@ -1,13 +1,14 @@
-"""Readers for typed verification results stored in attempt directories."""
+"""Public codecs for typed verification evidence stored by attempts."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .attempts import AttemptError, attempt_result_path, latest_attempt
+from .attempts import AttemptError, AttemptRecord, attempt_result_path, latest_attempt
 from .config import VerificationCommand
 from .models import AttemptPhase, AttemptStatus
 
@@ -23,7 +24,73 @@ class _VerificationArtifactError(ValueError):
     pass
 
 
-def _read_verification_source_fingerprint(
+@dataclass(frozen=True)
+class VerificationEvidence:
+    round_index: int
+    status: str
+    started_at: str
+    ended_at: str
+    duration_seconds: float
+    command_count: int
+
+
+def read_verification_evidence(
+    run_path: Path, record: AttemptRecord
+) -> VerificationEvidence:
+    data = _read_result(run_path, record)
+    _validate_verification_result_shape(data)
+    commands = data["commands"]
+    assert isinstance(commands, list)
+    return VerificationEvidence(
+        round_index=data["round_index"],
+        status=data["status"],
+        started_at=data["started_at"],
+        ended_at=data["ended_at"],
+        duration_seconds=float(data["duration_seconds"]),
+        command_count=len(commands),
+    )
+
+
+def _validate_verification_result_shape(data: dict[str, Any]) -> None:
+    if data.get("schema_version") != VERIFICATION_SCHEMA_VERSION:
+        raise _VerificationArtifactError(
+            "Verification result has an unsupported schema version."
+        )
+    if data.get("format") != VERIFICATION_ROUND_FORMAT:
+        raise _VerificationArtifactError(
+            "Verification result has an unsupported format."
+        )
+    if data.get("status") not in {"PASS", "FAIL", "ERROR"}:
+        raise _VerificationArtifactError(
+            "Verification result has an unsupported status."
+        )
+    if not isinstance(data.get("round_index"), int) or isinstance(
+        data.get("round_index"), bool
+    ):
+        raise _VerificationArtifactError(
+            "Verification result has an invalid round index."
+        )
+    for field in ("started_at", "ended_at"):
+        if not isinstance(data.get(field), str) or not data[field]:
+            raise _VerificationArtifactError(
+                f"Verification result has invalid {field}."
+            )
+    duration = data.get("duration_seconds")
+    if (
+        isinstance(duration, bool)
+        or not isinstance(duration, int | float)
+        or duration < 0
+    ):
+        raise _VerificationArtifactError(
+            "Verification result has invalid duration_seconds."
+        )
+    if not isinstance(data.get("commands"), list):
+        raise _VerificationArtifactError(
+            "Verification result commands must be an array."
+        )
+
+
+def read_verification_source_fingerprint(
     run_path: Path,
     run_record: RunRecord,
     *,
@@ -75,7 +142,7 @@ def _read_verification_source_fingerprint(
         ) from error
 
 
-def _baseline_verification_evidence_problem(
+def baseline_verification_evidence_problem(
     run_path: Path,
     run_record: RunRecord,
     baseline_record: BaselineRecord,
@@ -84,7 +151,7 @@ def _baseline_verification_evidence_problem(
 ) -> str | None:
     if (
         baseline_record.verification_commands_fingerprint
-        != _verification_commands_fingerprint(verification_commands)
+        != verification_commands_fingerprint(verification_commands)
     ):
         return "Configured verification commands no longer match the recorded baseline."
     try:
@@ -122,7 +189,7 @@ def _baseline_verification_evidence_problem(
     return None
 
 
-def _read_result(run_path: Path, record: Any) -> dict[str, Any]:
+def _read_result(run_path: Path, record: AttemptRecord) -> dict[str, Any]:
     path = attempt_result_path(run_path, record)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -280,7 +347,7 @@ def _validate_authoritative_round_evidence(
         )
 
 
-def _verification_commands_fingerprint(
+def verification_commands_fingerprint(
     commands: tuple[VerificationCommand, ...],
 ) -> str:
     payload = [
@@ -298,4 +365,9 @@ def _verification_commands_fingerprint(
 __all__ = [
     "VERIFICATION_ROUND_FORMAT",
     "VERIFICATION_SCHEMA_VERSION",
+    "VerificationEvidence",
+    "baseline_verification_evidence_problem",
+    "read_verification_evidence",
+    "read_verification_source_fingerprint",
+    "verification_commands_fingerprint",
 ]

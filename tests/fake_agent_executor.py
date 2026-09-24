@@ -15,6 +15,7 @@ from ticket_automation.application.agent_execution import (
     AgentFailureCategory,
     AgentTaskKind,
     ArtifactReference,
+    ArtifactRole,
     InvocationStart,
     ProviderId,
 )
@@ -104,25 +105,32 @@ def _artifacts(
 ) -> tuple[ArtifactReference, ...]:
     directory = request.artifact_directory
     paths = {
-        "request-copy": directory / "request.txt",
-        "in-memory-log": directory / "memory.log",
-        "in-memory-details": directory / "memory-execution.json",
-        "typed-output": directory / "memory-result.json",
+        ArtifactRole.PROMPT: directory / "request.txt",
+        ArtifactRole.PROVIDER_EVENTS: directory / "memory.log",
+        ArtifactRole.PROVIDER_EXECUTION_DETAILS: directory / "memory-execution.json",
+        ArtifactRole.TYPED_RESULT: directory / "memory-result.json",
     }
     directory.mkdir(parents=True, exist_ok=True)
-    paths["request-copy"].write_text(request.prompt, encoding="utf-8")
-    paths["in-memory-log"].write_text("", encoding="utf-8")
-    paths["in-memory-details"].write_text("{}\n", encoding="utf-8")
-    names = ["request-copy", "in-memory-log", "in-memory-details"]
+    paths[ArtifactRole.PROMPT].write_text(request.prompt, encoding="utf-8")
+    paths[ArtifactRole.PROVIDER_EVENTS].write_text("", encoding="utf-8")
+    paths[ArtifactRole.PROVIDER_EXECUTION_DETAILS].write_text("{}\n", encoding="utf-8")
+    roles = [
+        ArtifactRole.PROMPT,
+        ArtifactRole.PROVIDER_EVENTS,
+        ArtifactRole.PROVIDER_EXECUTION_DETAILS,
+    ]
     if result is not None:
         encoder = (
             encode_review_result
             if request.task_kind is AgentTaskKind.REVIEW
             else encode_implementation_result
         )
-        paths["typed-output"].write_text(json.dumps(encoder(result)), encoding="utf-8")
-        names.append("typed-output")
-    return tuple(ArtifactReference(name, paths[name]) for name in names)
+        paths[ArtifactRole.TYPED_RESULT].write_text(
+            json.dumps(encoder(result)), encoding="utf-8"
+        )
+        roles.append(ArtifactRole.TYPED_RESULT)
+    assert request.artifact_layout is not None
+    return tuple(request.artifact_layout.reference(role, paths[role]) for role in roles)
 
 
 __all__ = ["InMemoryAgentExecutor"]

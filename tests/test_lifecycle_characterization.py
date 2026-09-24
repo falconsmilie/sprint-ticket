@@ -7,12 +7,14 @@ from pathlib import Path
 import pytest
 
 import ticket_automation.corrections as corrections_module
+import ticket_automation.persistence as persistence_module
 from tests.helpers import (
     GIT,
     create_trusted_prepared_run,
     make_agent_executor,
     make_run_dependencies,
     run_git,
+    run_test_stage,
 )
 from tests.lifecycle_characterization_fixtures import (
     ScriptedVerificationRunner,
@@ -32,6 +34,7 @@ from ticket_automation.application.ports.handoff import (
     FinalPatchReference,
 )
 from ticket_automation.attempts import (
+    StageAttempt,
     latest_writable_attempt,
     load_attempt_records,
     start_attempt,
@@ -42,7 +45,7 @@ from ticket_automation.git_safety import WorkspaceSnapshot
 from ticket_automation.implementation import run_implementation_stage
 from ticket_automation.infrastructure.final_patch import FileSystemFinalPatchCapture
 from ticket_automation.models import AttemptPhase, StopCategory, WorkflowState
-from ticket_automation.reporting import collect_report_context
+from ticket_automation.presentation.reporting import collect_report_context
 from ticket_automation.review import run_review_stage
 from ticket_automation.runs import load_run_record, save_run_record
 from ticket_automation.verification import run_verification_stage
@@ -343,6 +346,33 @@ def test_correction_preparation_failure_persists_pre_and_post_evidence(
     assert (correction.artifact_directory / "workspace-guard.json").is_file()
 
 
+def test_run_entry_point_composes_default_report_publisher(tmp_path, monkeypatch):
+    workspace = build_lifecycle_workspace(tmp_path)
+    codex_runner = configure_fake_codex_actions(
+        monkeypatch,
+        tmp_path,
+        "modify",
+        "review-pass",
+    )
+    dependencies = make_run_dependencies(
+        workspace.config,
+        process_runner=codex_runner,
+    )
+    dependencies.pop("report_publisher")
+
+    result = run_ticket_lifecycle(
+        workspace.config,
+        workspace.ticket,
+        runs_dir=workspace.runs_dir,
+        **dependencies,
+        verification_runner=ScriptedVerificationRunner([0, 0]),
+        clock=TickingClock(),
+    )
+
+    assert result.run_record.state is WorkflowState.READY_FOR_HUMAN
+    assert (result.run_dir / "report.md").is_file()
+
+
 def test_required_review_finding_creates_correction_work(tmp_path, monkeypatch):
     workspace = build_lifecycle_workspace(tmp_path)
     codex_runner = configure_fake_codex_actions(
@@ -396,16 +426,34 @@ def test_required_review_finding_creates_correction_work(tmp_path, monkeypatch):
     )
     assert len(correction_tickets) == 1
 
+    for attempt in attempts:
+        (attempt.artifact_directory / "events.jsonl").unlink(missing_ok=True)
+        (attempt.artifact_directory / "stderr.log").unlink(missing_ok=True)
     context = collect_report_context(result.run_dir, result.run_record)
-    controller = context["controller"]
-    agent = context["agent"]
-    assert isinstance(agent["implementation"], ImplementationResult)
-    assert controller["review_results"]
+    controller = context.controller
+    agent = context.agent
+    assert isinstance(agent.implementation, ImplementationResult)
+    assert controller.review_results
     assert all(
         isinstance(review_result, ReviewResult)
-        for review_result in controller["review_results"]
+        for review_result in controller.review_results
     )
-    assert all("result" not in attempt for attempt in controller["attempts"])
+    agent_attempts = tuple(
+        attempt
+        for attempt in controller.attempts
+        if attempt.phase
+        in {
+            AttemptPhase.IMPLEMENTING,
+            AttemptPhase.REVIEWING,
+            AttemptPhase.CORRECTING,
+        }
+    )
+    assert all(attempt.execution is not None for attempt in agent_attempts)
+    assert {
+        attempt.execution.provider_id.value
+        for attempt in agent_attempts
+        if attempt.execution
+    } == {"codex-cli"}
 
 
 def test_review_finding_outside_correction_scope_remains_human_required(
@@ -555,9 +603,7 @@ def test_final_handoff_rejects_repository_drift(tmp_path, monkeypatch, drift):
     if drift == "branch":
         run_git(workspace.repository, "checkout", "-b", "handoff-drift")
     elif drift == "head":
-        (workspace.repository / "head.txt").write_text(
-            "head drift\n", encoding="utf-8"
-        )
+        (workspace.repository / "head.txt").write_text("head drift\n", encoding="utf-8")
         run_git(workspace.repository, "add", "head.txt")
         run_git(workspace.repository, "commit", "-m", "handoff drift")
     elif drift == "staging":
@@ -692,7 +738,9 @@ def test_final_handoff_rejects_stale_or_missing_evidence(
             attempt.path.unlink()
         else:
             data = json.loads(attempt.path.read_text(encoding="utf-8"))
-            fingerprint = "invalid" if evidence_change == "malformed-review" else "0" * 64
+            fingerprint = (
+                "invalid" if evidence_change == "malformed-review" else "0" * 64
+            )
             data["before_workspace_fingerprint"] = fingerprint
             data["after_workspace_fingerprint"] = fingerprint
             attempt.path.write_text(json.dumps(data), encoding="utf-8")
@@ -706,6 +754,7 @@ def test_final_handoff_rejects_stale_or_missing_evidence(
         runs_dir=workspace.runs_dir,
         agent_executor_factory=dependencies["agent_executor_factory"],
         final_patch_capture=dependencies["final_patch_capture"],
+        report_publisher=dependencies["report_publisher"],
         verification_runner=ScriptedVerificationRunner([]),
         clock=clock,
     )
@@ -730,7 +779,9 @@ def _prepare_reporting_run(workspace, *, codex_runner, clock):
         updated_timestamp=clock().isoformat(),
     )
     save_run_record(implementing, snapshot.run_dir / "run.json")
-    implementation = run_implementation_stage(
+    implementation = run_test_stage(
+        run_implementation_stage,
+        AttemptPhase.IMPLEMENTING,
         workspace.config,
         snapshot.run_dir,
         agent_executor=make_agent_executor(
@@ -744,7 +795,9 @@ def _prepare_reporting_run(workspace, *, codex_runner, clock):
         updated_timestamp=clock().isoformat(),
     )
     save_run_record(verifying, snapshot.run_dir / "run.json")
-    verification = run_verification_stage(
+    verification = run_test_stage(
+        run_verification_stage,
+        AttemptPhase.VERIFYING,
         workspace.config,
         snapshot.run_dir,
         process_runner=ScriptedVerificationRunner([0]),
@@ -755,7 +808,9 @@ def _prepare_reporting_run(workspace, *, codex_runner, clock):
         updated_timestamp=clock().isoformat(),
     )
     save_run_record(reviewing, snapshot.run_dir / "run.json")
-    review = run_review_stage(
+    review = run_test_stage(
+        run_review_stage,
+        AttemptPhase.REVIEWING,
         workspace.config,
         snapshot.run_dir,
         agent_executor=make_agent_executor(
@@ -823,6 +878,55 @@ def test_handoff_service_uses_persisted_attempt_and_does_not_transition_run(
         )
 
 
+def test_handoff_service_rejects_a_reporting_attempt_owned_by_another_run(
+    tmp_path,
+    monkeypatch,
+):
+    workspace = build_lifecycle_workspace(tmp_path)
+    codex_runner = configure_fake_codex_actions(
+        monkeypatch,
+        tmp_path,
+        "modify",
+        "review-pass",
+    )
+    clock = TickingClock()
+    reporting = _prepare_reporting_run(
+        workspace,
+        codex_runner=codex_runner,
+        clock=clock,
+    )
+    fingerprint = WorkspaceSnapshot.capture(
+        GitRepository(workspace.repository)
+    ).fingerprint
+    start_attempt(
+        reporting.run_dir,
+        phase=AttemptPhase.REPORTING,
+        before_workspace_fingerprint=fingerprint,
+        clock=clock,
+    )
+    foreign = start_attempt(
+        tmp_path / "foreign-run",
+        phase=AttemptPhase.REPORTING,
+        before_workspace_fingerprint=fingerprint,
+        clock=clock,
+    )
+
+    result = HandoffAcceptanceService(
+        patch_capture=FileSystemFinalPatchCapture(),
+    ).accept(
+        HandoffAcceptanceRequest(
+            run_dir=reporting.run_dir,
+            run_record=reporting.run_record,
+            attempt=StageAttempt.from_record(foreign),
+        )
+    )
+
+    assert isinstance(result, HandoffRejected)
+    assert result.stop_category is StopCategory.SAFETY_VIOLATION
+    assert "does not belong" in result.reason
+    assert not (reporting.run_dir / "final.patch").exists()
+
+
 @pytest.mark.parametrize("request_problem", ["state", "run-directory"])
 def test_handoff_service_rejects_invalid_request_context(
     tmp_path,
@@ -864,6 +968,7 @@ def test_final_handoff_rejects_patch_capture_failure(tmp_path, monkeypatch):
         "modify",
         "review-pass",
     )
+
     class FailingPatchCapture:
         def capture(self, request: FinalPatchCaptureRequest) -> FinalPatchReference:
             del request
@@ -907,19 +1012,24 @@ def test_reporting_attempt_write_failure_cannot_reclassify_handoff_decision(
         "modify",
         "review-pass",
     )
-    original_write_text = Path.write_text
+    original_replace = persistence_module.os.replace
 
-    def fail_reporting_attempt_write(path, data, *args, **kwargs):
+    def fail_reporting_attempt_write(source, destination):
+        path = Path(destination)
         if path.name == "result.json" and path.parent.name.endswith("-reporting"):
             raise OSError("reporting attempt storage unavailable")
-        return original_write_text(path, data, *args, **kwargs)
+        return original_replace(source, destination)
 
     class FailingPatchCapture:
         def capture(self, request: FinalPatchCaptureRequest) -> FinalPatchReference:
             del request
             raise OSError("patch storage unavailable")
 
-    monkeypatch.setattr(Path, "write_text", fail_reporting_attempt_write)
+    monkeypatch.setattr(
+        persistence_module.os,
+        "replace",
+        fail_reporting_attempt_write,
+    )
     dependencies = make_run_dependencies(
         workspace.config,
         process_runner=codex_runner,
@@ -978,7 +1088,9 @@ def test_final_handoff_rejects_invalid_patch_reference(
                 return None  # type: ignore[return-value]
             reference = FileSystemFinalPatchCapture().capture(request)
             if reference_problem == "wrong-path":
-                return replace(reference, path=request.destination.with_suffix(".other"))
+                return replace(
+                    reference, path=request.destination.with_suffix(".other")
+                )
             if reference_problem == "wrong-digest":
                 return replace(reference, sha256="0" * 64)
             return replace(reference, size_bytes=reference.size_bytes + 1)

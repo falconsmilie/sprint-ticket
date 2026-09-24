@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import json
 import os
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .models import AttemptPhase
+from .persistence import atomic_write_json
 
 WORKSPACE_GUARD_DIR_NAME = "workspace-guard"
 WORKSPACE_GUARD_FORMAT = "ticket_automation.workspace_environment_guard"
@@ -168,7 +167,7 @@ def write_workspace_guard_inspection(
 ) -> None:
     if inspection.artifact_path is None:
         raise ValueError("A workspace-guard artifact path is required for persistence.")
-    _atomic_write_json(inspection.artifact_path, inspection.to_dict())
+    atomic_write_json(inspection.artifact_path, inspection.to_dict())
 
 
 def format_workspace_hygiene_violation(
@@ -355,36 +354,6 @@ def _scandir(path: Path) -> os.ScandirIterator[os.DirEntry[str]]:
 def _is_junction(path: Path) -> bool:
     isjunction = getattr(os.path, "isjunction", None)
     return bool(isjunction is not None and isjunction(path))
-
-
-def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(data, indent=2, sort_keys=True)
-    temp_path: Path | None = None
-    file_descriptor = -1
-    try:
-        file_descriptor, temp_name = tempfile.mkstemp(
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            text=True,
-        )
-        temp_path = Path(temp_name)
-        with os.fdopen(
-            file_descriptor, "w", encoding="utf-8", newline="\n"
-        ) as temp_file:
-            file_descriptor = -1
-            temp_file.write(payload)
-            temp_file.write("\n")
-            temp_file.flush()
-            os.fsync(temp_file.fileno())
-        os.replace(temp_path, path)
-    except Exception:
-        if file_descriptor != -1:
-            os.close(file_descriptor)
-        if temp_path is not None:
-            temp_path.unlink(missing_ok=True)
-        raise
 
 
 __all__ = [
