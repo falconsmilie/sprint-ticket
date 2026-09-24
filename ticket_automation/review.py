@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -16,6 +15,7 @@ from .application.agent_execution import (
     AgentFailureCategory,
     AgentTaskKind,
     AttemptArtifactLayout,
+    InvocationStart,
     NetworkAccess,
     RepositoryAccess,
     required_execution_capabilities,
@@ -33,7 +33,6 @@ from .attempts import (
 from .config import AppConfig, VerificationCommand
 from .domain.task_results import (
     FindingDisposition,
-    ResultValidationError,
     ReviewFinding,
     ReviewResult,
     ReviewResultConsistencyError,
@@ -55,7 +54,7 @@ from .models import (
 )
 from .persistence_codecs import (
     PersistenceCodecError,
-    read_attempt_result_value,
+    read_implementation_result,
     write_review_result,
     write_stage_message,
 )
@@ -69,14 +68,15 @@ from .runs import (
     load_baseline_record,
     load_run_record,
 )
-from .task_result_codecs import (
-    decode_implementation_result,
-    decode_review_result,
+from .task_result_codecs import decode_review_result
+from .verification_evidence import (
+    read_verification_result_text,
+    read_verification_source_fingerprint,
 )
-from .verification_evidence import read_verification_source_fingerprint
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[1]
-_REVIEW_PROMPT_TEMPLATE = _PROJECT_ROOT / "prompts" / "review.md"
+_REVIEW_PROMPT_TEMPLATE = (
+    Path(__file__).resolve().parent / "application" / "prompts" / "review.md"
+)
 _AGENT_TIMEOUT_SECONDS = 60 * 60
 
 
@@ -412,12 +412,6 @@ def _validate_review_result_artifact(value: Any) -> ReviewResult:
     return decode_review_result(value)
 
 
-def format_review_result(result: ReviewStageResult) -> str:
-    from .presentation.stages import format_review_result as format_result
-
-    return format_result(result)
-
-
 def _finish_valid_review_result(
     *,
     run_record: RunRecord,
@@ -491,7 +485,11 @@ def _finish(
         ).fingerprint
     except (OSError, RuntimeError, ValueError):
         pass
-    process_started = False if execution is None else execution.invocation_started
+    process_started = (
+        False
+        if execution is None
+        else execution.invocation_start is InvocationStart.STARTED
+    )
     return ReviewStageResult(
         run_dir=run_dir,
         run_record=run_record,
@@ -573,30 +571,13 @@ def _read_verification_results(run_path: Path, run_record: RunRecord) -> str:
         raise ReviewError("Missing deterministic verification results.")
     verification_path = attempt_result_path(run_path, attempt)
     try:
-        data = read_attempt_result_value(run_path, attempt)
-    except PersistenceCodecError as error:
+        return read_verification_result_text(
+            run_path, attempt, expected_statuses=frozenset({"PASS"})
+        )
+    except ValueError as error:
         raise ReviewError(
             f"Could not read deterministic verification results: {verification_path}: {error}"
         ) from error
-    if data is None:
-        raise ReviewError(
-            f"Missing deterministic verification results: {verification_path}"
-        )
-    _require_passing_verification_round(data, verification_path)
-    return json.dumps(data, indent=2, sort_keys=True)
-
-
-def _require_passing_verification_round(data: Any, path: Path) -> None:
-    if not isinstance(data, dict):
-        raise ReviewError(
-            f"Deterministic verification results must be an object: {path}"
-        )
-    status = data.get("status")
-    if status != "PASS":
-        raise ReviewError(
-            "Deterministic verification results must have PASS status before review: "
-            f"{path} has {status!r}."
-        )
 
 
 def _read_implementation_summary(run_path: Path) -> str:
@@ -608,18 +589,13 @@ def _read_implementation_summary(run_path: Path) -> str:
     if attempt is None:
         return "No implementation summary is available."
     try:
-        data = read_attempt_result_value(run_path, attempt)
+        result = read_implementation_result(run_path, attempt)
     except PersistenceCodecError:
         return (
             "Implementation summary is unavailable because the result artifact "
             "could not be read."
         )
-    if data is None:
-        return "No implementation summary is available."
-
-    try:
-        result = decode_implementation_result(data)
-    except ResultValidationError:
+    if result is None:
         return "No implementation summary is available."
     return result.summary
 
@@ -720,6 +696,5 @@ __all__ = [
     "ReviewSafetyViolation",
     "ReviewStageResult",
     "ReviewVerdict",
-    "format_review_result",
     "run_review_stage",
 ]

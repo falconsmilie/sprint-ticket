@@ -366,12 +366,6 @@ class ArtifactReference:
     def name(self) -> str:
         return self.role.value
 
-    @property
-    def path(self) -> Path:
-        """Return the run-relative path as a Path for compatibility at boundaries."""
-
-        return Path(*PurePosixPath(self.run_relative_path).parts)
-
 
 ProviderMetadataScalar: TypeAlias = str | int | float | bool | None
 ProviderMetadataValue: TypeAlias = (
@@ -444,12 +438,6 @@ class AgentExecution(Generic[ResultT_co]):
     @property
     def successful(self) -> bool:
         return self.status is AgentExecutionStatus.SUCCESS
-
-    @property
-    def invocation_started(self) -> bool | None:
-        if self.invocation_start is InvocationStart.UNKNOWN:
-            return None
-        return self.invocation_start is InvocationStart.STARTED
 
     def _validate_success(self) -> None:
         if self.invocation_start is not InvocationStart.STARTED:

@@ -17,6 +17,7 @@ from typing import Any
 
 from .application.agent_execution import EXECUTION_EVIDENCE_FILE
 from .models import (
+    ATTEMPT_STATUS_BY_STAGE_OUTCOME,
     PHASE_DEFINITIONS,
     AttemptPhase,
     AttemptStatus,
@@ -211,7 +212,7 @@ def start_attempt(
                 before_workspace_fingerprint=before_workspace_fingerprint,
                 after_workspace_fingerprint=None,
                 process_started=False,
-                started_at=_timestamp(clock),
+                started_at=timestamp_now(clock),
                 ended_at=None,
                 result_path=PHASE_DEFINITIONS[phase].result_artifact_name,
                 execution_path=execution_path,
@@ -269,7 +270,7 @@ def update_attempt(
             record.execution_path if execution_path is None else execution_path
         ),
         metadata=record.metadata if metadata is None else metadata,
-        ended_at=_timestamp(clock) if ended else record.ended_at,
+        ended_at=timestamp_now(clock) if ended else record.ended_at,
     )
     save_attempt(updated)
     return updated
@@ -376,12 +377,7 @@ def finish_phase_attempt(
     )
     if record is None:
         return None
-    status = {
-        StageOutcome.COMPLETED: AttemptStatus.COMPLETED,
-        StageOutcome.CORRECTION_REQUIRED: AttemptStatus.COMPLETED,
-        StageOutcome.HUMAN_REQUIRED: AttemptStatus.HUMAN_REQUIRED,
-        StageOutcome.FAILED: AttemptStatus.FAILED,
-    }[stage_outcome]
+    status = ATTEMPT_STATUS_BY_STAGE_OUTCOME[stage_outcome]
     relative_execution_path = None
     if execution_path is not None:
         try:
@@ -430,12 +426,7 @@ def complete_stage_attempt(
         raise AttemptError("Persisted attempt identity changed during stage dispatch.")
     if persisted.status is not AttemptStatus.STARTED:
         raise AttemptError("Lifecycle can only complete its active started attempt.")
-    status = {
-        StageOutcome.COMPLETED: AttemptStatus.COMPLETED,
-        StageOutcome.CORRECTION_REQUIRED: AttemptStatus.COMPLETED,
-        StageOutcome.HUMAN_REQUIRED: AttemptStatus.HUMAN_REQUIRED,
-        StageOutcome.FAILED: AttemptStatus.FAILED,
-    }[stage_outcome]
+    status = ATTEMPT_STATUS_BY_STAGE_OUTCOME[stage_outcome]
     return complete_attempt(
         persisted,
         status=status,
@@ -606,10 +597,6 @@ def _status_filter(statuses: Iterable[AttemptStatus]) -> frozenset[AttemptStatus
     if any(not isinstance(status, AttemptStatus) for status in values):
         raise AttemptError("status filter must contain only AttemptStatus values.")
     return values
-
-
-def _timestamp(clock: Callable[[], datetime] | None) -> str:
-    return timestamp_now(clock)
 
 
 def _required_positive_int(data: dict[str, Any], key: str) -> int:

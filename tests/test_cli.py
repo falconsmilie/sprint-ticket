@@ -147,7 +147,13 @@ def test_cli_provider_composition_failure_does_not_create_a_run(
     ticket = tmp_path / "QDEB-COMPOSE.md"
     ticket.write_text("# Ticket\n", encoding="utf-8")
     fake_codex = write_fake_codex_executable(tmp_path / "fake-bin")
-    write_preflight_config(config_dir, repo, codex=str(fake_codex))
+    write_preflight_config(
+        config_dir,
+        repo,
+        codex=str(fake_codex),
+        model="cli-model",
+        reasoning_effort="high",
+    )
 
     def fail_executor_creation(self, policy):
         del self, policy
@@ -183,7 +189,13 @@ def test_cli_run_invokes_fake_codex_and_runs_verification(tmp_path, monkeypatch)
     fake_codex = write_fake_codex_executable(tmp_path / "fake-bin")
     record_path = tmp_path / "fake-codex-record.json"
     config_dir.mkdir()
-    write_preflight_config(config_dir, repo, codex=str(fake_codex))
+    write_preflight_config(
+        config_dir,
+        repo,
+        codex=str(fake_codex),
+        model="cli-model",
+        reasoning_effort="high",
+    )
     monkeypatch.setenv("TA_FAKE_CODEX_ACTION", "modify")
     monkeypatch.setenv("TA_FAKE_CODEX_RECORD", str(record_path))
 
@@ -192,10 +204,6 @@ def test_cli_run_invokes_fake_codex_and_runs_verification(tmp_path, monkeypatch)
         str(config_dir),
         "run",
         str(ticket),
-        "--model",
-        "cli-model",
-        "--reasoning-effort",
-        "high",
         cwd=config_dir,
     )
 

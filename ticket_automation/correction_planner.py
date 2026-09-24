@@ -14,9 +14,12 @@ from .corrections import (
 )
 from .domain.task_results import ReviewResult, ReviewVerdict
 from .models import AttemptPhase, AttemptStatus
-from .persistence_codecs import PersistenceCodecError, read_attempt_result_value
-from .task_result_codecs import decode_review_result
-from .verification import VerificationError, VerificationFailure
+from .persistence_codecs import (
+    PersistenceCodecError,
+    read_review_result,
+    read_verification_failures,
+)
+from .verification import VerificationFailure
 
 
 def plan_verification_correction(
@@ -56,9 +59,7 @@ def plan_review_correction(result: ReviewResult) -> CorrectionCauseSet:
 
     required_findings = result.required_findings
     eligible_findings = tuple(
-        finding
-        for finding in required_findings
-        if finding.correction_eligible
+        finding for finding in required_findings if finding.correction_eligible
     )
     if len(eligible_findings) != len(required_findings):
         raise CorrectionError(
@@ -107,27 +108,12 @@ def _load_latest_verification_failures(
     )
     if attempt is None:
         return ()
-    data = _read_correction_source_object(run_path, attempt)
-    if data is None:
-        return ()
-    if data.get("status") != "FAIL":
-        return ()
-
-    encoded_failures = data.get("correction_reasons")
-    if not isinstance(encoded_failures, list) or not encoded_failures:
+    try:
+        return read_verification_failures(run_path, attempt)
+    except PersistenceCodecError as error:
         raise CorrectionError(
-            "Failed verification evidence must contain a non-empty "
-            "correction_reasons list."
-        )
-    failures: list[VerificationFailure] = []
-    for index, value in enumerate(encoded_failures, start=1):
-        try:
-            failures.append(VerificationFailure._from_dict(value))
-        except VerificationError as error:
-            raise CorrectionError(
-                f"Verification correction reason {index} is invalid: {error}"
-            ) from error
-    return tuple(failures)
+            f"Verification correction source is invalid: {error}"
+        ) from error
 
 
 def _load_latest_review_result(run_path: Path) -> ReviewResult | None:
@@ -139,26 +125,11 @@ def _load_latest_review_result(run_path: Path) -> ReviewResult | None:
     if attempt is None:
         return None
     try:
-        data = _read_correction_source_object(run_path, attempt)
-        return None if data is None else decode_review_result(data)
-    except ValueError as error:
+        return read_review_result(run_path, attempt)
+    except PersistenceCodecError as error:
         raise CorrectionError(
             f"Review correction source is invalid: {error}"
         ) from error
-
-
-def _read_correction_source_object(run_path: Path, attempt) -> dict | None:
-    try:
-        data = read_attempt_result_value(run_path, attempt)
-    except PersistenceCodecError as error:
-        raise CorrectionError(
-            f"Could not read correction source data: {error}"
-        ) from error
-    if data is None:
-        return None
-    if not isinstance(data, dict):
-        raise CorrectionError("Correction source data must be an object.")
-    return data
 
 
 __all__ = [

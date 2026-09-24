@@ -19,7 +19,7 @@ from .application.lifecycle import (
 from .application.lifecycle.progress import LifecycleProgress
 from .application.lifecycle.resume import resume_preflight_problem, resume_problem
 from .application.ports.handoff import FinalPatchCapture
-from .application.ports.preflight import ProviderPreflight
+from .application.ports.preflight import PreflightResult, ProviderPreflight
 from .application.ports.reporting import ReportPublication, TerminalReportPublisher
 from .attempts import (
     AttemptMetadata,
@@ -39,6 +39,7 @@ from .git_safety import WorkspaceSnapshot
 from .implementation import ImplementationStageResult
 from .locking import RepositoryRunLock, acquire_repository_run_lock
 from .models import (
+    TERMINAL_WORKFLOW_STATES,
     StopCategory,
     StopReason,
     WorkflowState,
@@ -46,8 +47,6 @@ from .models import (
 )
 from .persistence import timestamp_now
 from .persistence_codecs import write_stage_message_result
-from .preflight import PreflightResult
-from .reporting import FilesystemTerminalReportPublisher, format_lifecycle_result
 from .resolved_config import ResolvedRunPolicy, config_from_resolved_run_policy
 from .review import ReviewStageResult
 from .runs import (
@@ -59,14 +58,6 @@ from .runs import (
     save_run_record,
 )
 from .verification import VerificationProcessRunner, VerificationStageResult
-
-TERMINAL_STATES = frozenset(
-    {
-        WorkflowState.READY_FOR_HUMAN,
-        WorkflowState.HUMAN_REQUIRED,
-        WorkflowState.FAILED,
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -156,11 +147,10 @@ def run_ticket_lifecycle(
     resolved_policy: ResolvedRunPolicy,
     agent_executor_factory: PersistedAgentExecutorFactory,
     final_patch_capture: FinalPatchCapture,
-    report_publisher: TerminalReportPublisher | None = None,
+    report_publisher: TerminalReportPublisher,
     verification_runner: VerificationProcessRunner | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> LifecycleResult:
-    publisher = _report_publisher_or_default(report_publisher)
     with acquire_repository_run_lock(
         config.project.repo,
         run_id=None,
@@ -176,7 +166,7 @@ def run_ticket_lifecycle(
             resolved_policy=resolved_policy,
             agent_executor_factory=agent_executor_factory,
             final_patch_capture=final_patch_capture,
-            report_publisher=publisher,
+            report_publisher=report_publisher,
             verification_runner=verification_runner,
             clock=clock,
         )
@@ -234,11 +224,10 @@ def resume_ticket_lifecycle(
     runs_dir: Path | str,
     agent_executor_factory: PersistedAgentExecutorFactory,
     final_patch_capture: FinalPatchCapture,
-    report_publisher: TerminalReportPublisher | None = None,
+    report_publisher: TerminalReportPublisher,
     verification_runner: VerificationProcessRunner | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> LifecycleResult:
-    publisher = _report_publisher_or_default(report_publisher)
     run_dir = Path(runs_dir) / run_id
     if not run_dir.is_dir():
         raise RunError(f"Run directory does not exist: {run_dir}")
@@ -259,7 +248,7 @@ def resume_ticket_lifecycle(
             repository_lock=repository_lock,
             agent_executor_factory=agent_executor_factory,
             final_patch_capture=final_patch_capture,
-            report_publisher=publisher,
+            report_publisher=report_publisher,
             verification_runner=verification_runner,
             clock=clock,
         )
@@ -278,7 +267,7 @@ def _resume_ticket_lifecycle_locked(
     verification_runner: VerificationProcessRunner | None,
     clock: Callable[[], datetime] | None,
 ) -> LifecycleResult:
-    if run_record.state in TERMINAL_STATES:
+    if run_record.state in TERMINAL_WORKFLOW_STATES:
         return _empty_result(run_dir, run_record, preflight_result)
 
     compatibility_problem = agent_executor_factory.compatibility_problem(
@@ -365,7 +354,7 @@ def _drive_lifecycle(
     report_publisher: TerminalReportPublisher,
     clock: Callable[[], datetime] | None,
 ) -> LifecycleResult:
-    while run_record.state not in TERMINAL_STATES:
+    while run_record.state not in TERMINAL_WORKFLOW_STATES:
         _update_repository_lock(repository_lock, run_record)
         attempt = _start_stage_attempt(run_dir, run_record, clock=clock)
         context = StageContext(
@@ -479,7 +468,7 @@ def _apply_stage_decision(
     )
     return run_record.transition_to(
         decision.requested_state,
-        updated_timestamp=_timestamp(clock),
+        updated_timestamp=timestamp_now(clock),
         current_correction_round=decision.current_correction_round,
         current_review_round=decision.current_review_round,
         terminal_reason=None if stop_reason is None else stop_reason.message,
@@ -582,14 +571,6 @@ def _publish_terminal_report(
         return None
 
 
-def _report_publisher_or_default(
-    publisher: TerminalReportPublisher | None,
-) -> TerminalReportPublisher:
-    if publisher is not None:
-        return publisher
-    return FilesystemTerminalReportPublisher()
-
-
 def _mark_controller_exception(
     run_dir: Path,
     *,
@@ -597,7 +578,7 @@ def _mark_controller_exception(
     clock: Callable[[], datetime] | None,
 ) -> RunRecord:
     run_record = load_run_record(run_dir / RUN_RECORD_FILE)
-    if run_record.state in TERMINAL_STATES:
+    if run_record.state in TERMINAL_WORKFLOW_STATES:
         return run_record
     stop = classify_unexpected_controller_failure(
         run_dir,
@@ -617,7 +598,7 @@ def _mark_terminal_stop(
     run_record = load_run_record(record_path)
     updated = run_record.transition_to(
         stop.state,
-        updated_timestamp=_timestamp(clock),
+        updated_timestamp=timestamp_now(clock),
         terminal_reason=stop.reason.message,
         stop_reason=stop.reason,
     )
@@ -657,16 +638,10 @@ def _update_repository_lock(
     )
 
 
-def _timestamp(clock: Callable[[], datetime] | None) -> str:
-    return timestamp_now(clock)
-
-
 __all__ = [
-    "TERMINAL_STATES",
     "LifecycleController",
     "LifecycleResult",
     "LifecycleSafetyViolation",
-    "format_lifecycle_result",
     "resume_ticket_lifecycle",
     "run_ticket_lifecycle",
 ]

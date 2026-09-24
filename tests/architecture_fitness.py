@@ -41,14 +41,13 @@ CONCRETE_PROVIDER_NAMES = frozenset(
         "--sandbox",
     }
 )
-CONCRETE_PROVIDER_MODULES = frozenset({f"{PACKAGE}.codex"})
 FILESYSTEM_MODULES = frozenset(
     {"fnmatch", "glob", "os", "pathlib", "shutil", "tempfile"}
 )
 FLAT_GIT_MODULES = frozenset(
     {f"{PACKAGE}.git", f"{PACKAGE}.git_safety", f"{PACKAGE}.workspace_guard"}
 )
-LIFECYCLE_IMPLEMENTATION_MODULES = frozenset(
+LIFECYCLE_APPLICATION_MODULES = frozenset(
     {
         f"{PACKAGE}.correction_planner",
         f"{PACKAGE}.corrections",
@@ -57,31 +56,6 @@ LIFECYCLE_IMPLEMENTATION_MODULES = frozenset(
         f"{PACKAGE}.review",
         f"{PACKAGE}.verification",
         f"{PACKAGE}.workflow",
-    }
-)
-LEGACY_APPLICATION_MODULES = LIFECYCLE_IMPLEMENTATION_MODULES
-PRESENTATION_COMPATIBILITY_IMPORTS = frozenset(
-    {
-        (
-            f"{PACKAGE}.implementation",
-            f"{PACKAGE}.presentation.stages",
-            "format_implementation_result",
-        ),
-        (
-            f"{PACKAGE}.review",
-            f"{PACKAGE}.presentation.stages",
-            "format_review_result",
-        ),
-        (
-            f"{PACKAGE}.verification",
-            f"{PACKAGE}.presentation.stages",
-            "format_verification_result",
-        ),
-        (
-            f"{PACKAGE}.corrections",
-            f"{PACKAGE}.presentation.stages",
-            "format_correction_result",
-        ),
     }
 )
 
@@ -114,74 +88,7 @@ class Violation:
         return f"{self.importer}:{self.line} -> {target} [{self.rule}] {self.detail}"
 
 
-@dataclass(frozen=True)
-class DebtEntry:
-    rule: str
-    importer: str
-    imported_module: str
-    symbol: str
-    removal_ticket: str
-    rationale: str
-
-    @property
-    def key(self) -> tuple[str, str, str, str]:
-        return (self.rule, self.importer, self.imported_module, self.symbol)
-
-    def describe(self) -> str:
-        return (
-            f"{self.importer} -> {self.imported_module}:{self.symbol} "
-            f"({self.removal_ticket}: {self.rationale})"
-        )
-
-
-def _private_debt(
-    importer: str,
-    imported_module: str,
-    symbol: str,
-    removal_ticket: str,
-    rationale: str,
-) -> DebtEntry:
-    return DebtEntry(
-        rule="cross_module_private_import",
-        importer=importer,
-        imported_module=imported_module,
-        symbol=symbol,
-        removal_ticket=removal_ticket,
-        rationale=rationale,
-    )
-
-
-def _provider_debt(
-    importer: str,
-    symbol: str,
-    rationale: str,
-) -> DebtEntry:
-    return DebtEntry(
-        rule="application_concrete_adapter_import",
-        importer=importer,
-        imported_module=f"{PACKAGE}.codex",
-        symbol=symbol,
-        removal_ticket="TA-AGENT-002",
-        rationale=rationale,
-    )
-
-
-ARCHITECTURE_DEBT = (
-    _private_debt(
-        "ticket_automation.resolved_config",
-        "ticket_automation",
-        "__version__",
-        "TA-CLEAN-001",
-        "Replace the package-private version dependency during legacy surface cleanup.",
-    ),
-    _private_debt(
-        "ticket_automation.runs",
-        "ticket_automation.models",
-        "_validate_workflow_transition",
-        "TA-DOM-003",
-        "Expose transition validation through the domain lifecycle model.",
-    ),
-)
+ARCHITECTURE_DEBT = ()
 
 
 def module_name_for_path(path: Path, package_root: Path) -> str:
@@ -266,12 +173,6 @@ def _edge_violation(edge: ImportEdge, rule: str, detail: str) -> Violation:
     )
 
 
-def _is_presentation_compatibility_import(edge: ImportEdge) -> bool:
-    return (edge.importer, edge.imported_module, edge.symbol) in (
-        PRESENTATION_COMPATIBILITY_IMPORTS
-    )
-
-
 def _import_violations(edge: ImportEdge) -> list[Violation]:
     violations: list[Violation] = []
     layer = _source_layer(edge.importer)
@@ -303,9 +204,7 @@ def _import_violations(edge: ImportEdge) -> list[Violation]:
             "presentation",
             "providers",
         }
-        if any(
-            _targets_layer(edge, candidate) for candidate in outward
-        ) or _targets_any_module(edge, CONCRETE_PROVIDER_MODULES):
+        if any(_targets_layer(edge, candidate) for candidate in outward):
             violations.append(
                 _edge_violation(
                     edge,
@@ -326,10 +225,8 @@ def _import_violations(edge: ImportEdge) -> list[Violation]:
                 )
             )
 
-    if (layer == "application" or edge.importer in LEGACY_APPLICATION_MODULES) and (
-        _targets_layer(edge, "providers")
-        or _targets_layer(edge, "infrastructure")
-        or _targets_any_module(edge, CONCRETE_PROVIDER_MODULES)
+    if (layer == "application" or edge.importer in LIFECYCLE_APPLICATION_MODULES) and (
+        _targets_layer(edge, "providers") or _targets_layer(edge, "infrastructure")
     ):
         violations.append(
             _edge_violation(
@@ -362,7 +259,7 @@ def _import_violations(edge: ImportEdge) -> list[Violation]:
                     f"{layer} may import application ports, not use-case implementations",
                 )
             )
-        if _targets_any_module(edge, LEGACY_APPLICATION_MODULES):
+        if _targets_any_module(edge, LIFECYCLE_APPLICATION_MODULES):
             rule = (
                 "provider_lifecycle_import"
                 if layer == "providers"
@@ -372,16 +269,14 @@ def _import_violations(edge: ImportEdge) -> list[Violation]:
                 _edge_violation(
                     edge,
                     rule,
-                    f"{layer} cannot import legacy application implementations",
+                    f"{layer} cannot import lifecycle application implementations",
                 )
             )
 
     if (
         layer in {"application", "domain", "infrastructure", "providers"}
-        or edge.importer in LEGACY_APPLICATION_MODULES
-    ) and (
-        _targets_layer(edge, "presentation") or _targets_layer(edge, "composition")
-    ) and not _is_presentation_compatibility_import(edge):
+        or edge.importer in LIFECYCLE_APPLICATION_MODULES
+    ) and (_targets_layer(edge, "presentation") or _targets_layer(edge, "composition")):
         violations.append(
             _edge_violation(
                 edge,

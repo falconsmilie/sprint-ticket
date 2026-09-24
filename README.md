@@ -1,8 +1,9 @@
 # SprintTicket
 
 SprintTicket is a synchronous local controller for implementation of one
-ticket at a time. It asks Codex (currently) to implement, verify, review, and, by default,
-make one corrective pass. The target repository remains under human Git
+ticket at a time. It assigns implementation, review, and correction tasks to
+registered agent providers and runs deterministic verification between those
+tasks. The target repository remains under human Git
 control: SprintTicket never stages, commits, switches branches, or cleans
 up target-worktree changes.
 
@@ -40,12 +41,11 @@ required access, structured result, isolation, or evidence capabilities are
 rejected before a run is created. Provider preflight runs once per assigned
 provider and reports all affected task assignments.
 
-The former top-level `[codex]` table is invalid and has no implicit fallback or
-alias; provider settings belong under `[agents.providers.codex-cli]`.
-
 SprintTicket does not install or own pytest, ruff, pyright, or any other
 target-project verification tool. Its own development tools are in the `dev`
 dependency group.
+
+See [architecture boundaries](docs/architecture.md), [provider contract testing](docs/provider-contract-testing.md), and [release notes](docs/release-notes.md).
 
 `runner.max_correction_rounds` defaults to `1`. A versioned resolved run policy
 is persisted in `run.json`. It records all three task assignments, their access
@@ -149,13 +149,7 @@ Attempt records are trusted only when their sequence, phase, status, paths, and
 directory agree. Invalid attempt evidence stops resume for human inspection;
 the controller never follows an artifact path outside its own attempt.
 
-## Breaking policy schema cutover
+## Persistence contract
 
-This release uses resolved-policy schema 2 and run-record schema 5. It rejects
-all earlier resolved-policy and run-record schemas. There is no legacy reader,
-migration, conversion, report fallback, or fallback to the current local
-configuration. Existing run directories are left untouched on disk.
-
-Operators must finish or discard every old active run before installing this
-release. Old run directories may be retained as files, but this release cannot
-list, report, or resume them.
+Runs use resolved-policy schema 2 and run-record schema 5. Records with other
+schema versions are unsupported and remain untouched on disk.

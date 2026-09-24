@@ -146,7 +146,7 @@ class RepositoryRunLock:
             owner_pid=os.getpid(),
             owner_hostname=socket.gethostname(),
             acquired_timestamp=self._acquired_timestamp,
-            updated_timestamp=_timestamp(self._clock),
+            updated_timestamp=timestamp_now(self._clock),
             current_state=self._current_state,
             lock_file=self._lock_file,
             metadata_file=self._metadata_file,
@@ -221,7 +221,7 @@ def acquire_repository_run_lock(
             target_repository_path=target_repository_path,
             run_id=run_id,
             current_state=current_state,
-            acquired_timestamp=_timestamp(clock),
+            acquired_timestamp=timestamp_now(clock),
             clock=clock,
         )
     except Exception:
@@ -385,10 +385,6 @@ def _format_lock_error(
         ]
     )
     return "\n".join(lines)
-
-
-def _timestamp(clock: Callable[[], datetime] | None) -> str:
-    return timestamp_now(clock)
 
 
 __all__ = [

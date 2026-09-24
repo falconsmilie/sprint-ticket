@@ -149,16 +149,6 @@ class CompletingCodexRunner:
         output.write_text(json.dumps(result), encoding="utf-8")
         return CodexProcessResult(returncode=0, stdout="", stderr="")
 
-    def _run_with_start_tracking(
-        self, command, *, stdin, timeout_seconds, on_process_start
-    ):
-        return self.run(
-            command,
-            stdin=stdin,
-            timeout_seconds=timeout_seconds,
-            on_process_start=on_process_start,
-        )
-
 
 def _ticket(tmp_path: Path) -> Path:
     ticket = tmp_path / "TA-ARCH-009.md"

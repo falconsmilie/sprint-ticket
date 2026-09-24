@@ -44,10 +44,10 @@ from ..models import (
 )
 from ..persistence_codecs import (
     PersistenceCodecError,
-    read_attempt_result_value,
+    read_implementation_result,
+    read_review_result,
 )
 from ..runs import RUN_RECORD_FILE, RunError, RunRecord, load_run_record
-from ..task_result_codecs import decode_implementation_result, decode_review_result
 from ..verification_evidence import VerificationEvidence, read_verification_evidence
 
 FINAL_REPORT_FILE = "report.md"
@@ -393,10 +393,10 @@ def _latest_review_result(run_path: Path) -> ReviewResult | None:
     record = _latest_attempt_for_role(run_path, ResultArtifactRole.REVIEW_RESULT)
     if record is None:
         return None
-    value = _task_result_value(run_path, record)
-    if value is None:
-        return None
-    return decode_review_result(value)
+    try:
+        return read_review_result(run_path, record)
+    except PersistenceCodecError as error:
+        raise ResultValidationError(str(error)) from error
 
 
 def _review_results(
@@ -409,11 +409,11 @@ def _review_results(
         if not _has_result_role(record, ResultArtifactRole.REVIEW_RESULT):
             continue
         try:
-            value = _task_result_value(run_path, record)
-            if value is None:
+            result = read_review_result(run_path, record)
+            if result is None:
                 continue
-            results.append(decode_review_result(value))
-        except ResultValidationError as error:
+            results.append(result)
+        except PersistenceCodecError as error:
             errors.append(f"Review attempt {record.sequence}: {error}")
     return tuple(results), tuple(errors)
 
@@ -427,14 +427,8 @@ def _latest_implementation_result(
     if record is None:
         return None, None
     try:
-        value = read_attempt_result_value(run_path, record)
+        return read_implementation_result(run_path, record), None
     except PersistenceCodecError as error:
-        return None, str(error)
-    if value is None:
-        return None, None
-    try:
-        return decode_implementation_result(value), None
-    except ResultValidationError as error:
         return None, str(error)
 
 
@@ -455,13 +449,6 @@ def _verification_view(
         return read_verification_evidence(run_path, record)
     except ValueError:
         return None
-
-
-def _task_result_value(run_path: Path, record: AttemptRecord) -> object | None:
-    try:
-        return read_attempt_result_value(run_path, record)
-    except PersistenceCodecError as error:
-        raise ResultValidationError(str(error)) from error
 
 
 def _latest_attempt_for_role(

@@ -8,7 +8,6 @@ from typing import Any
 from .models import AttemptPhase
 from .persistence import atomic_write_json
 
-WORKSPACE_GUARD_DIR_NAME = "workspace-guard"
 WORKSPACE_GUARD_FORMAT = "ticket_automation.workspace_environment_guard"
 WORKSPACE_GUARD_SCHEMA_VERSION = 1
 
@@ -357,7 +356,6 @@ def _is_junction(path: Path) -> bool:
 
 
 __all__ = [
-    "WORKSPACE_GUARD_DIR_NAME",
     "LocalEnvironment",
     "WorkspaceEnvironmentSnapshot",
     "WorkspaceGuardInspection",

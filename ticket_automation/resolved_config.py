@@ -7,11 +7,11 @@ import json
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
+from importlib.metadata import version as distribution_version
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Protocol
 
-from . import __version__
 from .application.agent_execution import (
     AgentCapability,
     AgentTaskKind,
@@ -29,15 +29,21 @@ from .config import (
 )
 
 RESOLVED_RUN_POLICY_SCHEMA_VERSION = 2
+_APPLICATION_VERSION = distribution_version("ticket-automation")
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_PACKAGE_ROOT = Path(__file__).resolve().parent
 _POLICY_ASSETS = {
-    "prompt.implementation": _PROJECT_ROOT / "prompts" / "implement.md",
-    "prompt.correction": _PROJECT_ROOT / "prompts" / "correct.md",
-    "prompt.review": _PROJECT_ROOT / "prompts" / "review.md",
-    "result-contract.implementation": _PROJECT_ROOT
+    "prompt.implementation": _PACKAGE_ROOT / "application" / "prompts" / "implement.md",
+    "prompt.correction": _PACKAGE_ROOT / "application" / "prompts" / "correct.md",
+    "prompt.review": _PACKAGE_ROOT / "application" / "prompts" / "review.md",
+    "result-contract.implementation": _PACKAGE_ROOT
+    / "domain"
     / "schemas"
     / "implementation-result.schema.json",
-    "result-contract.review": _PROJECT_ROOT / "schemas" / "review-result.schema.json",
+    "result-contract.review": _PACKAGE_ROOT
+    / "domain"
+    / "schemas"
+    / "review-result.schema.json",
 }
 
 
@@ -375,10 +381,10 @@ class ResolvedRunPolicy:
                     "Persisted policy asset is incompatible with this "
                     f"TicketAutomation installation: {name}."
                 )
-        if self.ticket_automation_version != __version__:
+        if self.ticket_automation_version != _APPLICATION_VERSION:
             raise ResolvedRunPolicyError(
                 "Persisted TicketAutomation version is incompatible with this installation: "
-                f"expected {self.ticket_automation_version!r}, got {__version__!r}."
+                f"expected {self.ticket_automation_version!r}, got {_APPLICATION_VERSION!r}."
             )
         if (
             self.ticket_automation_source_kind == "git"
@@ -500,7 +506,7 @@ def resolve_run_policy(
         task_policies=tasks,
         provider_policies=tuple(providers),
         ticket_automation_package="ticket-automation",
-        ticket_automation_version=__version__,
+        ticket_automation_version=_APPLICATION_VERSION,
         ticket_automation_source_kind="git"
         if git_sha is not None
         else "installed-package",

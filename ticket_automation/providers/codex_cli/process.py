@@ -55,6 +55,7 @@ class CodexProcessRunner(Protocol):
         *,
         stdin: str,
         timeout_seconds: float | None,
+        on_process_start: Callable[[], None] | None = None,
     ) -> CodexProcessResult: ...
 
 
@@ -65,16 +66,7 @@ class SubprocessCodexRunner:
         *,
         stdin: str,
         timeout_seconds: float | None,
-    ) -> CodexProcessResult:
-        return _run_without_start_tracking(command, stdin, timeout_seconds)
-
-    def _run_with_start_tracking(
-        self,
-        command: CodexCommand,
-        *,
-        stdin: str,
-        timeout_seconds: float | None,
-        on_process_start: Callable[[], None],
+        on_process_start: Callable[[], None] | None = None,
     ) -> CodexProcessResult:
         process = subprocess.Popen(
             command.argv,
@@ -86,7 +78,8 @@ class SubprocessCodexRunner:
             shell=False,
         )
         try:
-            on_process_start()
+            if on_process_start is not None:
+                on_process_start()
             stdout, stderr = process.communicate(
                 input=stdin.encode("utf-8"), timeout=timeout_seconds
             )
@@ -109,38 +102,6 @@ class SubprocessCodexRunner:
             stdout=decode_human_output(stdout),
             stderr=decode_human_output(stderr),
         )
-
-
-def _run_without_start_tracking(
-    command: CodexCommand,
-    stdin: str,
-    timeout_seconds: float | None,
-) -> CodexProcessResult:
-    try:
-        completed = subprocess.run(
-            command.argv,
-            cwd=command.cwd,
-            env=_process_environment(command.environment),
-            input=stdin.encode("utf-8"),
-            capture_output=True,
-            text=False,
-            check=False,
-            timeout=timeout_seconds,
-            shell=False,
-        )
-    except subprocess.TimeoutExpired as error:
-        raise CodexProcessTimedOut(
-            CodexProcessTimeout(
-                stdout=decode_human_output(error.stdout),
-                stderr=decode_human_output(error.stderr),
-                timeout_seconds=float(timeout_seconds or 0),
-            )
-        ) from error
-    return CodexProcessResult(
-        returncode=completed.returncode,
-        stdout=decode_human_output(completed.stdout),
-        stderr=decode_human_output(completed.stderr),
-    )
 
 
 def with_environment(

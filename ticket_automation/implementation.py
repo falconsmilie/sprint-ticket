@@ -14,6 +14,7 @@ from .application.agent_execution import (
     AgentExecutor,
     AgentTaskKind,
     AttemptArtifactLayout,
+    InvocationStart,
     NetworkAccess,
     RepositoryAccess,
     required_execution_capabilities,
@@ -66,8 +67,9 @@ from .verification_evidence import baseline_verification_evidence_problem
 from .workspace_guard import WorkspaceGuardInspection
 
 _TICKET_PLACEHOLDER = "{{SNAPSHOTTED_TICKET}}"
-_PROJECT_ROOT = Path(__file__).resolve().parents[1]
-_IMPLEMENTATION_PROMPT_TEMPLATE = _PROJECT_ROOT / "prompts" / "implement.md"
+_IMPLEMENTATION_PROMPT_TEMPLATE = (
+    Path(__file__).resolve().parent / "application" / "prompts" / "implement.md"
+)
 _AGENT_TIMEOUT_SECONDS = 60 * 60
 
 
@@ -232,7 +234,7 @@ def _run_implementation_stage(
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=evidence_problem,
             after_workspace_fingerprint=audit.after_workspace_fingerprint,
-            invocation_started=False,
+            process_started=False,
         )
 
     active_record = run_record
@@ -291,7 +293,7 @@ def _run_implementation_stage(
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message=message,
             after_workspace_fingerprint=audit.after_workspace_fingerprint,
-            invocation_started=audit.invocation_started,
+            process_started=audit.invocation_start is InvocationStart.STARTED,
         )
 
     if isinstance(
@@ -329,7 +331,7 @@ def _run_implementation_stage(
             outcome=outcome,
             controller_message=message,
             after_workspace_fingerprint=audit.after_workspace_fingerprint,
-            invocation_started=audit.invocation_started,
+            process_started=audit.invocation_start is InvocationStart.STARTED,
         )
 
     if not isinstance(writable_outcome, WritableSucceeded):
@@ -351,7 +353,7 @@ def _run_implementation_stage(
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message="Implementation agent returned BLOCKED.",
             after_workspace_fingerprint=audit.after_workspace_fingerprint,
-            invocation_started=True,
+            process_started=True,
         )
 
     if not changed_files:
@@ -367,7 +369,7 @@ def _run_implementation_stage(
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message="Implementation completed without repository changes.",
             after_workspace_fingerprint=audit.after_workspace_fingerprint,
-            invocation_started=True,
+            process_started=True,
         )
 
     return _finish(
@@ -382,7 +384,7 @@ def _run_implementation_stage(
         outcome=StageOutcome.COMPLETED,
         controller_message="Implementation completed and Git safety checks passed.",
         after_workspace_fingerprint=audit.after_workspace_fingerprint,
-        invocation_started=True,
+        process_started=True,
     )
 
 
@@ -393,12 +395,6 @@ def _render_implementation_prompt(ticket_text: str) -> str:
             f"Implementation prompt template is missing {_TICKET_PLACEHOLDER}."
         )
     return template.replace(_TICKET_PLACEHOLDER, ticket_text)
-
-
-def format_implementation_result(result: ImplementationStageResult) -> str:
-    from .presentation.stages import format_implementation_result as format_result
-
-    return format_result(result)
 
 
 def _finish(
@@ -414,7 +410,7 @@ def _finish(
     outcome: StageOutcome,
     controller_message: str,
     after_workspace_fingerprint: str | None = None,
-    invocation_started: bool | None = None,
+    process_started: bool | None = None,
 ) -> ImplementationStageResult:
     _write_agent_result(
         artifact_directory,
@@ -423,11 +419,11 @@ def _finish(
         controller_message=controller_message,
     )
     process_started = (
-        invocation_started
-        if invocation_started is not None
+        process_started
+        if process_started is not None
         else False
         if execution is None
-        else execution.invocation_started
+        else execution.invocation_start is InvocationStart.STARTED
     )
     return ImplementationStageResult(
         run_dir=run_dir,
@@ -511,6 +507,5 @@ def _format_failure_safety(
 
 __all__ = [
     "ImplementationError",
-    "format_implementation_result",
     "run_implementation_stage",
 ]

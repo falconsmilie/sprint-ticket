@@ -9,12 +9,16 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-from .application.agent_execution import AgentContractError, AgentTaskKind, ProviderId
+from .application.agent_execution import (
+    AgentContractError,
+    AgentTaskKind,
+    ProviderId,
+    RepositoryAccess,
+)
 
 DEFAULT_MAX_CORRECTION_ROUNDS = 1
-IMPLEMENTATION_SANDBOX_POLICY = "workspace-write"
-REVIEW_SANDBOX_POLICY = "read-only"
 SECRET_FIELD_MARKERS = ("secret", "password", "token", "api_key", "apikey")
+_TOP_LEVEL_SECTIONS = frozenset({"project", "runner", "agents", "verification"})
 
 
 class ConfigError(ValueError):
@@ -54,8 +58,7 @@ class AgentSettings:
         if not isinstance(self.assignments, Mapping):
             raise ConfigError("agents.assignments must be a mapping.")
         if not all(
-            isinstance(task_kind, AgentTaskKind)
-            and isinstance(provider_id, ProviderId)
+            isinstance(task_kind, AgentTaskKind) and isinstance(provider_id, ProviderId)
             for task_kind, provider_id in self.assignments.items()
         ):
             raise ConfigError(
@@ -137,10 +140,12 @@ def parse_config(
     source_files: tuple[Path, ...] = (),
     configuration_directory: Path,
 ) -> AppConfig:
-    if "codex" in raw_config:
+    unknown_sections = sorted(set(raw_config) - _TOP_LEVEL_SECTIONS)
+    if unknown_sections:
         raise ConfigError(
-            "Unsupported [codex] configuration section; configure explicit "
-            "[agents.assignments] and [agents.providers.<provider-id>] sections."
+            "Unknown top-level configuration section(s): "
+            + ", ".join(unknown_sections)
+            + "."
         )
     project = _require_table(raw_config, "project")
     runner = _require_table(raw_config, "runner")
@@ -218,8 +223,11 @@ def format_config_summary(
             *providers,
             "",
             "Execution policy",
-            f"  implementation/correction access: {IMPLEMENTATION_SANDBOX_POLICY}",
-            f"  review access: {REVIEW_SANDBOX_POLICY}",
+            (
+                "  implementation/correction access: "
+                f"{RepositoryAccess.WORKSPACE_WRITE.value}"
+            ),
+            f"  review access: {RepositoryAccess.READ_ONLY.value}",
             "",
             "Verification commands",
             verification,
@@ -255,7 +263,9 @@ def _parse_agent_settings(agents: dict[str, Any]) -> AgentSettings:
         agents, "assignments", "agents.assignments"
     )
     providers_table = _require_nested_table(agents, "providers", "agents.providers")
-    unknown_tasks = sorted(set(assignments_table) - {kind.value for kind in AgentTaskKind})
+    unknown_tasks = sorted(
+        set(assignments_table) - {kind.value for kind in AgentTaskKind}
+    )
     if unknown_tasks:
         raise ConfigError(
             "Unknown agent task assignment(s): " + ", ".join(unknown_tasks) + "."
@@ -269,7 +279,9 @@ def _parse_agent_settings(agents: dict[str, Any]) -> AgentSettings:
     for raw_provider_id, settings in providers_table.items():
         if not isinstance(raw_provider_id, str) or not raw_provider_id.strip():
             raise ConfigError("agents.providers keys must be non-empty provider IDs.")
-        provider_id = _provider_id(raw_provider_id, f"agents.providers.{raw_provider_id}")
+        provider_id = _provider_id(
+            raw_provider_id, f"agents.providers.{raw_provider_id}"
+        )
         if not isinstance(settings, dict):
             raise ConfigError(
                 f"agents.providers.{provider_id} must be a configuration table."
@@ -432,8 +444,6 @@ def _redact_if_secret(key: str, value: str) -> str:
 
 
 __all__ = [
-    "IMPLEMENTATION_SANDBOX_POLICY",
-    "REVIEW_SANDBOX_POLICY",
     "AgentSettings",
     "AppConfig",
     "ConfigError",

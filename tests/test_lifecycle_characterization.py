@@ -346,33 +346,6 @@ def test_correction_preparation_failure_persists_pre_and_post_evidence(
     assert (correction.artifact_directory / "workspace-guard.json").is_file()
 
 
-def test_run_entry_point_composes_default_report_publisher(tmp_path, monkeypatch):
-    workspace = build_lifecycle_workspace(tmp_path)
-    codex_runner = configure_fake_codex_actions(
-        monkeypatch,
-        tmp_path,
-        "modify",
-        "review-pass",
-    )
-    dependencies = make_run_dependencies(
-        workspace.config,
-        process_runner=codex_runner,
-    )
-    dependencies.pop("report_publisher")
-
-    result = run_ticket_lifecycle(
-        workspace.config,
-        workspace.ticket,
-        runs_dir=workspace.runs_dir,
-        **dependencies,
-        verification_runner=ScriptedVerificationRunner([0, 0]),
-        clock=TickingClock(),
-    )
-
-    assert result.run_record.state is WorkflowState.READY_FOR_HUMAN
-    assert (result.run_dir / "report.md").is_file()
-
-
 def test_required_review_finding_creates_correction_work(tmp_path, monkeypatch):
     workspace = build_lifecycle_workspace(tmp_path)
     codex_runner = configure_fake_codex_actions(

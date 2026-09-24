@@ -1,9 +1,9 @@
 # Architecture boundaries
 
-TicketAutomation is moving from its current flat package to explicit layers. New
-code follows these boundaries while later remediation tickets move the existing
-runtime code. TA-FND-001 creates the package roots and guardrails; it does not
-move runtime behavior.
+TicketAutomation uses explicit dependency layers with provider-neutral domain
+and application contracts. Concrete provider code is isolated under
+`providers`, and `composition` is the only package that assembles providers with
+application workflows.
 
 ```mermaid
 flowchart LR
@@ -67,12 +67,6 @@ of a leading-underscore symbol from another module. A private symbol is local to
 the module that defines it; sharing behavior requires a public contract owned by
 the appropriate layer.
 
-The current flat package has a finite set of private-import and concrete-provider
-violations. The fitness check classifies the existing lifecycle and writable
-execution modules as application code while they await their later moves. Each
-exact importer, imported module, and symbol is recorded in `ARCHITECTURE_DEBT`
-with a removal ticket and rationale. Wildcards and package-wide exemptions are
-not supported. A new violation fails the repository check. Removing an existing
-violation also fails until its now-stale allowlist entry is deleted, so the debt
-baseline can only shrink through an explicit change associated with its removal
-ticket. The program is complete when the allowlist is empty.
+The fitness test has no debt allowlist. Any dependency violation, concrete
+provider reference in an inward layer, or cross-module private import fails the
+repository check.

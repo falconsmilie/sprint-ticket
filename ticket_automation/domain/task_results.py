@@ -167,10 +167,7 @@ class ReviewResult:
             raise ReviewResultConsistencyError(
                 "PASS results must not contain REQUIRED findings."
             )
-        if (
-            self.verdict is ReviewVerdict.CORRECTIONS_REQUIRED
-            and required_count == 0
-        ):
+        if self.verdict is ReviewVerdict.CORRECTIONS_REQUIRED and required_count == 0:
             raise ReviewResultConsistencyError(
                 "CORRECTIONS_REQUIRED results must contain at least one REQUIRED "
                 "finding."

@@ -674,6 +674,7 @@ def test_resume_rejects_started_writable_attempt_after_persisted_transition(
         agent_executor_factory=make_resume_agent_executor_factory(
             make_agent_executors(config).implementation
         ),
+        report_publisher=make_report_publisher(),
         clock=fixed_clock,
     )
 

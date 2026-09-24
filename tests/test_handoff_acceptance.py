@@ -321,11 +321,7 @@ def _replace_verification_fingerprint(
     *,
     before: bool,
 ) -> HandoffPolicyRequest:
-    field = (
-        "before_workspace_fingerprint"
-        if before
-        else "after_workspace_fingerprint"
-    )
+    field = "before_workspace_fingerprint" if before else "after_workspace_fingerprint"
     attempt = replace(request.attempts[1], **{field: _OTHER_FINGERPRINT})
     evidence = replace(request.verification, **{field: _OTHER_FINGERPRINT})
     return replace(
@@ -340,11 +336,7 @@ def _replace_review_fingerprint(
     *,
     before: bool,
 ) -> HandoffPolicyRequest:
-    field = (
-        "before_workspace_fingerprint"
-        if before
-        else "after_workspace_fingerprint"
-    )
+    field = "before_workspace_fingerprint" if before else "after_workspace_fingerprint"
     attempt = replace(request.attempts[2], **{field: _OTHER_FINGERPRINT})
     evidence = replace(request.review, **{field: _OTHER_FINGERPRINT})
     return replace(

@@ -99,7 +99,7 @@ def test_provider_transport_vocabulary_fails_in_application_port(source: str):
         ("import subprocess\n", "domain_runtime_boundary_import"),
         ("from pathlib import Path\n", "domain_runtime_boundary_import"),
         ("from ticket_automation import git\n", "domain_runtime_boundary_import"),
-        ("import ticket_automation.codex\n", "domain_outward_import"),
+        ("import ticket_automation.providers.codex_cli\n", "domain_outward_import"),
     ],
 )
 def test_domain_outward_imports_fail(source: str, rule: str):
@@ -121,9 +121,9 @@ def test_fake_provider_import_in_application_fixture_fails(tmp_path: Path):
     }
 
 
-def test_flat_concrete_provider_import_in_application_fails():
+def test_concrete_provider_import_in_application_fails():
     assert "application_concrete_adapter_import" in _rules(
-        "from ticket_automation.codex import CodexProcessRunner\n",
+        "from ticket_automation.providers.codex_cli import CodexProcessRunner\n",
         "ticket_automation.application.use_case",
     )
 
@@ -221,27 +221,6 @@ def test_provider_neutral_string_references_are_allowed(layer: str):
     )
 
 
-def test_repository_matches_the_exact_temporary_debt_allowlist():
-    violations = scan_package(PACKAGE_ROOT)
-    actual = {violation.key: violation for violation in violations}
-    allowed = {entry.key: entry for entry in ARCHITECTURE_DEBT}
-    duplicate_debt_keys = len(allowed) != len(ARCHITECTURE_DEBT)
-    unexpected = [
-        actual[key].describe()
-        for key in sorted(actual.keys() - allowed.keys(), key=repr)
-    ]
-    stale = [
-        allowed[key].describe()
-        for key in sorted(allowed.keys() - actual.keys(), key=repr)
-    ]
-
-    assert not duplicate_debt_keys, "architecture debt entries must be unique"
-    assert not unexpected, "new architecture violations:\n" + "\n".join(unexpected)
-    assert not stale, "remove stale architecture debt entries:\n" + "\n".join(stale)
-    assert all(entry.removal_ticket.startswith("TA-") for entry in ARCHITECTURE_DEBT)
-    assert all(entry.rationale for entry in ARCHITECTURE_DEBT)
-    assert all(
-        "*" not in value
-        for entry in ARCHITECTURE_DEBT
-        for value in (entry.importer, entry.imported_module, entry.symbol)
-    )
+def test_repository_has_no_architecture_debt():
+    assert ARCHITECTURE_DEBT == ()
+    assert scan_package(PACKAGE_ROOT) == ()

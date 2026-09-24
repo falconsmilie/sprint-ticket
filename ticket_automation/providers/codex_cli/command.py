@@ -7,7 +7,7 @@ from pathlib import Path
 
 from ...application.agent_execution import NetworkAccess, RepositoryAccess
 from .process import CodexCommand
-from .settings import CodexSettings
+from .settings import CodexCliSettings
 
 
 class CodexSandbox(StrEnum):
@@ -21,7 +21,7 @@ def build_command(
     repository_path: Path,
     repository_access: RepositoryAccess,
     network_access: NetworkAccess,
-    settings: CodexSettings,
+    settings: CodexCliSettings,
     output_schema: Path,
     output_result: Path,
 ) -> CodexCommand:

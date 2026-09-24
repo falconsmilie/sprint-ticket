@@ -23,6 +23,11 @@ from tests.helpers import (
     make_resume_agent_executor_factory,
     make_run_dependencies,
 )
+from ticket_automation.application.ports.preflight import (
+    PreflightCheck,
+    PreflightResult,
+    PreflightStatus,
+)
 from ticket_automation.config import VerificationCommand
 from ticket_automation.locking import (
     RepositoryLockError,
@@ -30,7 +35,6 @@ from ticket_automation.locking import (
     active_repository_locks,
 )
 from ticket_automation.models import WorkflowState
-from ticket_automation.preflight import PreflightCheck, PreflightResult, PreflightStatus
 from ticket_automation.providers.codex_cli import CodexCommand, CodexProcessResult
 from ticket_automation.runs import RunPreflightError, TicketInputError
 from ticket_automation.verification import (
@@ -132,21 +136,6 @@ class SequencedCodexRunner:
             returncode=0,
             stdout=_event_stream(step.result),
             stderr="fake codex progress\n",
-        )
-
-    def _run_with_start_tracking(
-        self,
-        command: CodexCommand,
-        *,
-        stdin: str,
-        timeout_seconds: float | None,
-        on_process_start,
-    ) -> CodexProcessResult:
-        return self.run(
-            command,
-            stdin=stdin,
-            timeout_seconds=timeout_seconds,
-            on_process_start=on_process_start,
         )
 
 

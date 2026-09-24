@@ -10,7 +10,10 @@ def _agent_artifact_rows(execution: Any) -> list[str]:
         return ["Agent artifacts: none"]
     return [
         "Agent artifacts:",
-        *(f"  - {artifact.name}: {artifact.path}" for artifact in execution.artifacts),
+        *(
+            f"  - {artifact.name}: {artifact.run_relative_path}"
+            for artifact in execution.artifacts
+        ),
     ]
 
 

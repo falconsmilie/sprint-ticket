@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .application.ports.preflight import ProviderPreflight
+from .application.ports.preflight import PreflightResult, ProviderPreflight
 from .config import AppConfig
 from .git import GitCommandError, GitRepository
 from .git_safety import WorkspaceSnapshot, workspace_safety_changes
@@ -17,7 +17,7 @@ from .models import (
     StopCategory,
     StopReason,
     WorkflowState,
-    _validate_workflow_transition,
+    validate_workflow_transition,
 )
 from .persistence import (
     CodecError,
@@ -26,7 +26,7 @@ from .persistence import (
     read_json_object,
     timestamp_now,
 )
-from .preflight import PreflightResult, run_preflight
+from .preflight import run_preflight
 from .resolved_config import (
     ResolvedRunPolicy,
     ResolvedRunPolicyError,
@@ -234,7 +234,7 @@ class RunRecord:
         terminal_reason: str | None = None,
         stop_reason: StopReason | None = None,
     ) -> RunRecord:
-        _validate_workflow_transition(self.state, state)
+        validate_workflow_transition(self.state, state)
         return replace(
             self,
             state=state,
@@ -345,7 +345,7 @@ def create_run_snapshot(
         raise RunPreflightError(preflight_result)
 
     repository = GitRepository(config.project.repo)
-    timestamp = _timestamp(clock)
+    timestamp = timestamp_now(clock)
     baseline_record = _capture_baseline(
         repository,
         snapshot_timestamp=timestamp,
@@ -517,10 +517,6 @@ def _ownership_value(ownership: object, key: str) -> object:
     if isinstance(ownership, Mapping):
         return ownership.get(key)
     return getattr(ownership, key, None)
-
-
-def _timestamp(clock: Callable[[], datetime] | None) -> str:
-    return timestamp_now(clock)
 
 
 def _run_id_prefix(timestamp: str) -> str:

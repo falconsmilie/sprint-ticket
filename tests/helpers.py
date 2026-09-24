@@ -33,7 +33,7 @@ from ticket_automation.providers.codex_cli import (
     DEFAULT_CODEX_MODEL,
     DEFAULT_CODEX_REASONING_EFFORT,
     CodexCliAgentExecutor,
-    CodexSettings,
+    CodexCliSettings,
 )
 from ticket_automation.providers.codex_cli.composition import (
     CodexCliProviderRegistration,
@@ -350,23 +350,13 @@ class _UnexpectedCodexRunner:
         del command, stdin, timeout_seconds, on_process_start
         raise AssertionError("This test did not inject a Codex process result.")
 
-    def _run_with_start_tracking(
-        self, command, *, stdin, timeout_seconds, on_process_start
-    ):
-        return self.run(
-            command,
-            stdin=stdin,
-            timeout_seconds=timeout_seconds,
-            on_process_start=on_process_start,
-        )
-
 
 def make_agent_executor(config: AppConfig, *, process_runner=None):
     """Compose the configured adapter for characterization tests."""
 
     raw = config.agents.providers[PROVIDER_ID]
     return CodexCliAgentExecutor(
-        CodexSettings(
+        CodexCliSettings(
             executable=str(raw["executable"]),
             model=str(raw["model"]),
             reasoning_effort=str(raw["reasoning_effort"]),
@@ -577,6 +567,8 @@ def write_preflight_config(
     repo: Path,
     *,
     codex: str | None = None,
+    model: str = DEFAULT_CODEX_MODEL,
+    reasoning_effort: str = DEFAULT_CODEX_REASONING_EFFORT,
     max_correction_rounds: int = 1,
     verification_commands: tuple[VerificationCommand, ...] | None = None,
 ) -> None:
@@ -604,8 +596,8 @@ def write_preflight_config(
         "",
         "[agents.providers.codex-cli]",
         f"executable = {json.dumps(executable)}",
-        f"model = {json.dumps(DEFAULT_CODEX_MODEL)}",
-        f"reasoning_effort = {json.dumps(DEFAULT_CODEX_REASONING_EFFORT)}",
+        f"model = {json.dumps(model)}",
+        f"reasoning_effort = {json.dumps(reasoning_effort)}",
     ]
     for command in commands:
         lines.extend(

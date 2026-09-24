@@ -14,14 +14,14 @@ from tests.provider_contract import (
     ProviderContractTests,
     TransportObservation,
 )
-from ticket_automation.application.agent_execution import AgentTaskKind
+from ticket_automation.application.agent_execution import AgentCapability, AgentTaskKind
 from ticket_automation.providers.codex_cli import (
     CodexCliAgentExecutor,
+    CodexCliSettings,
     CodexCommand,
     CodexProcessResult,
     CodexProcessTimedOut,
     CodexProcessTimeout,
-    CodexSettings,
 )
 from ticket_automation.providers.codex_cli import composition as codex_composition
 from ticket_automation.providers.codex_cli.composition import (
@@ -95,21 +95,6 @@ class DeterministicCodexTransport:
             )
         return CodexProcessResult(0, "", "")
 
-    def _run_with_start_tracking(
-        self,
-        command: CodexCommand,
-        *,
-        stdin: str,
-        timeout_seconds: float | None,
-        on_process_start,
-    ) -> CodexProcessResult:
-        return self.run(
-            command,
-            stdin=stdin,
-            timeout_seconds=timeout_seconds,
-            on_process_start=on_process_start,
-        )
-
 
 @dataclass
 class ReadOnlyCodexTransport:
@@ -121,10 +106,17 @@ class ReadOnlyCodexTransport:
         *,
         stdin: str,
         timeout_seconds: float | None,
+        on_process_start=None,
     ) -> CodexProcessResult:
-        del command, stdin, timeout_seconds
+        del command, stdin, timeout_seconds, on_process_start
         self.observation.invocation_attempts += 1
         raise AssertionError("capability rejection must precede transport invocation")
+
+
+class CapabilityLimitedCodexExecutor(CodexCliAgentExecutor):
+    @property
+    def capabilities(self) -> frozenset[AgentCapability]:
+        return CAPABILITIES - {AgentCapability.WORKSPACE_WRITE_EXECUTION}
 
 
 class TestCodexProviderContract(ProviderContractTests):
@@ -156,7 +148,7 @@ class TestCodexProviderContract(ProviderContractTests):
         monkeypatch.setattr(codex_composition, "supports_ephemeral", supports_ephemeral)
         monkeypatch.setattr(codex_composition, "cli_version", cli_version)
 
-        settings = CodexSettings(str(executable), "contract-model", "high")
+        settings = CodexCliSettings(str(executable), "contract-model", "high")
 
         def make_probe(
             outcome: ContractOutcome,
@@ -170,7 +162,7 @@ class TestCodexProviderContract(ProviderContractTests):
             )
             configured = settings
             if outcome is ContractOutcome.PROVIDER_UNAVAILABLE:
-                configured = CodexSettings(
+                configured = CodexCliSettings(
                     str(tmp_path / "missing-provider-executable"),
                     settings.model,
                     settings.reasoning_effort,
@@ -186,7 +178,7 @@ class TestCodexProviderContract(ProviderContractTests):
             assert task_kind is AgentTaskKind.IMPLEMENTATION
             observation = TransportObservation()
             return AdapterProbe(
-                executor=CodexCliAgentExecutor(
+                executor=CapabilityLimitedCodexExecutor(
                     settings,
                     runner=ReadOnlyCodexTransport(observation),
                 ),

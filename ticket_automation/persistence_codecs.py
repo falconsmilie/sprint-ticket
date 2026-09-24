@@ -6,9 +6,19 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .attempts import AttemptRecord, attempt_result_path
-from .domain.task_results import ImplementationResult, ReviewResult
+from .domain.task_results import (
+    ImplementationResult,
+    ResultValidationError,
+    ReviewResult,
+)
 from .persistence import CodecError, atomic_write_json, read_json
-from .task_result_codecs import encode_implementation_result, encode_review_result
+from .task_result_codecs import (
+    decode_implementation_result,
+    decode_review_result,
+    encode_implementation_result,
+    encode_review_result,
+)
+from .verification import VerificationError, VerificationFailure
 
 
 class PersistenceCodecError(ValueError):
@@ -27,7 +37,7 @@ class StageMessageResult:
             raise PersistenceCodecError("stage message must be non-empty.")
 
 
-def read_attempt_result_value(
+def _read_attempt_result_value(
     run_dir: Path | str,
     attempt: AttemptRecord,
 ) -> object | None:
@@ -42,6 +52,74 @@ def read_attempt_result_value(
         raise PersistenceCodecError(
             f"Attempt result artifact could not be read as JSON: {path}: {error}"
         ) from error
+
+
+def read_implementation_result(
+    run_dir: Path | str,
+    attempt: AttemptRecord,
+) -> ImplementationResult | None:
+    value = _read_attempt_result_value(run_dir, attempt)
+    if value is None:
+        return None
+    try:
+        return decode_implementation_result(value)
+    except ResultValidationError as error:
+        raise PersistenceCodecError(str(error)) from error
+
+
+def read_review_result(
+    run_dir: Path | str,
+    attempt: AttemptRecord,
+) -> ReviewResult | None:
+    value = _read_attempt_result_value(run_dir, attempt)
+    if value is None:
+        return None
+    try:
+        return decode_review_result(value)
+    except ResultValidationError as error:
+        raise PersistenceCodecError(str(error)) from error
+
+
+def read_stage_message_result(
+    run_dir: Path | str,
+    attempt: AttemptRecord,
+) -> StageMessageResult | None:
+    value = _read_attempt_result_value(run_dir, attempt)
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"status", "message"}:
+        raise PersistenceCodecError("stage message result has unsupported fields.")
+    try:
+        return StageMessageResult(status=value["status"], message=value["message"])
+    except (TypeError, ValueError) as error:
+        raise PersistenceCodecError(str(error)) from error
+
+
+def read_verification_failures(
+    run_dir: Path | str,
+    attempt: AttemptRecord,
+) -> tuple[VerificationFailure, ...]:
+    value = _read_attempt_result_value(run_dir, attempt)
+    if value is None:
+        return ()
+    if not isinstance(value, dict):
+        raise PersistenceCodecError("verification result must be an object.")
+    if value.get("status") != "FAIL":
+        return ()
+    encoded = value.get("correction_reasons")
+    if not isinstance(encoded, list) or not encoded:
+        raise PersistenceCodecError(
+            "failed verification evidence must contain correction reasons."
+        )
+    failures: list[VerificationFailure] = []
+    for index, item in enumerate(encoded, start=1):
+        try:
+            failures.append(VerificationFailure.from_dict(item))
+        except VerificationError as error:
+            raise PersistenceCodecError(
+                f"verification correction reason {index} is invalid: {error}"
+            ) from error
+    return tuple(failures)
 
 
 def write_stage_message_result(
@@ -74,7 +152,10 @@ def write_review_result(path: Path, result: ReviewResult) -> None:
 __all__ = [
     "PersistenceCodecError",
     "StageMessageResult",
-    "read_attempt_result_value",
+    "read_implementation_result",
+    "read_review_result",
+    "read_stage_message_result",
+    "read_verification_failures",
     "write_implementation_result",
     "write_review_result",
     "write_stage_message",

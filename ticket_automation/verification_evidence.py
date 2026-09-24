@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 from .attempts import AttemptError, AttemptRecord, attempt_result_path, latest_attempt
 from .config import VerificationCommand
 from .models import AttemptPhase, AttemptStatus
+from .persistence import CodecError, read_json_object
 
 if TYPE_CHECKING:
     from .runs import BaselineRecord, RunRecord
@@ -49,6 +50,23 @@ def read_verification_evidence(
         duration_seconds=float(data["duration_seconds"]),
         command_count=len(commands),
     )
+
+
+def read_verification_result_text(
+    run_path: Path,
+    record: AttemptRecord,
+    *,
+    expected_statuses: frozenset[str],
+) -> str:
+    """Render validated verification evidence without exposing its JSON object."""
+
+    data = _read_result(run_path, record)
+    _validate_verification_result_shape(data)
+    if data["status"] not in expected_statuses:
+        raise _VerificationArtifactError(
+            "Verification result does not have an allowed status."
+        )
+    return json.dumps(data, indent=2, sort_keys=True)
 
 
 def _validate_verification_result_shape(data: dict[str, Any]) -> None:
@@ -192,13 +210,11 @@ def baseline_verification_evidence_problem(
 def _read_result(run_path: Path, record: AttemptRecord) -> dict[str, Any]:
     path = attempt_result_path(run_path, record)
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        data = read_json_object(path)
+    except CodecError as error:
         raise _VerificationArtifactError(
             f"Could not read verification result: {error}"
         ) from error
-    if not isinstance(data, dict):
-        raise _VerificationArtifactError("Verification result must be an object.")
     return data
 
 
@@ -368,6 +384,7 @@ __all__ = [
     "VerificationEvidence",
     "baseline_verification_evidence_problem",
     "read_verification_evidence",
+    "read_verification_result_text",
     "read_verification_source_fingerprint",
     "verification_commands_fingerprint",
 ]

@@ -249,7 +249,6 @@ def test_capability_mismatch_is_explicit_and_precedes_fake_invocation(
         AgentFailureCategory.CAPABILITY_OR_CONFIGURATION_FAILURE
     )
     assert execution.invocation_start is InvocationStart.NOT_STARTED
-    assert execution.invocation_started is False
     assert executor.requests == []
 
 
@@ -281,7 +280,7 @@ def test_in_memory_executor_demonstrates_each_task_kind(
     assert execution.successful
     assert type(execution.result) is expected_type
     assert execution.task_kind is task_kind
-    assert execution.invocation_started is True
+    assert execution.invocation_start is InvocationStart.STARTED
 
 
 def test_in_memory_executor_writes_every_referenced_artifact(tmp_path: Path):

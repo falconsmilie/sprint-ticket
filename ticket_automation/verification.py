@@ -101,7 +101,6 @@ class VerificationFailure:
             raise VerificationError("verification failure result_path must be a Path.")
 
     def to_dict(self) -> dict[str, Any]:
-        # Keep the established evidence shape for existing runs and reports.
         return {
             "kind": "VerificationFailure",
             "gate_name": self.gate_name,
@@ -114,7 +113,7 @@ class VerificationFailure:
         }
 
     @classmethod
-    def _from_dict(cls, value: object) -> VerificationFailure:
+    def from_dict(cls, value: object) -> VerificationFailure:
         """Reconstruct trusted verification evidence at its owning boundary."""
 
         if not isinstance(value, dict):
@@ -586,8 +585,8 @@ def _run_round(
     ended = _utcnow(clock)
     result = VerificationRound(
         round_index=round_index,
-        started_at=_timestamp(started),
-        ended_at=_timestamp(ended),
+        started_at=format_timestamp(started),
+        ended_at=format_timestamp(ended),
         duration_seconds=(ended - started).total_seconds(),
         status=_round_status(commands_result, violations),
         commands=commands_result,
@@ -599,7 +598,7 @@ def _run_round(
         ),
         result_path=result_path,
     )
-    _write_json(result_path, result.to_dict())
+    atomic_write_json(result_path, result.to_dict())
     return result
 
 
@@ -660,8 +659,8 @@ def _controller_error_round(
     now = _utcnow(clock)
     result = VerificationRound(
         round_index=round_index,
-        started_at=_timestamp(now),
-        ended_at=_timestamp(now),
+        started_at=format_timestamp(now),
+        ended_at=format_timestamp(now),
         duration_seconds=0.0,
         status=VerificationStatus.ERROR,
         commands=(),
@@ -669,7 +668,7 @@ def _controller_error_round(
         failures=(),
         result_path=result_path,
     )
-    _write_json(result_path, result.to_dict())
+    atomic_write_json(result_path, result.to_dict())
     return result
 
 
@@ -729,8 +728,8 @@ def _run_command(
         command.name,
         command.argv,
         cwd,
-        _timestamp(started),
-        _timestamp(ended),
+        format_timestamp(started),
+        format_timestamp(ended),
         (ended - started).total_seconds(),
         VerificationStatus.PASS if process.returncode == 0 else VerificationStatus.FAIL,
         process.returncode,
@@ -755,8 +754,8 @@ def _command_error(
         command.name,
         command.argv,
         cwd,
-        _timestamp(started),
-        _timestamp(ended),
+        format_timestamp(started),
+        format_timestamp(ended),
         (ended - started).total_seconds(),
         VerificationStatus.ERROR,
         None,
@@ -877,10 +876,6 @@ def _excerpt(value: str, limit: int = 4000) -> str:
     return value if len(value) <= limit else value[:limit] + "\n... <truncated>"
 
 
-def _write_json(path: Path, data: dict[str, Any]) -> None:
-    atomic_write_json(path, data)
-
-
 def _process_text(value: bytes | str | None) -> str:
     if value is None:
         return ""
@@ -890,16 +885,6 @@ def _process_text(value: bytes | str | None) -> str:
 def _utcnow(clock: Callable[[], datetime] | None) -> datetime:
     value = datetime.now(UTC) if clock is None else clock()
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
-
-
-def _timestamp(value: datetime) -> str:
-    return format_timestamp(value)
-
-
-def format_verification_result(result: VerificationStageResult) -> str:
-    from .presentation.stages import format_verification_result as format_result
-
-    return format_result(result)
 
 
 __all__ = [
@@ -917,7 +902,6 @@ __all__ = [
     "VerificationSafetyViolation",
     "VerificationStageResult",
     "VerificationStatus",
-    "format_verification_result",
     "run_baseline_verification_stage",
     "run_verification_stage",
 ]

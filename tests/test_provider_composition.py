@@ -10,6 +10,10 @@ from ticket_automation.application.agent_execution import (
     AgentTaskKind,
     ProviderId,
 )
+from ticket_automation.application.ports.preflight import (
+    PreflightCheck,
+    PreflightStatus,
+)
 from ticket_automation.composition import prepare_agent_providers
 from ticket_automation.config import (
     AgentSettings,
@@ -20,7 +24,6 @@ from ticket_automation.config import (
     VerificationCommand,
     VerificationSettings,
 )
-from ticket_automation.preflight import PreflightCheck, PreflightStatus
 
 ALL_CAPABILITIES = frozenset(AgentCapability)
 READ_ONLY_CAPABILITIES = ALL_CAPABILITIES - {AgentCapability.WORKSPACE_WRITE_EXECUTION}

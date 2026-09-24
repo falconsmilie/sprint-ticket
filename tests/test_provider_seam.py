@@ -35,7 +35,10 @@ from ticket_automation.composition.providers import (
 from ticket_automation.composition.root import production_provider_registry
 from ticket_automation.config import AgentSettings, AppConfig, ConfigError
 from ticket_automation.models import AttemptPhase, WorkflowState
-from ticket_automation.providers.codex_cli import CodexCliAgentExecutor, CodexSettings
+from ticket_automation.providers.codex_cli import (
+    CodexCliAgentExecutor,
+    CodexCliSettings,
+)
 from ticket_automation.providers.codex_cli import composition as codex_composition
 from ticket_automation.providers.codex_cli.composition import (
     CodexCliProviderRegistration,
@@ -57,7 +60,7 @@ class InMemoryCodexRegistration(CodexCliProviderRegistration):
         if not isinstance(policy, CodexCliRunPolicy):
             raise TypeError("Codex policy has the wrong type")
         return CodexCliAgentExecutor(
-            CodexSettings(
+            CodexCliSettings(
                 executable=str(policy.executable),
                 model=policy.model,
                 reasoning_effort=policy.reasoning_effort,

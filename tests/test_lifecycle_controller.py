@@ -9,9 +9,7 @@ import pytest
 import ticket_automation.workflow as workflow_module
 from tests.helpers import (
     create_test_run_snapshot,
-    create_trusted_prepared_run,
     make_agent_executors,
-    make_final_patch_capture,
     make_report_publisher,
     make_run_dependencies,
 )
@@ -38,10 +36,7 @@ from ticket_automation.models import (
     WorkflowState,
 )
 from ticket_automation.runs import RUN_RECORD_FILE, load_run_record, save_run_record
-from ticket_automation.workflow import (
-    LifecycleController,
-    resume_ticket_lifecycle,
-)
+from ticket_automation.workflow import LifecycleController
 
 
 @dataclass(frozen=True)
@@ -222,9 +217,7 @@ def test_controller_does_not_persist_transition_before_attempt_completion(
     )
     controller = LifecycleController(
         handlers={
-            WorkflowState.CORRECTING: StubHandler(
-                {WorkflowState.CORRECTING: decision}
-            )
+            WorkflowState.CORRECTING: StubHandler({WorkflowState.CORRECTING: decision})
         },
         progress=LifecycleProgress(),
         repository_lock=RecordingLock(),
@@ -383,38 +376,6 @@ def test_handler_exception_uses_conservative_controller_failure_outcome(tmp_path
 
 
 @dataclass
-class FailingExecutorFactory:
-    def compatibility_problem(self, resolved_policy):
-        del resolved_policy
-
-    def create_executors(self, resolved_policy):
-        del resolved_policy
-        raise RuntimeError("executor construction failed")
-
-
-def test_resume_default_publisher_generates_report_after_executor_failure(tmp_path):
-    workspace = build_lifecycle_workspace(tmp_path)
-    snapshot = create_trusted_prepared_run(
-        workspace.config,
-        workspace.ticket,
-        runs_dir=workspace.runs_dir,
-        clock=TickingClock(),
-    )
-
-    result = resume_ticket_lifecycle(
-        snapshot.run_record.run_id,
-        runs_dir=workspace.runs_dir,
-        agent_executor_factory=FailingExecutorFactory(),
-        final_patch_capture=make_final_patch_capture(),
-        clock=TickingClock(),
-    )
-
-    assert result.run_record.state is WorkflowState.FAILED
-    assert (snapshot.run_dir / "report.md").is_file()
-    assert "executor construction failed" in (result.controller_error or "")
-
-
-@dataclass
 class RaisingPublisher:
     calls: int = 0
 
@@ -490,7 +451,8 @@ def test_lifecycle_handlers_do_not_import_transition_persistence_services():
             for node in ast.walk(tree)
             if isinstance(node, ast.Import)
             for alias in node.names
-            if alias.name in {
+            if alias.name
+            in {
                 "ticket_automation.attempts",
                 "ticket_automation.runs",
             }
@@ -504,17 +466,3 @@ def test_lifecycle_handlers_do_not_import_transition_persistence_services():
             and node.func.value.id in persistence_aliases
         }
         assert qualified_calls.isdisjoint(forbidden), path
-
-
-def test_established_reporting_import_paths_remain_available():
-    from ticket_automation.presentation.lifecycle import (
-        format_lifecycle_result as presentation_formatter,
-    )
-    from ticket_automation.presentation.reporting import (
-        run_report_stage as presentation_report_stage,
-    )
-    from ticket_automation.reporting import run_report_stage
-    from ticket_automation.workflow import format_lifecycle_result
-
-    assert run_report_stage is presentation_report_stage
-    assert format_lifecycle_result is presentation_formatter

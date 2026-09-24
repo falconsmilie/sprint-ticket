@@ -14,18 +14,16 @@ from .identity import CAPABILITIES, PROVIDER_ID
 from .settings import (
     DEFAULT_CODEX_MODEL,
     DEFAULT_CODEX_REASONING_EFFORT,
-    CodexExecutionSettings,
-    CodexSettings,
-    CodexSettingsError,
-    validate_codex_execution_settings,
+    CodexCliSettings,
+    CodexCliSettingsError,
+    validate_codex_cli_settings,
 )
 from .validation import CodexCliValidationError, cli_version, supports_ephemeral
 
 
 @dataclass(frozen=True)
 class CodexCliConfiguredSettings:
-    executable: str
-    execution: CodexExecutionSettings
+    settings: CodexCliSettings
     configuration_directory: Path
 
 
@@ -51,26 +49,20 @@ class CodexCliProviderRegistration:
         allowed = {"executable", "model", "reasoning_effort"}
         unknown = sorted(set(raw_settings) - allowed)
         if unknown:
-            raise CodexSettingsError(
+            raise CodexCliSettingsError(
                 "Unknown setting(s): " + ", ".join(unknown) + "."
             )
-        executable = _non_empty(
-            raw_settings.get("executable"),
-            "agents.providers.codex-cli.executable",
-        )
-        execution = validate_codex_execution_settings(
-            CodexExecutionSettings(
+        settings = validate_codex_cli_settings(
+            CodexCliSettings(
+                executable=raw_settings.get("executable"),  # type: ignore[arg-type]
                 model=raw_settings.get("model", DEFAULT_CODEX_MODEL),  # type: ignore[arg-type]
                 reasoning_effort=raw_settings.get(
                     "reasoning_effort", DEFAULT_CODEX_REASONING_EFFORT
                 ),  # type: ignore[arg-type]
-            ),
-            model_name="agents.providers.codex-cli.model",
-            reasoning_name="agents.providers.codex-cli.reasoning_effort",
+            )
         )
         return CodexCliConfiguredSettings(
-            executable=executable,
-            execution=execution,
+            settings=settings,
             configuration_directory=configuration_directory,
         )
 
@@ -95,12 +87,15 @@ class CodexCliProviderRegistration:
             checks.append(_pass("project configuration"))
 
         executable = resolve_executable(
-            configured.executable,
+            configured.settings.executable,
             config_dir=configured.configuration_directory,
         )
         if executable is None:
             checks.append(
-                _fail("executable", f"Executable not found: {configured.executable}")
+                _fail(
+                    "executable",
+                    f"Executable not found: {configured.settings.executable}",
+                )
             )
             return tuple(checks)
         checks.append(_pass("executable", str(executable)))
@@ -115,28 +110,37 @@ class CodexCliProviderRegistration:
             )
         return tuple(checks)
 
+    def display_settings(self, settings: object) -> Mapping[str, object]:
+        configured = _configured_settings(settings)
+        return {
+            "executable": configured.settings.executable,
+            "model": configured.settings.model,
+            "reasoning_effort": configured.settings.reasoning_effort,
+        }
+
     def resolve_run_policy(self, settings: object) -> CodexCliRunPolicy:
         configured = _configured_settings(settings)
         executable = resolve_executable(
-            configured.executable,
+            configured.settings.executable,
             config_dir=configured.configuration_directory,
         )
         if executable is None:
-            raise CodexSettingsError(
-                f"Configured executable is unavailable: {configured.executable}"
+            raise CodexCliSettingsError(
+                "Configured executable is unavailable: "
+                f"{configured.settings.executable}"
             )
         if not supports_ephemeral(executable, cwd=configured.configuration_directory):
-            raise CodexSettingsError(
+            raise CodexCliSettingsError(
                 "Configured executable does not support required --ephemeral mode."
             )
         try:
             version = cli_version(executable, cwd=configured.configuration_directory)
         except CodexCliValidationError as error:
-            raise CodexSettingsError(str(error)) from error
+            raise CodexCliSettingsError(str(error)) from error
         return CodexCliRunPolicy(
             executable=executable,
-            model=configured.execution.model,
-            reasoning_effort=configured.execution.reasoning_effort,
+            model=configured.settings.model,
+            reasoning_effort=configured.settings.reasoning_effort,
             cli_version=version,
         )
 
@@ -171,7 +175,7 @@ class CodexCliProviderRegistration:
 
     def decode_run_policy(self, payload: object) -> CodexCliRunPolicy:
         if not isinstance(payload, dict):
-            raise CodexSettingsError("Codex CLI resolved payload must be an object.")
+            raise CodexCliSettingsError("Codex CLI resolved payload must be an object.")
         expected = {
             "executable",
             "model",
@@ -180,35 +184,36 @@ class CodexCliProviderRegistration:
             "ephemeral",
         }
         if set(payload) != expected:
-            raise CodexSettingsError(
+            raise CodexCliSettingsError(
                 "Codex CLI resolved payload fields are incomplete or unsupported."
             )
         if payload.get("ephemeral") is not True:
-            raise CodexSettingsError(
+            raise CodexCliSettingsError(
                 "Codex CLI resolved payload requires ephemeral invocation."
             )
         executable = Path(_payload_string(payload, "executable"))
         if not executable.is_absolute():
-            raise CodexSettingsError(
+            raise CodexCliSettingsError(
                 "Codex CLI resolved executable must be an absolute path."
             )
-        execution = validate_codex_execution_settings(
-            CodexExecutionSettings(
+        settings = validate_codex_cli_settings(
+            CodexCliSettings(
+                executable=str(executable),
                 model=_payload_string(payload, "model"),
                 reasoning_effort=_payload_string(payload, "reasoning_effort"),
             )
         )
         return CodexCliRunPolicy(
             executable=executable,
-            model=execution.model,
-            reasoning_effort=execution.reasoning_effort,
+            model=settings.model,
+            reasoning_effort=settings.reasoning_effort,
             cli_version=_payload_string(payload, "cli_version"),
         )
 
     def create_executor(self, policy: object) -> AgentExecutor:
         resolved = _run_policy(policy)
         return CodexCliAgentExecutor(
-            CodexSettings(
+            CodexCliSettings(
                 executable=str(resolved.executable),
                 model=resolved.model,
                 reasoning_effort=resolved.reasoning_effort,
@@ -219,26 +224,22 @@ class CodexCliProviderRegistration:
 
 def _configured_settings(settings: object) -> CodexCliConfiguredSettings:
     if not isinstance(settings, CodexCliConfiguredSettings):
-        raise CodexSettingsError("Codex CLI configured settings have the wrong type.")
+        raise CodexCliSettingsError(
+            "Codex CLI configured settings have the wrong type."
+        )
     return settings
 
 
 def _run_policy(policy: object) -> CodexCliRunPolicy:
     if not isinstance(policy, CodexCliRunPolicy):
-        raise CodexSettingsError("Codex CLI run policy has the wrong type.")
+        raise CodexCliSettingsError("Codex CLI run policy has the wrong type.")
     return policy
-
-
-def _non_empty(value: object, name: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise CodexSettingsError(f"Missing required non-empty string: {name}.")
-    return value.strip()
 
 
 def _payload_string(payload: Mapping[str, object], key: str) -> str:
     value = payload.get(key)
     if not isinstance(value, str) or not value.strip():
-        raise CodexSettingsError(
+        raise CodexCliSettingsError(
             f"Codex CLI resolved payload field must be a non-empty string: {key}."
         )
     return value.strip()

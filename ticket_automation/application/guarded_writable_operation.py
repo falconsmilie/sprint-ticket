@@ -213,12 +213,6 @@ class WritableAudit(Generic[ResultT]):
             return None
         return self.after_workspace.fingerprint
 
-    @property
-    def invocation_started(self) -> bool | None:
-        if self.invocation_start is InvocationStart.UNKNOWN:
-            return None
-        return self.invocation_start is InvocationStart.STARTED
-
 
 @final
 @dataclass(frozen=True)
@@ -786,7 +780,7 @@ class GuardedWritableOperation:
     ) -> WorkspaceGuardInspection:
         return WorkspaceGuardInspection(
             phase=phase,
-            timestamp=_timestamp(self._clock),
+            timestamp=timestamp_now(self._clock),
             artifact_path=None,
             before=before,
             after=after,
@@ -812,7 +806,7 @@ class GuardedWritableOperation:
             tracker.evidence_errors.append(detail)
             inspection = WorkspaceGuardInspection(
                 phase=phase,
-                timestamp=_timestamp(None),
+                timestamp=timestamp_now(),
                 artifact_path=None,
                 before=before,
                 after=replace(
@@ -898,7 +892,7 @@ def format_writable_failure_audit(
             [
                 "Agent artifacts:",
                 *(
-                    f"  - {artifact.name}: {artifact.path}"
+                    f"  - {artifact.name}: {artifact.run_relative_path}"
                     for artifact in audit.execution.artifacts
                 ),
             ]
@@ -1200,10 +1194,6 @@ def _format_files(files: tuple[str, ...]) -> str:
     shown = ", ".join(files[:5])
     hidden_count = len(files) - 5
     return shown if hidden_count <= 0 else f"{shown}, and {hidden_count} more"
-
-
-def _timestamp(clock: Callable[[], datetime] | None) -> str:
-    return timestamp_now(clock)
 
 
 def _relative_path(path: Path, root: Path) -> str:

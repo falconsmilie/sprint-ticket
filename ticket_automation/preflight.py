@@ -203,14 +203,14 @@ def _check_repository_lock(
     conflicts = tuple(
         lock
         for lock in active_repository_locks()
-        if lock.canonical_repository_identity == identity and lock.owner_pid != os.getpid()
+        if lock.canonical_repository_identity == identity
+        and lock.owner_pid != os.getpid()
     )
     if not conflicts:
         checks.append(_pass("Repository lock"))
         return
     assignments = ", ".join(
-        f"{lock.run_id} ({lock.current_state or 'unknown state'})"
-        for lock in conflicts
+        f"{lock.run_id} ({lock.current_state or 'unknown state'})" for lock in conflicts
     )
     checks.append(
         _fail(
@@ -247,9 +247,6 @@ def _format_file_reason(prefix: str, files: tuple[str, ...]) -> str:
 
 
 __all__ = [
-    "PreflightCheck",
-    "PreflightResult",
-    "PreflightStatus",
     "format_preflight_result",
     "run_preflight",
 ]

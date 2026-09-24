@@ -13,10 +13,10 @@ from tests.helpers import (
     run_git,
     write_path_executable,
 )
+from ticket_automation.application.ports.preflight import PreflightStatus
 from ticket_automation.composition import prepare_production_agents
 from ticket_automation.git import GitRepository
 from ticket_automation.locking import canonical_repository_identity
-from ticket_automation.preflight import PreflightStatus
 from ticket_automation.preflight import run_preflight as combine_preflight
 
 
@@ -24,9 +24,7 @@ def configured_preflight(config):
     providers = prepare_production_agents(config)
     return combine_preflight(
         config,
-        provider_result=providers.run_preflight(
-            repository_path=config.project.repo
-        ),
+        provider_result=providers.run_preflight(repository_path=config.project.repo),
     )
 
 
@@ -172,7 +170,10 @@ def test_missing_codex_executable_fails_with_useful_reason(tmp_path):
 
     assert not result.passed
     assert provider_check(result, "executable").status == PreflightStatus.FAIL
-    assert "ticket-automation-missing-codex" in provider_check(result, "executable").message
+    assert (
+        "ticket-automation-missing-codex"
+        in provider_check(result, "executable").message
+    )
 
 
 @pytest.mark.skipif(
@@ -201,5 +202,9 @@ def test_target_codex_project_configuration_is_rejected(tmp_path):
     result = configured_preflight(make_config(repo))
 
     assert not result.passed
-    assert provider_check(result, "project configuration").status == PreflightStatus.FAIL
-    assert ".codex/config.toml" in provider_check(result, "project configuration").message
+    assert (
+        provider_check(result, "project configuration").status == PreflightStatus.FAIL
+    )
+    assert (
+        ".codex/config.toml" in provider_check(result, "project configuration").message
+    )

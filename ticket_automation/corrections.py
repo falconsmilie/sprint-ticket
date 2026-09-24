@@ -16,6 +16,7 @@ from .application.agent_execution import (
     AgentExecutor,
     AgentTaskKind,
     AttemptArtifactLayout,
+    InvocationStart,
     NetworkAccess,
     RepositoryAccess,
     required_execution_capabilities,
@@ -77,12 +78,10 @@ from .verification_evidence import (
 )
 from .workspace_guard import WorkspaceGuardInspection
 
-CORRECTIONS_DIR_NAME = "corrections"
-CORRECTION_EXECUTIONS_DIR_NAME = "correction-executions"
-CORRECTION_TICKET_SUFFIX = "CORR"
 CORRECTION_TICKET_EXCERPT_CHARS = 1200
-_PROJECT_ROOT = Path(__file__).resolve().parents[1]
-_CORRECTION_PROMPT_TEMPLATE = _PROJECT_ROOT / "prompts" / "correct.md"
+_CORRECTION_PROMPT_TEMPLATE = (
+    Path(__file__).resolve().parent / "application" / "prompts" / "correct.md"
+)
 _AGENT_TIMEOUT_SECONDS = 60 * 60
 
 
@@ -343,7 +342,7 @@ def _run_correction_stage(
             controller_message=message,
             advance_correction_round=False,
             after_workspace_fingerprint=audit.after_workspace_fingerprint,
-            invocation_started=False,
+            process_started=False,
         )
 
     evidence_problem = baseline_verification_evidence_problem(
@@ -385,7 +384,7 @@ def _run_correction_stage(
             controller_message=evidence_problem,
             advance_correction_round=False,
             after_workspace_fingerprint=audit.after_workspace_fingerprint,
-            invocation_started=False,
+            process_started=False,
         )
 
     expected_source_fingerprint, starting_violations = _correction_source_fingerprint(
@@ -431,7 +430,7 @@ def _run_correction_stage(
             ),
             advance_correction_round=False,
             after_workspace_fingerprint=audit.after_workspace_fingerprint,
-            invocation_started=False,
+            process_started=False,
         )
 
     selected_causes = cause_set.causes
@@ -492,7 +491,7 @@ def _run_correction_stage(
             controller_message=message,
             advance_correction_round=False,
             after_workspace_fingerprint=audit.after_workspace_fingerprint,
-            invocation_started=False,
+            process_started=False,
         )
     request = AgentExecutionRequest(
         task_kind=AgentTaskKind.CORRECTION,
@@ -557,7 +556,7 @@ def _run_correction_stage(
             controller_message=message,
             advance_correction_round=False,
             after_workspace_fingerprint=audit.after_workspace_fingerprint,
-            invocation_started=audit.invocation_started,
+            process_started=audit.invocation_start is InvocationStart.STARTED,
         )
 
     if isinstance(
@@ -598,7 +597,7 @@ def _run_correction_stage(
             controller_message=message,
             advance_correction_round=False,
             after_workspace_fingerprint=audit.after_workspace_fingerprint,
-            invocation_started=audit.invocation_started,
+            process_started=audit.invocation_start is InvocationStart.STARTED,
         )
 
     if not isinstance(writable_outcome, WritableSucceeded):
@@ -622,7 +621,7 @@ def _run_correction_stage(
             outcome=StageOutcome.HUMAN_REQUIRED,
             controller_message="Correction agent returned BLOCKED.",
             after_workspace_fingerprint=audit.after_workspace_fingerprint,
-            invocation_started=True,
+            process_started=True,
         )
 
     return _finish(
@@ -641,7 +640,7 @@ def _run_correction_stage(
             "Correction completed; deterministic verification must run next."
         ),
         after_workspace_fingerprint=audit.after_workspace_fingerprint,
-        invocation_started=True,
+        process_started=True,
     )
 
 
@@ -703,12 +702,6 @@ def render_correction_prompt(
     return template
 
 
-def format_correction_result(result: CorrectionStageResult) -> str:
-    from .presentation.stages import format_correction_result as format_result
-
-    return format_result(result)
-
-
 def _finish(
     *,
     run_record: RunRecord,
@@ -725,7 +718,7 @@ def _finish(
     controller_message: str,
     advance_correction_round: bool = True,
     after_workspace_fingerprint: str | None = None,
-    invocation_started: bool | None = None,
+    process_started: bool | None = None,
 ) -> CorrectionStageResult:
     _write_agent_result(
         artifact_directory,
@@ -734,11 +727,11 @@ def _finish(
         controller_message=controller_message,
     )
     process_started = (
-        invocation_started
-        if invocation_started is not None
+        process_started
+        if process_started is not None
         else False
         if execution is None
-        else execution.invocation_started
+        else execution.invocation_start is InvocationStart.STARTED
     )
     return CorrectionStageResult(
         run_dir=run_dir,
@@ -1097,8 +1090,6 @@ def _format_optional(value: str | None) -> str:
 
 
 __all__ = [
-    "CORRECTIONS_DIR_NAME",
-    "CORRECTION_EXECUTIONS_DIR_NAME",
     "CorrectionCause",
     "CorrectionCauseSet",
     "CorrectionError",
@@ -1107,7 +1098,6 @@ __all__ = [
     "ReviewCorrectionCause",
     "ReviewCorrectionScope",
     "VerificationCorrectionCause",
-    "format_correction_result",
     "render_correction_prompt",
     "render_correction_ticket",
     "run_correction_stage",

@@ -5,7 +5,6 @@ import sys
 from pathlib import Path
 
 from .composition import (
-    apply_codex_execution_overrides,
     prepare_production_agents,
     production_agent_executor_factory,
     production_final_patch_capture,
@@ -19,9 +18,6 @@ from .locking import RepositoryLockError, active_repository_locks
 from .preflight import format_preflight_result, run_preflight
 from .presentation.lifecycle import format_lifecycle_result
 from .presentation.reporting import FilesystemTerminalReportPublisher
-from .providers.codex_cli import CodexExecutionOverrides
-from .providers.codex_cli.composition import CodexCliConfiguredSettings
-from .providers.codex_cli.identity import PROVIDER_ID as CODEX_CLI_PROVIDER_ID
 from .runs import (
     RUNS_DIR_NAME,
     RunError,
@@ -72,14 +68,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Local Markdown ticket file to copy into the run directory.",
     )
-    run_parser.add_argument(
-        "--model",
-        help="Codex model to use for this run.",
-    )
-    run_parser.add_argument(
-        "--reasoning-effort",
-        help="Codex reasoning effort to use for this run.",
-    )
     run_parser.set_defaults(handler=_handle_run)
 
     status_parser = subparsers.add_parser(
@@ -113,20 +101,7 @@ def main(argv: list[str] | None = None) -> int:
 def _handle_config(args: argparse.Namespace) -> int:
     config = load_config(args.config_dir)
     providers = prepare_production_agents(config)
-    effective_settings = {
-        provider_id: settings
-        for provider_id, settings in config.agents.providers.items()
-    }
-    codex = providers.providers.get(CODEX_CLI_PROVIDER_ID)
-    if codex is not None:
-        if not isinstance(codex.settings, CodexCliConfiguredSettings):
-            raise ConfigError("Codex CLI resolved settings have the wrong type.")
-        effective_settings[CODEX_CLI_PROVIDER_ID] = {
-            "executable": codex.settings.executable,
-            "model": codex.settings.execution.model,
-            "reasoning_effort": codex.settings.execution.reasoning_effort,
-        }
-    print(format_config_summary(config, provider_settings=effective_settings))
+    print(format_config_summary(config, provider_settings=providers.display_settings()))
     return 0
 
 
@@ -142,13 +117,7 @@ def _handle_preflight(args: argparse.Namespace) -> int:
 
 
 def _handle_run(args: argparse.Namespace) -> int:
-    config = apply_codex_execution_overrides(
-        load_config(args.config_dir),
-        CodexExecutionOverrides(
-            model=args.model,
-            reasoning_effort=args.reasoning_effort,
-        ),
-    )
+    config = load_config(args.config_dir)
     providers = prepare_production_agents(config)
     resolved_policy = providers.resolve_run_policy(
         config,

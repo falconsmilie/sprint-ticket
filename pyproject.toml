@@ -20,3 +20,6 @@ dev = [
 
 [project.scripts]
 ticket-automation = "ticket_automation.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ticket_automation"]

@@ -164,6 +164,25 @@ PHASE_DEFINITIONS: Final[Mapping[AttemptPhase, PhaseDefinition]] = MappingProxyT
     }
 )
 
+TERMINAL_WORKFLOW_STATES: Final[frozenset[WorkflowState]] = frozenset(
+    {
+        WorkflowState.READY_FOR_HUMAN,
+        WorkflowState.HUMAN_REQUIRED,
+        WorkflowState.FAILED,
+    }
+)
+
+ATTEMPT_STATUS_BY_STAGE_OUTCOME: Final[Mapping[StageOutcome, AttemptStatus]] = (
+    MappingProxyType(
+        {
+            StageOutcome.COMPLETED: AttemptStatus.COMPLETED,
+            StageOutcome.CORRECTION_REQUIRED: AttemptStatus.COMPLETED,
+            StageOutcome.HUMAN_REQUIRED: AttemptStatus.HUMAN_REQUIRED,
+            StageOutcome.FAILED: AttemptStatus.FAILED,
+        }
+    )
+)
+
 
 def phase_for_active_state(state: WorkflowState) -> AttemptPhase | None:
     for phase, definition in PHASE_DEFINITIONS.items():
@@ -224,7 +243,7 @@ _LEGAL_WORKFLOW_TRANSITIONS: Final[Mapping[WorkflowState, frozenset[WorkflowStat
 )
 
 
-def _validate_workflow_transition(
+def validate_workflow_transition(
     current: WorkflowState,
     requested: WorkflowState,
 ) -> None:

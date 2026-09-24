@@ -142,16 +142,6 @@ class ScriptedCodexRunner:
         output_path.write_text(json.dumps(result), encoding="utf-8")
         return CodexProcessResult(0, "", "")
 
-    def _run_with_start_tracking(
-        self, command, *, stdin, timeout_seconds, on_process_start
-    ):
-        return self.run(
-            command,
-            stdin=stdin,
-            timeout_seconds=timeout_seconds,
-            on_process_start=on_process_start,
-        )
-
 
 def _scripted_implementation_result(action: str) -> dict[str, object]:
     status = "BLOCKED" if action == "blocked" else "COMPLETED"

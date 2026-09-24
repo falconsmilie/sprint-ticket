@@ -6,15 +6,11 @@ import pytest
 
 from tests.helpers import copy_example_config
 from ticket_automation.application.agent_execution import AgentTaskKind, ProviderId
-from ticket_automation.composition import (
-    apply_codex_execution_overrides,
-    prepare_production_agents,
-)
+from ticket_automation.composition import prepare_production_agents
 from ticket_automation.config import ConfigError, load_config, parse_config
 from ticket_automation.providers.codex_cli import (
     DEFAULT_CODEX_MODEL,
     DEFAULT_CODEX_REASONING_EFFORT,
-    CodexExecutionOverrides,
 )
 
 
@@ -29,9 +25,8 @@ def test_application_and_provider_defaults_work_without_example_file(tmp_path):
     local_config.write_text(_config_toml(), encoding="utf-8")
 
     config = load_config(tmp_path)
-    effective = apply_codex_execution_overrides(config, CodexExecutionOverrides())
-    prepare_production_agents(effective)
-    provider = effective.agents.providers[ProviderId("codex-cli")]
+    providers = prepare_production_agents(config)
+    provider = providers.display_settings()[ProviderId("codex-cli")]
 
     assert config.project.name == "Local project"
     assert config.project.repo.as_posix() == "D:/work/local-project"
@@ -55,41 +50,18 @@ def test_local_config_overrides_application_defaults(tmp_path):
         encoding="utf-8",
     )
     config = load_config(tmp_path)
-    effective = apply_codex_execution_overrides(config, CodexExecutionOverrides())
-    prepare_production_agents(effective)
-    settings = effective.agents.providers[ProviderId("codex-cli")]
+    providers = prepare_production_agents(config)
+    settings = providers.display_settings()[ProviderId("codex-cli")]
 
-    assert effective.runner.max_correction_rounds == 2
+    assert config.runner.max_correction_rounds == 2
     assert settings["model"] == "local-model"
     assert settings["reasoning_effort"] == "high"
 
 
-def test_cli_codex_overrides_take_precedence_independently():
+def test_unknown_top_level_configuration_section_is_rejected():
     raw = base_raw_config()
-    raw["agents"]["providers"]["codex-cli"].update(  # type: ignore[index]
-        {"model": "local-model", "reasoning_effort": "medium"}
-    )
-    config = parse_config(raw, configuration_directory=Path.cwd())
-
-    model_override = apply_codex_execution_overrides(
-        config, CodexExecutionOverrides(model="cli-model")
-    )
-    reasoning_override = apply_codex_execution_overrides(
-        config, CodexExecutionOverrides(reasoning_effort="high")
-    )
-
-    model = model_override.agents.providers[ProviderId("codex-cli")]
-    reasoning = reasoning_override.agents.providers[ProviderId("codex-cli")]
-    assert model["model"] == "cli-model"
-    assert model["reasoning_effort"] == "medium"
-    assert reasoning["model"] == "local-model"
-    assert reasoning["reasoning_effort"] == "high"
-
-
-def test_old_codex_table_is_rejected_explicitly():
-    raw = base_raw_config()
-    raw["codex"] = {"executable": "codex"}
-    with pytest.raises(ConfigError, match=r"Unsupported \[codex\]"):
+    raw["obsolete-provider"] = {"executable": "tool"}
+    with pytest.raises(ConfigError, match="Unknown top-level configuration section"):
         parse_config(raw, configuration_directory=Path.cwd())
 
 
@@ -182,11 +154,17 @@ def test_invalid_verification_command_values_are_rejected(command, message):
 def test_verification_commands_retain_argument_boundaries():
     raw = base_raw_config()
     raw["verification"]["commands"][0]["argv"] = [  # type: ignore[index]
-        "python", "-m", "pytest", "tests/unit/test file.py"
+        "python",
+        "-m",
+        "pytest",
+        "tests/unit/test file.py",
     ]
     config = parse_config(raw, configuration_directory=Path.cwd())
     assert config.verification.commands[0].argv == (
-        "python", "-m", "pytest", "tests/unit/test file.py"
+        "python",
+        "-m",
+        "pytest",
+        "tests/unit/test file.py",
     )
 
 
@@ -215,7 +193,7 @@ def base_raw_config() -> dict[str, object]:
 
 
 def _config_toml(*, runner: str = "", provider: str = 'executable = "codex"') -> str:
-    return f'''[project]
+    return f"""[project]
 name = "Local project"
 repo = "D:/work/local-project"
 protected_branches = ["main"]
@@ -232,4 +210,4 @@ correction = "codex-cli"
 name = "tests"
 argv = ["python", "-m", "pytest"]
 timeout_seconds = 1800
-'''.strip()
+""".strip()

@@ -26,9 +26,8 @@ from ..models import (
     StopCategory,
     WorkflowState,
 )
-from ..persistence_codecs import PersistenceCodecError, read_attempt_result_value
+from ..persistence_codecs import PersistenceCodecError, read_review_result
 from ..runs import RunRecord
-from ..task_result_codecs import decode_review_result
 from ..verification_evidence import read_verification_source_fingerprint
 from .ports.handoff import (
     FINAL_PATCH_FILE,
@@ -590,7 +589,7 @@ def _read_policy_request(
             review_problem = "Final independent review evidence is incomplete."
         else:
             try:
-                payload = read_attempt_result_value(
+                result = read_review_result(
                     request.run_dir,
                     next(
                         item
@@ -598,11 +597,10 @@ def _read_policy_request(
                         if item.sequence == review_attempt.sequence
                     ),
                 )
-                if payload is None:
+                if result is None:
                     raise PersistenceCodecError(
                         "Final independent review result artifact is missing."
                     )
-                result = decode_review_result(payload)
                 review = ReviewHandoffEvidence(
                     attempt_sequence=review_attempt.sequence,
                     before_workspace_fingerprint=(

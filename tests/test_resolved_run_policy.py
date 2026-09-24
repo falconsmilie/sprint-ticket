@@ -110,7 +110,6 @@ def test_round_trip_with_one_provider_assigned_to_every_task(tmp_path):
         assignments={kind: provider_id for kind in AgentTaskKind},
         registrations={provider_id: registration},
     )
-
     loaded = ResolvedRunPolicy.from_dict(resolved.to_dict())
 
     assert loaded == resolved
@@ -168,15 +167,15 @@ def test_round_trip_and_executor_selection_with_distinct_task_providers(tmp_path
     assert loaded == creation.run_record
 
 
-@pytest.mark.parametrize("version", [None, 0, 1])
-def test_every_old_resolved_policy_schema_is_rejected_directly(version):
-    old_policy = _representative_v1_resolved_config()
-    old_policy["schema_version"] = version
+def test_unsupported_resolved_policy_schema_is_rejected_directly(tmp_path):
+    policy, _ = _shared_policy(tmp_path)
+    data = policy.to_dict()
+    data["schema_version"] = 999
     with pytest.raises(
         ResolvedRunPolicyError,
         match="Unsupported resolved policy schema version",
     ):
-        ResolvedRunPolicy.from_dict(old_policy)
+        ResolvedRunPolicy.from_dict(data)
 
 
 def test_tampered_assignment_and_missing_provider_policy_fail_closed(tmp_path):
@@ -295,9 +294,9 @@ def test_mutable_policy_decoded_by_adapter_is_rejected_before_executor_creation(
     )
 
     with pytest.raises(ConfigError, match="mutable run policy"):
-        RegisteredProviderExecutorFactory(
-            {provider_id: registration}
-        ).create_executors(ResolvedRunPolicy.from_dict(resolved.to_dict()))
+        RegisteredProviderExecutorFactory({provider_id: registration}).create_executors(
+            ResolvedRunPolicy.from_dict(resolved.to_dict())
+        )
 
     assert registration.executor_calls == 0
 
@@ -438,45 +437,3 @@ def _policy_config(
         source_files=(),
         configuration_directory=repository.parent,
     )
-
-
-def _representative_v1_resolved_config() -> dict[str, object]:
-    digest = "0" * 64
-    return {
-        "schema_version": 1,
-        "target_repository_path": "C:/old/repository",
-        "protected_branches": ["main"],
-        "codex": {
-            "model": "old-model",
-            "reasoning_effort": "high",
-            "executable": "C:/old/codex.exe",
-            "cli_version": "old-codex 1.0",
-            "ephemeral": True,
-        },
-        "sandbox_policy": {
-            "implementation": "workspace-write",
-            "review": "read-only",
-        },
-        "verification": {
-            "commands": [
-                {
-                    "name": "tests",
-                    "argv": ["python", "-m", "pytest"],
-                    "timeout_seconds": 1800,
-                }
-            ]
-        },
-        "max_correction_rounds": 1,
-        "ticket_automation": {
-            "package": "ticket-automation",
-            "version": "0.1.0",
-            "git_sha": "0" * 40,
-        },
-        "prompt_schema_versions": {
-            "implementation_prompt": digest,
-            "correction_prompt": digest,
-            "review_prompt": digest,
-            "implementation_result_schema": digest,
-            "review_result_schema": digest,
-        },
-    }

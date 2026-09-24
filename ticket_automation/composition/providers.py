@@ -45,6 +45,8 @@ class ProviderRegistration(Protocol):
         configuration_directory: Path,
     ) -> object: ...
 
+    def display_settings(self, settings: object) -> Mapping[str, object]: ...
+
     def run_preflight(
         self,
         settings: object,
@@ -134,6 +136,18 @@ class PreparedAgentProviders:
                     )
                 )
         return PreflightResult(tuple(checks))
+
+    def display_settings(self) -> Mapping[ProviderId, Mapping[str, object]]:
+        """Return provider-owned normalized settings for user-facing output."""
+
+        return MappingProxyType(
+            {
+                provider_id: MappingProxyType(
+                    dict(configured.registration.display_settings(configured.settings))
+                )
+                for provider_id, configured in self.providers.items()
+            }
+        )
 
     def resolve_run_policy(
         self,

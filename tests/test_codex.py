@@ -27,19 +27,19 @@ from ticket_automation.application.agent_execution import (
 from ticket_automation.domain.task_results import ImplementationResult, ReviewResult
 from ticket_automation.providers.codex_cli import (
     CodexCliAgentExecutor,
+    CodexCliSettings,
+    CodexCliSettingsError,
     CodexCommand,
     CodexProcessResult,
     CodexProcessTimedOut,
     CodexProcessTimeout,
-    CodexSettings,
-    CodexSettingsError,
     SubprocessCodexRunner,
 )
 from ticket_automation.providers.codex_cli import process as process_module
 from ticket_automation.providers.codex_cli.command import build_command
 
 EXISTING_EXECUTABLE = str(Path(sys.executable).resolve())
-SETTINGS = CodexSettings(EXISTING_EXECUTABLE, "gpt-5.5", "xhigh")
+SETTINGS = CodexCliSettings(EXISTING_EXECUTABLE, "gpt-5.5", "xhigh")
 
 
 def implementation_payload(**changes: object) -> dict[str, object]:
@@ -95,21 +95,6 @@ class FakeRunner:
             output.write_text(self.typed_result, encoding="utf-8")
         assert self.result is not None
         return self.result
-
-    def _run_with_start_tracking(
-        self,
-        command: CodexCommand,
-        *,
-        stdin: str,
-        timeout_seconds: float | None,
-        on_process_start,
-    ) -> CodexProcessResult:
-        return self.run(
-            command,
-            stdin=stdin,
-            timeout_seconds=timeout_seconds,
-            on_process_start=on_process_start,
-        )
 
 
 def request(
@@ -284,7 +269,7 @@ def test_failure_mapping_is_deterministic(
 
 def test_unavailable_executable_is_process_not_started(tmp_path: Path) -> None:
     executor = CodexCliAgentExecutor(
-        CodexSettings(str(tmp_path / "missing"), "gpt-5.5", "xhigh"),
+        CodexCliSettings(str(tmp_path / "missing"), "gpt-5.5", "xhigh"),
         runner=FakeRunner(),
     )
 
@@ -380,44 +365,6 @@ def test_review_request_is_read_only(tmp_path: Path) -> None:
         runner.command.argv[runner.command.argv.index("--sandbox") + 1] == "read-only"
     )
     assert "sandbox_workspace_write.network_access=true" not in runner.command.argv
-
-
-def test_legacy_runner_remains_read_only_compatible_and_cannot_claim_write(
-    tmp_path: Path,
-) -> None:
-    @dataclass
-    class LegacyRunner:
-        calls: int = 0
-
-        def run(self, command, *, stdin, timeout_seconds):
-            del stdin, timeout_seconds
-            self.calls += 1
-            output = Path(command.argv[command.argv.index("--output-last-message") + 1])
-            output.write_text(json.dumps(review_payload()), encoding="utf-8")
-            return CodexProcessResult(0, "", "")
-
-    review_repository = tmp_path / "review"
-    review_repository.mkdir()
-    runner = LegacyRunner()
-    executor = CodexCliAgentExecutor(SETTINGS, runner=runner)
-
-    review = executor.execute(request(review_repository, AgentTaskKind.REVIEW))
-
-    assert review.successful
-    assert runner.calls == 1
-    assert AgentCapability.WORKSPACE_WRITE_EXECUTION not in executor.capabilities
-
-    write_repository = tmp_path / "write"
-    write_repository.mkdir()
-    rejected = executor.execute(request(write_repository))
-
-    assert not rejected.successful
-    assert (
-        rejected.failure_category
-        is AgentFailureCategory.CAPABILITY_OR_CONFIGURATION_FAILURE
-    )
-    assert rejected.invocation_start is InvocationStart.NOT_STARTED
-    assert runner.calls == 1
 
 
 def test_invocation_start_is_reported_after_spawn_before_process_completion(
@@ -595,7 +542,7 @@ def test_adapter_resolves_bare_executable_from_path(
     runner = FakeRunner(
         CodexProcessResult(0, "", ""), json.dumps(implementation_payload())
     )
-    settings = CodexSettings("codex", "gpt-5.5", "xhigh")
+    settings = CodexCliSettings("codex", "gpt-5.5", "xhigh")
 
     execution = CodexCliAgentExecutor(settings, runner=runner).execute(
         request(tmp_path)
@@ -618,7 +565,7 @@ def test_explicit_executable_does_not_use_path_lookup(
         raise AssertionError("explicit executable paths must not use PATH lookup")
 
     monkeypatch.setattr(executable_resolution.shutil, "which", fail_which)
-    settings = CodexSettings(str(executable), "gpt-5.5", "xhigh")
+    settings = CodexCliSettings(str(executable), "gpt-5.5", "xhigh")
 
     execution = CodexCliAgentExecutor(settings, runner=runner).execute(
         request(tmp_path)
@@ -691,31 +638,6 @@ def test_timeout_preserves_partial_diagnostic_evidence(tmp_path: Path) -> None:
     ) == "still working\n"
 
 
-def test_subprocess_timeout_decodes_partial_output(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    def fake_run(*args: object, **kwargs: object) -> object:
-        raise process_module.subprocess.TimeoutExpired(
-            cmd=args[0],
-            timeout=kwargs["timeout"],
-            output=b'{"type":"turn.started"}\n',
-            stderr=b"partial stderr\n",
-        )
-
-    monkeypatch.setattr(process_module.subprocess, "run", fake_run)
-
-    with pytest.raises(CodexProcessTimedOut) as raised:
-        SubprocessCodexRunner().run(
-            CodexCommand(("codex", "exec", "-"), tmp_path),
-            stdin="prompt",
-            timeout_seconds=5,
-        )
-
-    assert raised.value.result.timeout_seconds == 5
-    assert raised.value.result.stdout == '{"type":"turn.started"}\n'
-    assert raised.value.result.stderr == "partial stderr\n"
-
-
 def test_subprocess_runner_uses_argv_and_disables_shell(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -747,7 +669,7 @@ def test_subprocess_runner_uses_argv_and_disables_shell(
     def record_start() -> None:
         captured["process_started"] = True
 
-    result = SubprocessCodexRunner()._run_with_start_tracking(
+    result = SubprocessCodexRunner().run(
         CodexCommand(
             ("codex", "exec", "-"),
             tmp_path,
@@ -810,7 +732,7 @@ def test_tracked_subprocess_timeout_kills_process_and_keeps_final_output(
         starts += 1
 
     with pytest.raises(CodexProcessTimedOut) as raised:
-        SubprocessCodexRunner()._run_with_start_tracking(
+        SubprocessCodexRunner().run(
             CodexCommand(("codex", "exec", "-"), tmp_path),
             stdin="prompt",
             timeout_seconds=5,
@@ -855,7 +777,7 @@ def test_tracked_subprocess_stops_child_when_start_observer_is_interrupted(
         raise KeyboardInterrupt("interrupted while recording start")
 
     with pytest.raises(KeyboardInterrupt, match="recording start"):
-        SubprocessCodexRunner()._run_with_start_tracking(
+        SubprocessCodexRunner().run(
             CodexCommand(("codex", "exec", "-"), tmp_path),
             stdin="prompt",
             timeout_seconds=5,
@@ -883,7 +805,7 @@ def test_subprocess_spawn_failure_does_not_report_process_start(
     monkeypatch.setattr(process_module.subprocess, "Popen", fail_spawn)
 
     with pytest.raises(FileNotFoundError, match="codex unavailable"):
-        SubprocessCodexRunner()._run_with_start_tracking(
+        SubprocessCodexRunner().run(
             CodexCommand(("codex", "exec", "-"), tmp_path),
             stdin="prompt",
             timeout_seconds=10,
@@ -924,9 +846,9 @@ def test_invalid_settings_are_rejected_before_runner_starts(tmp_path: Path) -> N
         CodexProcessResult(0, "", ""), json.dumps(implementation_payload())
     )
 
-    with pytest.raises(CodexSettingsError, match="reasoning_effort"):
+    with pytest.raises(CodexCliSettingsError, match="reasoning_effort"):
         CodexCliAgentExecutor(
-            CodexSettings(EXISTING_EXECUTABLE, "gpt-5.5", "unsupported"),
+            CodexCliSettings(EXISTING_EXECUTABLE, "gpt-5.5", "unsupported"),
             runner=runner,
         )
 
