@@ -228,11 +228,17 @@ def _run_ticket_lifecycle_locked(
         resolved_policy=resolved_policy,
         clock=clock,
     )
+    run_ownership = snapshot.run_ownership
     try:
-        run_ownership = RunOwnership.acquire(runs_dir, snapshot.run_record.run_id)
-    except (RunOwnershipError, ValueError) as error:
-        raise RunError(str(error)) from error
-    run_dir = run_ownership.run_dir
+        run_dir = run_ownership.validate_run_path(snapshot.run_dir)
+    except RunOwnershipError as error:
+        return _ownership_failure_result(
+            snapshot.run_dir,
+            snapshot.run_record,
+            snapshot.preflight_result,
+            LifecycleProgress(),
+            error,
+        )
     config = config_from_resolved_run_policy(snapshot.run_record.resolved_policy)
     _update_repository_lock(repository_lock, snapshot.run_record)
     handlers = build_active_stage_handlers(
@@ -434,10 +440,15 @@ def _drive_lifecycle(
             clock=clock,
             run_ownership=run_ownership,
         )
+        stage_attempt = (
+            None
+            if attempt is None
+            else StageAttempt.from_record(attempt, run_ownership=run_ownership)
+        )
         context = StageContext(
             run_dir,
             run_record,
-            None if attempt is None else StageAttempt.from_record(attempt),
+            stage_attempt,
             clock,
             lambda active_attempt=attempt: _mark_attempt_process_started(
                 active_attempt,
@@ -446,6 +457,9 @@ def _drive_lifecycle(
             run_ownership,
         )
         decision = dispatch_stage(context, handlers)
+        if stage_attempt is not None:
+            assert stage_attempt.artifact_layout is not None
+            stage_attempt.artifact_layout.revalidate()
         _require_owned_run(run_dir, run_ownership)
         updated = _apply_stage_decision(run_record, decision, clock=clock)
         transition_persisted = False
@@ -468,7 +482,7 @@ def _drive_lifecycle(
                 )
             complete_stage_attempt(
                 run_dir,
-                attempt,
+                stage_attempt,
                 stage_outcome=completion.outcome,
                 after_workspace_fingerprint=completion.after_workspace_fingerprint,
                 process_started=completion.process_started,

@@ -10,6 +10,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
+from .application.agent_execution import AttemptArtifactLayout
 from .attempts import (
     AttemptMetadata,
     StageAttempt,
@@ -393,6 +394,8 @@ def run_baseline_verification_stage(
         phase=AttemptPhase.PREPARING,
         run_ownership=run_ownership,
     )
+    assert attempt.artifact_layout is not None
+    artifact_layout = attempt.artifact_layout
     baseline = load_baseline_record(run_path / BASELINE_RECORD_FILE)
     repository = GitRepository(Path(run_record.target_repository_path))
     try:
@@ -430,7 +433,7 @@ def run_baseline_verification_stage(
             0,
             violations,
             clock=clock,
-            run_ownership=run_ownership,
+            artifact_layout=artifact_layout,
         )
     else:
         assert snapshot is not None
@@ -444,7 +447,7 @@ def run_baseline_verification_stage(
             include_failures=False,
             process_runner=process_runner,
             clock=clock,
-            run_ownership=run_ownership,
+            artifact_layout=artifact_layout,
         )
     return _finish_stage(
         run_path,
@@ -453,7 +456,7 @@ def run_baseline_verification_stage(
         artifact_directory=attempt.artifact_directory,
         round_result=round_result,
         baseline=True,
-        run_ownership=run_ownership,
+        artifact_layout=artifact_layout,
     )
 
 
@@ -549,6 +552,8 @@ def _run_verification_stage(
         phase=AttemptPhase.VERIFYING,
         run_ownership=run_ownership,
     )
+    assert attempt.artifact_layout is not None
+    artifact_layout = attempt.artifact_layout
     repository = GitRepository(Path(run_record.target_repository_path))
     selected_round = (
         run_record.current_correction_round if round_index is None else round_index
@@ -588,7 +593,7 @@ def _run_verification_stage(
             selected_round,
             violations,
             clock=clock,
-            run_ownership=run_ownership,
+            artifact_layout=artifact_layout,
         )
     else:
         assert snapshot is not None
@@ -602,7 +607,7 @@ def _run_verification_stage(
             include_failures=True,
             process_runner=process_runner,
             clock=clock,
-            run_ownership=run_ownership,
+            artifact_layout=artifact_layout,
         )
     return _finish_stage(
         run_path,
@@ -611,7 +616,7 @@ def _run_verification_stage(
         artifact_directory=attempt.artifact_directory,
         round_result=round_result,
         baseline=False,
-        run_ownership=run_ownership,
+        artifact_layout=artifact_layout,
     )
 
 
@@ -626,7 +631,7 @@ def _run_round(
     include_failures: bool,
     process_runner: VerificationProcessRunner | None,
     clock: Callable[[], datetime] | None,
-    run_ownership: RunOwnership | None,
+    artifact_layout: AttemptArtifactLayout,
 ) -> VerificationRound:
     started = _utcnow(clock)
     runner = process_runner or SubprocessVerificationRunner()
@@ -636,7 +641,7 @@ def _run_round(
             cwd,
             runner,
             clock,
-            run_ownership=run_ownership,
+            artifact_layout=artifact_layout,
         )
         for command in commands
     )
@@ -657,8 +662,7 @@ def _run_round(
         ),
         result_path=result_path,
     )
-    if run_ownership is not None:
-        run_ownership.validate_descendant(result_path)
+    artifact_layout.revalidate()
     atomic_write_json(result_path, result.to_dict())
     return result
 
@@ -671,11 +675,9 @@ def _finish_stage(
     artifact_directory: Path,
     round_result: VerificationRound,
     baseline: bool,
-    run_ownership: RunOwnership | None,
+    artifact_layout: AttemptArtifactLayout,
 ) -> VerificationStageResult:
-    if run_ownership is not None:
-        run_ownership.validate_run_path(run_path)
-        run_ownership.validate_descendant(artifact_directory)
+    artifact_layout.revalidate()
     if round_result.safety_violations or round_result.errored_commands:
         outcome = StageOutcome.HUMAN_REQUIRED
         message = (
@@ -720,7 +722,7 @@ def _controller_error_round(
     violations: tuple[VerificationSafetyViolation, ...],
     *,
     clock: Callable[[], datetime] | None,
-    run_ownership: RunOwnership | None,
+    artifact_layout: AttemptArtifactLayout,
 ) -> VerificationRound:
     now = _utcnow(clock)
     result = VerificationRound(
@@ -734,8 +736,7 @@ def _controller_error_round(
         failures=(),
         result_path=result_path,
     )
-    if run_ownership is not None:
-        run_ownership.validate_descendant(result_path)
+    artifact_layout.revalidate()
     atomic_write_json(result_path, result.to_dict())
     return result
 
@@ -756,7 +757,7 @@ def _run_command(
     runner: VerificationProcessRunner,
     clock: Callable[[], datetime] | None,
     *,
-    run_ownership: RunOwnership | None,
+    artifact_layout: AttemptArtifactLayout,
 ) -> VerificationCommandResult:
     started = _utcnow(clock)
     try:
@@ -765,8 +766,7 @@ def _run_command(
             timeout_seconds=command.timeout_seconds,
         )
     except FileNotFoundError as error:
-        if run_ownership is not None:
-            run_ownership.validate()
+        artifact_layout.revalidate()
         return _command_error(
             command,
             cwd,
@@ -776,8 +776,7 @@ def _run_command(
             clock,
         )
     except VerificationProcessTimedOut as error:
-        if run_ownership is not None:
-            run_ownership.validate()
+        artifact_layout.revalidate()
         return _command_error(
             command,
             cwd,
@@ -789,8 +788,7 @@ def _run_command(
             stderr=error.result.stderr,
         )
     except OSError as error:
-        if run_ownership is not None:
-            run_ownership.validate()
+        artifact_layout.revalidate()
         return _command_error(
             command,
             cwd,
@@ -799,8 +797,7 @@ def _run_command(
             str(error),
             clock,
         )
-    if run_ownership is not None:
-        run_ownership.validate()
+    artifact_layout.revalidate()
     ended = _utcnow(clock)
     return VerificationCommandResult(
         command.name,

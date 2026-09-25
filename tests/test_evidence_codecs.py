@@ -38,6 +38,8 @@ from ticket_automation.persistence import (
     PersistenceError,
     atomic_write_json,
     atomic_write_text,
+    exclusive_write_bytes,
+    exclusive_write_text,
 )
 from ticket_automation.verification_evidence import (
     VERIFICATION_ROUND_FORMAT,
@@ -427,6 +429,30 @@ def test_atomic_text_write_replaces_a_hardlink_without_mutating_its_target(
     assert external.read_text(encoding="utf-8") == "external evidence"
     assert destination.read_text(encoding="utf-8") == "captured patch"
     assert not os.path.samefile(external, destination)
+
+
+@pytest.mark.parametrize(
+    ("writer", "payload"),
+    [
+        (exclusive_write_text, "immutable text"),
+        (exclusive_write_bytes, b"immutable bytes"),
+    ],
+)
+def test_exclusive_artifact_creation_rejects_existing_hardlinks(
+    tmp_path: Path,
+    writer,
+    payload,
+) -> None:
+    external = tmp_path / "external"
+    external.write_bytes(b"external evidence")
+    destination = tmp_path / "artifact"
+    os.link(external, destination)
+
+    with pytest.raises(PersistenceError, match="exclusively create"):
+        writer(destination, payload)
+
+    assert external.read_bytes() == b"external evidence"
+    assert os.path.samefile(external, destination)
 
 
 @pytest.mark.parametrize("status", list(VerificationStatus))

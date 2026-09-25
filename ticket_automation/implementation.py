@@ -34,6 +34,7 @@ from .application.guarded_writable_operation import (
 from .attempts import (
     AttemptMetadata,
     StageAttempt,
+    attempt_artifact_layout,
     complete_stage_attempt,
     require_stage_attempt,
     start_attempt,
@@ -208,6 +209,11 @@ def _run_implementation_stage(
     ticket_text = _read_snapshotted_ticket(run_path / RUN_TICKET_FILE)
     prompt = _render_implementation_prompt(ticket_text)
     implementation_dir = attempt.artifact_directory
+    artifact_layout = attempt_artifact_layout(
+        run_path,
+        attempt,
+        run_ownership=run_ownership,
+    )
     baseline = WritableBaseline(
         repository_path=repository.path,
         branch=run_record.starting_branch,
@@ -231,6 +237,7 @@ def _run_implementation_stage(
             GuardedWritableRejectionRequest(
                 phase=AttemptPhase.IMPLEMENTING,
                 artifact_directory=implementation_dir,
+                artifact_layout=artifact_layout,
                 baseline=baseline,
                 failure_message=evidence_problem,
                 safety_violations=(
@@ -248,6 +255,7 @@ def _run_implementation_stage(
             run_record=run_record,
             run_dir=run_path,
             artifact_directory=implementation_dir,
+            artifact_layout=artifact_layout,
             execution=None,
             agent_result=None,
             safety_violations=_implementation_violations(audit.safety_violations),
@@ -268,11 +276,7 @@ def _run_implementation_stage(
         prompt=prompt,
         result_contract=IMPLEMENTATION_RESULT_CONTRACT,
         artifact_directory=implementation_dir,
-        artifact_layout=AttemptArtifactLayout.for_attempt(
-            run_path,
-            implementation_dir,
-            run_ownership=run_ownership,
-        ),
+        artifact_layout=artifact_layout,
         policy=run_record.resolved_policy.task_policy(
             AgentTaskKind.IMPLEMENTATION
         ).execution_policy,
@@ -307,6 +311,7 @@ def _run_implementation_stage(
             run_record=active_record,
             run_dir=run_path,
             artifact_directory=implementation_dir,
+            artifact_layout=artifact_layout,
             execution=audit.execution,
             agent_result=(
                 audit.execution.result
@@ -350,6 +355,7 @@ def _run_implementation_stage(
             run_record=active_record,
             run_dir=run_path,
             artifact_directory=implementation_dir,
+            artifact_layout=artifact_layout,
             execution=audit.execution,
             agent_result=None,
             safety_violations=safety_violations,
@@ -373,6 +379,7 @@ def _run_implementation_stage(
             run_record=active_record,
             run_dir=run_path,
             artifact_directory=implementation_dir,
+            artifact_layout=artifact_layout,
             execution=execution,
             agent_result=agent_result,
             safety_violations=(),
@@ -390,6 +397,7 @@ def _run_implementation_stage(
             run_record=active_record,
             run_dir=run_path,
             artifact_directory=implementation_dir,
+            artifact_layout=artifact_layout,
             execution=execution,
             agent_result=agent_result,
             safety_violations=(),
@@ -406,6 +414,7 @@ def _run_implementation_stage(
         run_record=active_record,
         run_dir=run_path,
         artifact_directory=implementation_dir,
+        artifact_layout=artifact_layout,
         execution=execution,
         agent_result=agent_result,
         safety_violations=(),
@@ -433,6 +442,7 @@ def _finish(
     run_record: RunRecord,
     run_dir: Path,
     artifact_directory: Path,
+    artifact_layout: AttemptArtifactLayout,
     execution: AgentExecution[ImplementationResult] | None,
     agent_result: ImplementationResult | None,
     safety_violations: tuple[_ImplementationSafetyViolation, ...],
@@ -447,8 +457,9 @@ def _finish(
     if run_ownership is not None:
         run_ownership.validate_run_path(run_dir)
         run_ownership.validate_descendant(artifact_directory)
+    artifact_layout.revalidate()
     _write_agent_result(
-        artifact_directory,
+        artifact_layout,
         agent_result,
         outcome=outcome,
         controller_message=controller_message,
@@ -477,13 +488,13 @@ def _finish(
 
 
 def _write_agent_result(
-    artifact_directory: Path,
+    artifact_layout: AttemptArtifactLayout,
     result: ImplementationResult | None,
     *,
     outcome: StageOutcome,
     controller_message: str,
 ) -> None:
-    path = artifact_directory / ATTEMPT_RESULT_ARTIFACT_NAME
+    path = artifact_layout.path(ATTEMPT_RESULT_ARTIFACT_NAME)
     if result is not None:
         write_implementation_result(path, result)
     else:

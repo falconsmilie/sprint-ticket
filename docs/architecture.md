@@ -62,11 +62,14 @@ policy; application code never receives the registry itself.
 Run and attempt paths are ownership boundaries as well as naming conventions.
 Resume accepts only a direct, non-linked run directory whose persisted identity
 matches its directory. Attempt creation, loading, and mutation resolve through
-the same physically confined layout. Lifecycle execution carries the configured
-runs root and run ID as an ownership token and revalidates it before authoritative
-reads and writes; ownership loss stops without terminal persistence or reporting.
-Fixed text artifacts such as `final.patch` and `report.md` are atomically replaced
-so pre-existing file links cannot redirect an authoritative write.
+the same physically confined layout. The run token is bound during new-run
+reservation and is the token returned to lifecycle execution; it is not reacquired
+from the path after snapshot persistence. Each active attempt layout also binds the
+physical identities of its attempts root and attempt directory across provider and
+verification calls. Replacement of either directory stops before post-call evidence
+or attempt updates are written. Mutable text artifacts are atomically replaced, and
+immutable text/byte artifacts are exclusively created, so pre-existing file links
+cannot redirect an authoritative or diagnostic write.
 
 ## Enforced rules
 

@@ -15,6 +15,7 @@ from ticket_automation.application.agent_execution import (
     IMPLEMENTATION_RESULT_CONTRACT,
     REVIEW_RESULT_CONTRACT,
     AgentCapability,
+    AgentContractError,
     AgentExecution,
     AgentExecutionPolicy,
     AgentExecutionRequest,
@@ -874,10 +875,12 @@ def test_stage_owned_rejection_records_complete_workspace_evidence(
         phase=phase,
         before_workspace_fingerprint=None,
     )
+    assert record.artifact_layout is not None
     executor = MatrixExecutor("tracked-success")
     request = GuardedWritableRejectionRequest(
         phase=phase,
         artifact_directory=record.artifact_directory,
+        artifact_layout=record.artifact_layout,
         baseline=WritableBaseline(
             repository.path,
             before.branch,
@@ -905,6 +908,144 @@ def test_stage_owned_rejection_records_complete_workspace_evidence(
     assert persisted.after_workspace_fingerprint is not None
     assert persisted.process_started is False
     assert (record.artifact_directory / "workspace-guard.json").is_file()
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required")
+@pytest.mark.parametrize("replacement", ["attempts-root", "active-attempt"])
+def test_stage_owned_rejection_keeps_original_attempt_ownership(
+    tmp_path: Path,
+    replacement: str,
+) -> None:
+    repository = GitRepository(create_git_repo(tmp_path / "target"))
+    before = WorkspaceSnapshot.capture(repository)
+    record = start_attempt(
+        tmp_path / "run",
+        phase=AttemptPhase.IMPLEMENTING,
+        before_workspace_fingerprint=None,
+    )
+    assert record.artifact_layout is not None
+    request = GuardedWritableRejectionRequest(
+        phase=AttemptPhase.IMPLEMENTING,
+        artifact_directory=record.artifact_directory,
+        artifact_layout=record.artifact_layout,
+        baseline=WritableBaseline(
+            repository.path,
+            before.branch,
+            before.head_sha or "",
+        ),
+        failure_message="Stage authorization failed.",
+    )
+    attempts_root = record.artifact_directory.parent
+    moved = tmp_path / f"moved-{replacement}"
+    if replacement == "attempts-root":
+        attempts_root.rename(moved)
+        attempts_root.mkdir()
+        replacement_directory = attempts_root / record.artifact_directory.name
+        replacement_directory.mkdir()
+        original_record = moved / record.artifact_directory.name / "attempt.json"
+    else:
+        record.artifact_directory.rename(moved)
+        record.artifact_directory.mkdir()
+        replacement_directory = record.artifact_directory
+        original_record = moved / "attempt.json"
+    executor = MatrixExecutor("tracked-success")
+
+    with pytest.raises(AgentContractError, match="ownership was lost"):
+        GuardedWritableOperation(executor).reject_before_start(request)
+
+    assert executor.calls == 0
+    assert tuple(replacement_directory.iterdir()) == ()
+    assert json.loads(original_record.read_text(encoding="utf-8"))["status"] == (
+        "STARTED"
+    )
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required")
+@pytest.mark.parametrize("inspection", ["workspace", "environment", "changed-files"])
+@pytest.mark.parametrize("replacement", ["attempts-root", "active-attempt"])
+def test_post_invocation_inspection_cannot_redirect_attempt_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inspection: str,
+    replacement: str,
+) -> None:
+    repository = GitRepository(create_git_repo(tmp_path / "target"))
+    before = WorkspaceSnapshot.capture(repository)
+    request = _request(
+        tmp_path,
+        repository,
+        before,
+        AgentTaskKind.IMPLEMENTATION,
+        AttemptPhase.IMPLEMENTING,
+    )
+    artifact_directory = request.execution_request.artifact_directory
+    attempts_root = artifact_directory.parent
+    moved = tmp_path / f"moved-{inspection}-{replacement}"
+    replacement_directory: Path | None = None
+    original_record: Path | None = None
+
+    def replace_attempt_storage() -> None:
+        nonlocal replacement_directory, original_record
+        if replacement_directory is not None:
+            return
+        if replacement == "attempts-root":
+            attempts_root.rename(moved)
+            attempts_root.mkdir()
+            replacement_directory = attempts_root / artifact_directory.name
+            replacement_directory.mkdir()
+            original_record = moved / artifact_directory.name / "attempt.json"
+        else:
+            artifact_directory.rename(moved)
+            artifact_directory.mkdir()
+            replacement_directory = artifact_directory
+            original_record = moved / "attempt.json"
+
+    operation = GuardedWritableOperation(MatrixExecutor("tracked-success"))
+    if inspection == "workspace":
+        original = operation._capture_workspace
+        calls = 0
+
+        def capture_workspace(repository):
+            nonlocal calls
+            result = original(repository)
+            calls += 1
+            if calls == 2:
+                replace_attempt_storage()
+            return result
+
+        monkeypatch.setattr(operation, "_capture_workspace", capture_workspace)
+    elif inspection == "environment":
+        original = operation._capture_environment
+        calls = 0
+
+        def capture_environment(repository):
+            nonlocal calls
+            result = original(repository)
+            calls += 1
+            if calls == 2:
+                replace_attempt_storage()
+            return result
+
+        monkeypatch.setattr(operation, "_capture_environment", capture_environment)
+    else:
+        original = guarded_module._changed_files
+
+        def changed_files(repository, baseline_sha):
+            result = original(repository, baseline_sha)
+            replace_attempt_storage()
+            return result
+
+        monkeypatch.setattr(guarded_module, "_changed_files", changed_files)
+
+    with pytest.raises(AgentContractError, match="ownership was lost"):
+        operation.execute(request)
+
+    assert replacement_directory is not None
+    assert tuple(replacement_directory.iterdir()) == ()
+    assert original_record is not None
+    assert json.loads(original_record.read_text(encoding="utf-8"))["status"] == (
+        "STARTED"
+    )
 
 
 def test_writable_baseline_rejects_untrusted_identity_values(tmp_path: Path) -> None:

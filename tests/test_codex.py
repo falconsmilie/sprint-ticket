@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +26,7 @@ from ticket_automation.application.agent_execution import (
     required_execution_capabilities,
 )
 from ticket_automation.domain.task_results import ImplementationResult, ReviewResult
+from ticket_automation.persistence import PersistenceError
 from ticket_automation.providers.codex_cli import (
     CodexCliAgentExecutor,
     CodexCliSettings,
@@ -314,6 +316,82 @@ def test_workspace_write_requires_declared_capability(tmp_path: Path) -> None:
     )
     assert execution.invocation_start is InvocationStart.NOT_STARTED
     assert runner.calls == 0
+    assert (tmp_path / "artifacts" / "prompt.md").read_text(encoding="utf-8") == (
+        "Application-owned task prompt."
+    )
+    assert (tmp_path / "artifacts" / "events.jsonl").read_text(encoding="utf-8") == ""
+    assert (tmp_path / "artifacts" / "stderr.log").read_text(encoding="utf-8") == ""
+    assert (tmp_path / "artifacts" / "codex-execution.json").is_file()
+
+
+def test_provider_artifact_preparation_never_follows_existing_hardlinks(
+    tmp_path: Path,
+) -> None:
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    external = {
+        "prompt.md": tmp_path / "external-prompt.md",
+        "events.jsonl": tmp_path / "external-events.jsonl",
+        "stderr.log": tmp_path / "external-stderr.log",
+    }
+    originals = {name: f"external {name}\n" for name in external}
+    for name, target in external.items():
+        target.write_text(originals[name], encoding="utf-8")
+        os.link(target, artifacts / name)
+    runner = FakeRunner(
+        CodexProcessResult(0, "", ""), json.dumps(implementation_payload())
+    )
+
+    with pytest.raises(PersistenceError, match="exclusively create text"):
+        CodexCliAgentExecutor(SETTINGS, runner=runner).execute(request(tmp_path))
+
+    assert runner.calls == 0
+    for name, target in external.items():
+        assert target.read_text(encoding="utf-8") == originals[name]
+
+
+def test_process_output_atomically_replaces_hardlinks_created_during_invocation(
+    tmp_path: Path,
+) -> None:
+    external_events = tmp_path / "external-events.jsonl"
+    external_stderr = tmp_path / "external-stderr.log"
+    external_events.write_text("external events\n", encoding="utf-8")
+    external_stderr.write_text("external stderr\n", encoding="utf-8")
+
+    @dataclass
+    class ReplacingRunner(FakeRunner):
+        def run(self, command, **kwargs):
+            artifacts = tmp_path / "artifacts"
+            for name, target in (
+                ("events.jsonl", external_events),
+                ("stderr.log", external_stderr),
+            ):
+                (artifacts / name).unlink()
+                os.link(target, artifacts / name)
+            return super().run(command, **kwargs)
+
+    runner = ReplacingRunner(
+        CodexProcessResult(0, "local events\n", "local stderr\n"),
+        json.dumps(implementation_payload()),
+    )
+
+    execution = CodexCliAgentExecutor(SETTINGS, runner=runner).execute(
+        request(tmp_path)
+    )
+
+    assert execution.successful
+    assert external_events.read_text(encoding="utf-8") == "external events\n"
+    assert external_stderr.read_text(encoding="utf-8") == "external stderr\n"
+    assert (tmp_path / "artifacts" / "events.jsonl").read_text(encoding="utf-8") == (
+        "local events\n"
+    )
+    assert (tmp_path / "artifacts" / "stderr.log").read_text(encoding="utf-8") == (
+        "local stderr\n"
+    )
+    assert not os.path.samefile(
+        external_events, tmp_path / "artifacts" / "events.jsonl"
+    )
+    assert not os.path.samefile(external_stderr, tmp_path / "artifacts" / "stderr.log")
 
 
 @pytest.mark.parametrize(

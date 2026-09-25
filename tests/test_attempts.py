@@ -76,8 +76,10 @@ from ticket_automation.persistence_codecs import (
     read_stage_message_result,
     write_stage_message_result,
 )
+from ticket_automation.review import run_review_stage
 from ticket_automation.run_ownership import RunOwnership, RunOwnershipError
 from ticket_automation.runs import RunError, save_run_record
+from ticket_automation.verification import run_verification_stage
 from ticket_automation.verification_evidence import read_verification_evidence
 from ticket_automation.workflow import resume_ticket_lifecycle
 
@@ -130,6 +132,62 @@ def test_attempt_update_rejects_a_retargeted_attempts_root(tmp_path: Path) -> No
         assert external_record.read_bytes() == original
     finally:
         remove_directory_link(attempts_root)
+
+
+@pytest.mark.parametrize("replacement", ["attempts-root", "active-attempt"])
+def test_attempt_update_rejects_unbound_record_copied_into_replacement_storage(
+    tmp_path: Path,
+    replacement: str,
+) -> None:
+    run_dir = tmp_path / "run"
+    record = start_attempt(
+        run_dir,
+        phase=AttemptPhase.REVIEWING,
+        before_workspace_fingerprint="before",
+        clock=fixed_clock,
+    )
+    assert record.artifact_layout is not None
+    loaded = load_attempt_records(run_dir)
+    assert len(loaded) == 1
+    assert loaded[0].artifact_layout is not None
+    original_bytes = record.path.read_bytes()
+    attempts_root = record.artifact_directory.parent
+    moved = tmp_path / f"moved-{replacement}"
+
+    if replacement == "attempts-root":
+        attempts_root.rename(moved)
+        attempts_root.mkdir()
+        replacement_directory = attempts_root / record.artifact_directory.name
+        replacement_directory.mkdir()
+        original_record = moved / record.artifact_directory.name / "attempt.json"
+    else:
+        record.artifact_directory.rename(moved)
+        record.artifact_directory.mkdir()
+        replacement_directory = record.artifact_directory
+        original_record = moved / "attempt.json"
+    replacement_record = replacement_directory / "attempt.json"
+    replacement_record.write_bytes(original_bytes)
+    unbound = replace(record, artifact_layout=None)
+
+    with pytest.raises(AttemptError, match="original bound artifact layout"):
+        update_attempt(unbound, process_started=True)
+
+    assert original_record.read_bytes() == original_bytes
+    assert replacement_record.read_bytes() == original_bytes
+
+
+def test_stage_attempt_cannot_be_derived_from_an_unbound_record(
+    tmp_path: Path,
+) -> None:
+    record = start_attempt(
+        tmp_path / "run",
+        phase=AttemptPhase.IMPLEMENTING,
+        before_workspace_fingerprint=None,
+        clock=fixed_clock,
+    )
+
+    with pytest.raises(AttemptError, match="original bound artifact layout"):
+        StageAttempt.from_record(replace(record, artifact_layout=None))
 
 
 def test_attempt_creation_and_update_reject_a_retargeted_owned_run(
@@ -374,6 +432,160 @@ def test_stage_attempt_validates_public_identity_fields(
 
     with pytest.raises(AttemptError, match=message):
         replace(trusted, **replacement)
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required")
+@pytest.mark.parametrize(
+    ("stage_name", "phase", "states"),
+    [
+        (
+            "implementation",
+            AttemptPhase.IMPLEMENTING,
+            (WorkflowState.IMPLEMENTING,),
+        ),
+        (
+            "verification",
+            AttemptPhase.VERIFYING,
+            (WorkflowState.IMPLEMENTING, WorkflowState.VERIFYING),
+        ),
+        (
+            "review",
+            AttemptPhase.REVIEWING,
+            (
+                WorkflowState.IMPLEMENTING,
+                WorkflowState.VERIFYING,
+                WorkflowState.REVIEWING,
+            ),
+        ),
+        (
+            "correction",
+            AttemptPhase.CORRECTING,
+            (
+                WorkflowState.IMPLEMENTING,
+                WorkflowState.VERIFYING,
+                WorkflowState.CORRECTION_PENDING,
+                WorkflowState.CORRECTING,
+            ),
+        ),
+    ],
+)
+def test_public_stage_boundaries_reject_unbound_attempt_before_execution(
+    tmp_path: Path,
+    stage_name: str,
+    phase: AttemptPhase,
+    states: tuple[WorkflowState, ...],
+) -> None:
+    repository = create_git_repo(tmp_path / "target")
+    config = make_config(repository)
+    ticket = tmp_path / "TA-REV-008.md"
+    ticket.write_text("# Ticket\n", encoding="utf-8")
+    snapshot = create_trusted_prepared_run(
+        config,
+        ticket,
+        runs_dir=tmp_path / "runs",
+        clock=fixed_clock,
+    )
+    active = snapshot.run_record
+    for state in states:
+        active = active.transition_to(
+            state,
+            updated_timestamp="2026-09-14T10:16:00Z",
+        )
+    save_run_record(active, snapshot.run_dir / "run.json")
+    record = start_attempt(
+        snapshot.run_dir,
+        phase=phase,
+        before_workspace_fingerprint=None,
+        clock=fixed_clock,
+    )
+    unbound = replace(StageAttempt.from_record(record), artifact_layout=None)
+    evidence_before = {
+        path.name: path.read_bytes()
+        for path in record.artifact_directory.iterdir()
+        if path.is_file()
+    }
+
+    class NeverAgentExecutor:
+        calls = 0
+
+        @property
+        def capabilities(self):
+            return frozenset()
+
+        def execute(self, request, *, on_invocation_start=None):
+            del request, on_invocation_start
+            self.calls += 1
+            raise AssertionError("provider must not be invoked")
+
+    class NeverVerificationRunner:
+        calls = 0
+
+        def run(self, command, *, timeout_seconds):
+            del command, timeout_seconds
+            self.calls += 1
+            raise AssertionError("verification runner must not be invoked")
+
+    executor = NeverAgentExecutor()
+    runner = NeverVerificationRunner()
+    causes = CorrectionCauseSet(
+        (
+            VerificationCorrectionCause(
+                gate_name="tests",
+                command=("python", "-m", "pytest"),
+                failure_summary="tests failed",
+                stdout_excerpt="",
+                stderr_excerpt="failure",
+                exit_code=1,
+                result_path=snapshot.run_dir / "verification.json",
+            ),
+        )
+    )
+
+    with pytest.raises(AttemptError, match="original bound artifact layout"):
+        if stage_name == "implementation":
+            run_implementation_stage(
+                config,
+                snapshot.run_dir,
+                agent_executor=executor,
+                attempt_record=unbound,
+                clock=fixed_clock,
+            )
+        elif stage_name == "verification":
+            run_verification_stage(
+                config,
+                snapshot.run_dir,
+                process_runner=runner,
+                attempt_record=unbound,
+                clock=fixed_clock,
+            )
+        elif stage_name == "review":
+            run_review_stage(
+                config,
+                snapshot.run_dir,
+                agent_executor=executor,
+                attempt_record=unbound,
+                mark_process_started=lambda: pytest.fail(
+                    "process-start callback must not run"
+                ),
+                clock=fixed_clock,
+            )
+        else:
+            run_correction_stage(
+                config,
+                snapshot.run_dir,
+                cause_set=causes,
+                agent_executor=executor,
+                attempt_record=unbound,
+                clock=fixed_clock,
+            )
+
+    assert executor.calls == 0
+    assert runner.calls == 0
+    assert {
+        path.name: path.read_bytes()
+        for path in record.artifact_directory.iterdir()
+        if path.is_file()
+    } == evidence_before
 
 
 def test_implementation_rejects_stage_attempt_from_an_unowned_directory(

@@ -153,10 +153,11 @@ directory, and the persisted run ID and ticket-copy path must agree with that
 directory before provider policy is restored or a repository lock is acquired.
 
 Attempt creation and update revalidate physical path ownership before writing.
-Lifecycle operations retain the configured runs root and run ID and fail closed
-without terminal persistence or reporting if that ownership is lost.
-The final patch and report use atomic replacement, so an existing file link is
-replaced rather than followed to another file.
+The run token is acquired as part of directory reservation, and an active attempt
+binds both its attempts root and attempt-directory identity across external calls.
+Lifecycle operations fail closed if any of those owned directories is replaced.
+Mutable artifacts use atomic replacement and immutable artifacts use exclusive
+creation, so an existing file link is replaced or rejected rather than followed.
 
 ## Persistence contract
 

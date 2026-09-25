@@ -1177,6 +1177,193 @@ def test_verification_runner_cannot_redirect_result_after_run_retarget(tmp_path)
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required")
+@pytest.mark.parametrize("replacement", ["attempts-root", "active-attempt"])
+def test_agent_attempt_storage_replacement_stops_without_writing_replacement(
+    tmp_path: Path,
+    replacement: str,
+) -> None:
+    repository = create_git_repo(tmp_path / "target")
+    config = make_config(repository)
+    runs_dir = tmp_path / "runs"
+    moved = tmp_path / f"moved-{replacement}"
+
+    class ReplacingAttemptRunner(CompletingCodexRunner):
+        replacement_path: Path | None = None
+        original_record: Path | None = None
+
+        def run(self, command, *, stdin, timeout_seconds, on_process_start=None):
+            if on_process_start is not None:
+                on_process_start()
+            run_dir = next(path for path in runs_dir.iterdir() if path.is_dir())
+            attempts_root = run_dir / "attempts"
+            active = next(
+                path
+                for path in attempts_root.iterdir()
+                if path.name.endswith("-implementation")
+            )
+            if replacement == "attempts-root":
+                attempts_root.rename(moved)
+                attempts_root.mkdir()
+                replacement_path = attempts_root / active.name
+                replacement_path.mkdir()
+                self.original_record = moved / active.name / "attempt.json"
+            else:
+                active.rename(moved)
+                active.mkdir()
+                replacement_path = active
+                self.original_record = moved / "attempt.json"
+            self.replacement_path = replacement_path
+            return super().run(
+                command,
+                stdin=stdin,
+                timeout_seconds=timeout_seconds,
+                on_process_start=None,
+            )
+
+    runner = ReplacingAttemptRunner()
+    result = run_ticket_lifecycle(
+        config,
+        _ticket(tmp_path),
+        runs_dir=runs_dir,
+        verification_runner=PassingVerificationRunner(),
+        **make_run_dependencies(config, process_runner=runner),
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state is not WorkflowState.READY_FOR_HUMAN
+    assert result.controller_error is not None
+    assert "ownership was lost" in result.controller_error
+    assert runner.replacement_path is not None
+    assert tuple(runner.replacement_path.iterdir()) == ()
+    assert runner.original_record is not None
+    assert json.loads(runner.original_record.read_text(encoding="utf-8"))["status"] == (
+        "STARTED"
+    )
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required")
+@pytest.mark.parametrize("replacement", ["attempts-root", "active-attempt"])
+def test_verification_attempt_storage_replacement_stops_before_result_write(
+    tmp_path: Path,
+    replacement: str,
+) -> None:
+    repository = create_git_repo(tmp_path / "target")
+    config = make_config(repository)
+    runs_dir = tmp_path / "runs"
+    moved = tmp_path / f"moved-verification-{replacement}"
+
+    class ReplacingVerificationRunner(PassingVerificationRunner):
+        replacement_path: Path | None = None
+        original_record: Path | None = None
+
+        def run(self, command, *, timeout_seconds):
+            self.calls += 1
+            if self.calls == 2:
+                run_dir = next(path for path in runs_dir.iterdir() if path.is_dir())
+                attempts_root = run_dir / "attempts"
+                active = next(
+                    path
+                    for path in attempts_root.iterdir()
+                    if path.name.endswith("-verification")
+                )
+                if replacement == "attempts-root":
+                    attempts_root.rename(moved)
+                    attempts_root.mkdir()
+                    replacement_path = attempts_root / active.name
+                    replacement_path.mkdir()
+                    self.original_record = moved / active.name / "attempt.json"
+                else:
+                    active.rename(moved)
+                    active.mkdir()
+                    replacement_path = active
+                    self.original_record = moved / "attempt.json"
+                self.replacement_path = replacement_path
+            del command, timeout_seconds
+            return VerificationProcessResult(0, "verification passed\n", "")
+
+    verification_runner = ReplacingVerificationRunner()
+    result = run_ticket_lifecycle(
+        config,
+        _ticket(tmp_path),
+        runs_dir=runs_dir,
+        verification_runner=verification_runner,
+        **make_run_dependencies(config, process_runner=CompletingCodexRunner()),
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state is not WorkflowState.READY_FOR_HUMAN
+    assert result.controller_error is not None
+    assert "ownership was lost" in result.controller_error
+    assert verification_runner.replacement_path is not None
+    assert tuple(verification_runner.replacement_path.iterdir()) == ()
+    assert verification_runner.original_record is not None
+    assert (
+        json.loads(verification_runner.original_record.read_text(encoding="utf-8"))[
+            "status"
+        ]
+        == "STARTED"
+    )
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required")
+def test_new_run_replacement_after_snapshot_is_rejected_before_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = create_git_repo(tmp_path / "target")
+    config = make_config(repository)
+    runs_dir = tmp_path / "runs"
+    moved_run = tmp_path / "created-run"
+    replacement_sentinel = b"replacement must remain untouched\n"
+    original_create = workflow_module.create_run_snapshot
+
+    def create_then_replace(*args, **kwargs):
+        snapshot = original_create(*args, **kwargs)
+        snapshot.run_dir.rename(moved_run)
+        snapshot.run_dir.mkdir()
+        snapshot.run_dir.joinpath("sentinel").write_bytes(replacement_sentinel)
+        return snapshot
+
+    monkeypatch.setattr(workflow_module, "create_run_snapshot", create_then_replace)
+    provider_runner = CompletingCodexRunner()
+    verification_runner = PassingVerificationRunner()
+
+    result = run_ticket_lifecycle(
+        config,
+        _ticket(tmp_path),
+        runs_dir=runs_dir,
+        verification_runner=verification_runner,
+        **make_run_dependencies(config, process_runner=provider_runner),
+        clock=fixed_clock,
+    )
+
+    assert result.run_record.state is WorkflowState.PREPARING
+    assert result.controller_error is not None
+    assert "ownership was lost" in result.controller_error
+    assert [item.name for item in result.safety_violations] == [
+        "run-directory-ownership"
+    ]
+    assert provider_runner.calls == 0
+    assert verification_runner.calls == 0
+    assert result.report_result is None
+    assert snapshot_repository(result.run_record) == repository.resolve()
+    assert snapshot_files(result.run_dir) == {"sentinel": replacement_sentinel}
+    assert load_run_record(moved_run / "run.json").state is WorkflowState.PREPARING
+
+
+def snapshot_repository(run_record) -> Path:
+    return Path(run_record.target_repository_path).resolve()
+
+
+def snapshot_files(directory: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(directory).as_posix(): path.read_bytes()
+        for path in directory.rglob("*")
+        if path.is_file()
+    }
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required")
 def test_terminal_report_describes_a_failed_baseline_attempt(tmp_path):
     repository = create_git_repo(tmp_path / "target")
     config = make_config(repository)

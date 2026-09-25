@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import re
-import shutil
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -22,6 +21,7 @@ from .models import (
 from .persistence import (
     CodecError,
     atomic_write_json,
+    exclusive_write_bytes,
     parse_timestamp,
     read_json_object,
     timestamp_now,
@@ -369,6 +369,7 @@ class RunRecord:
 @dataclass(frozen=True)
 class RunCreationResult:
     run_dir: Path
+    run_ownership: RunOwnership
     run_record: RunRecord
     baseline_record: BaselineRecord
     preflight_result: PreflightResult
@@ -401,9 +402,10 @@ def create_run_snapshot(
     )
     _validate_new_run_policy(config, baseline_record, resolved_policy)
     ticket_id = sanitize_ticket_id(source_ticket.path.stem)
-    run_id, run_dir = _reserve_run_directory(Path(runs_dir), timestamp, ticket_id)
+    run_ownership = _reserve_run_directory(Path(runs_dir), timestamp, ticket_id)
+    run_id = run_ownership.run_id
+    run_dir = run_ownership.validate()
     run_ticket_path = run_dir / RUN_TICKET_FILE
-    run_record_path = run_dir / RUN_RECORD_FILE
     baseline_record_path = run_dir / BASELINE_RECORD_FILE
 
     try:
@@ -423,17 +425,23 @@ def create_run_snapshot(
             created_timestamp=timestamp,
             updated_timestamp=timestamp,
         )
-        save_run_record(run_record, run_record_path)
+        save_owned_run_record(run_ownership, run_record)
 
-        _copy_ticket(source_ticket.contents, run_ticket_path)
+        _copy_ticket(
+            source_ticket.contents,
+            run_ticket_path,
+            run_ownership=run_ownership,
+        )
+        run_ownership.validate_descendant(baseline_record_path)
         save_baseline_record(baseline_record, baseline_record_path)
 
     except Exception:
-        _remove_incomplete_run_directory(run_dir)
+        _remove_incomplete_run_directory(run_ownership)
         raise
 
     return RunCreationResult(
         run_dir=run_dir,
+        run_ownership=run_ownership,
         run_record=run_record,
         baseline_record=baseline_record,
         preflight_result=preflight_result,
@@ -635,17 +643,15 @@ def _run_id_prefix(timestamp: str) -> str:
 
 def _reserve_run_directory(
     runs_dir: Path, timestamp: str, ticket_id: str
-) -> tuple[str, Path]:
+) -> RunOwnership:
     runs_dir.mkdir(parents=True, exist_ok=True)
     base_run_id = f"{_run_id_prefix(timestamp)}_{ticket_id}"
     for index in range(1, 1000):
         run_id = base_run_id if index == 1 else f"{base_run_id}_{index}"
-        run_dir = runs_dir / run_id
         try:
-            run_dir.mkdir()
+            return RunOwnership.reserve(runs_dir, run_id)
         except FileExistsError:
             continue
-        return run_id, run_dir
     raise RunError(f"Could not reserve a unique run directory for {base_run_id}.")
 
 
@@ -697,17 +703,29 @@ def _read_ticket(ticket_path: Path | str) -> _TicketSource:
     return _TicketSource(path=path, contents=contents)
 
 
-def _copy_ticket(contents: bytes, destination: Path) -> None:
-    if destination.exists():
-        raise RunError(f"Run ticket copy already exists: {destination}")
-    destination.write_bytes(contents)
+def _copy_ticket(
+    contents: bytes,
+    destination: Path,
+    *,
+    run_ownership: RunOwnership,
+) -> None:
+    run_ownership.validate_descendant(destination)
+    exclusive_write_bytes(destination, contents)
 
 
-def _remove_incomplete_run_directory(run_dir: Path) -> None:
+def _remove_incomplete_run_directory(ownership: RunOwnership) -> None:
     try:
-        shutil.rmtree(run_dir)
-    except FileNotFoundError:
+        run_dir = ownership.validate()
+    except RunOwnershipError:
         return
+    try:
+        for name in (RUN_RECORD_FILE, RUN_TICKET_FILE, BASELINE_RECORD_FILE):
+            (run_dir / name).unlink(missing_ok=True)
+        run_dir.rmdir()
+    except OSError:
+        # A directory whose contents or identity are no longer exactly the
+        # incomplete snapshot is left for human inspection.
+        pass
 
 
 def _load_json_object(path: Path) -> dict[str, Any]:

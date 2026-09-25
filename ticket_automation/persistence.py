@@ -8,7 +8,7 @@ import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TextIO, TypeAlias
+from typing import IO, Any, TextIO, TypeAlias
 
 JsonScalar: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
@@ -46,6 +46,42 @@ def atomic_write_text(path: Path | str, value: str) -> None:
     _atomic_write_text_payload(Path(path), write_payload, description="text")
 
 
+def exclusive_write_text(path: Path | str, value: str) -> None:
+    """Create one immutable UTF-8 artifact without following an existing entry."""
+
+    if not isinstance(value, str):
+        raise TypeError("text artifact value must be a string.")
+    destination = Path(path)
+
+    def write_payload(output: IO[Any]) -> None:
+        output.write(value)
+
+    _exclusive_write_payload(
+        destination,
+        write_payload,
+        binary=False,
+        description="text",
+    )
+
+
+def exclusive_write_bytes(path: Path | str, value: bytes) -> None:
+    """Create one immutable byte artifact without following an existing entry."""
+
+    if not isinstance(value, bytes):
+        raise TypeError("byte artifact value must be bytes.")
+    destination = Path(path)
+
+    def write_payload(output: IO[Any]) -> None:
+        output.write(value)
+
+    _exclusive_write_payload(
+        destination,
+        write_payload,
+        binary=True,
+        description="byte",
+    )
+
+
 def _atomic_write_text_payload(
     destination: Path,
     write_payload: Callable[[TextIO], None],
@@ -81,6 +117,45 @@ def _atomic_write_text_payload(
             raise
         raise PersistenceError(
             f"Could not atomically write {description} {destination}: {error}"
+        ) from error
+
+
+def _exclusive_write_payload(
+    destination: Path,
+    write_payload: Callable[[IO[Any]], None],
+    *,
+    binary: bool,
+    description: str,
+) -> None:
+    """Create a new file entry exclusively and durably, never opening a target."""
+
+    descriptor = -1
+    created = False
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if binary and hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    try:
+        descriptor = os.open(destination, flags, 0o600)
+        created = True
+        mode = "wb" if binary else "w"
+        kwargs = {} if binary else {"encoding": "utf-8", "newline": "\n"}
+        with os.fdopen(descriptor, mode, **kwargs) as output:
+            descriptor = -1
+            write_payload(output)
+            output.flush()
+            os.fsync(output.fileno())
+        _sync_directory(destination.parent)
+    except BaseException as error:
+        if descriptor != -1:
+            os.close(descriptor)
+        if created:
+            destination.unlink(missing_ok=True)
+        if not isinstance(error, Exception):
+            raise
+        if isinstance(error, PersistenceError):
+            raise
+        raise PersistenceError(
+            f"Could not exclusively create {description} {destination}: {error}"
         ) from error
 
 
@@ -163,6 +238,8 @@ __all__ = [
     "PersistenceError",
     "atomic_write_json",
     "atomic_write_text",
+    "exclusive_write_bytes",
+    "exclusive_write_text",
     "format_timestamp",
     "parse_timestamp",
     "read_json",

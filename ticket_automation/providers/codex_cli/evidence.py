@@ -11,7 +11,12 @@ from ...application.agent_execution import (
     ArtifactRole,
     AttemptArtifactLayout,
 )
-from ...persistence import JsonValue, atomic_write_json, atomic_write_text
+from ...persistence import (
+    JsonValue,
+    atomic_write_json,
+    atomic_write_text,
+    exclusive_write_text,
+)
 
 PROMPT_ARTIFACT = "prompt.md"
 EVENTS_ARTIFACT = "events.jsonl"
@@ -90,10 +95,11 @@ class CodexArtifactPaths:
 def prepare(paths: CodexArtifactPaths, prompt: str) -> None:
     paths.revalidate()
     paths.directory.mkdir(parents=True, exist_ok=True)
+    paths.revalidate()
     paths.result.unlink(missing_ok=True)
-    paths.prompt.write_text(prompt, encoding="utf-8", newline="\n")
-    paths.events.write_text("", encoding="utf-8", newline="\n")
-    paths.stderr.write_text("", encoding="utf-8", newline="\n")
+    exclusive_write_text(paths.prompt, prompt)
+    atomic_write_text(paths.events, "")
+    atomic_write_text(paths.stderr, "")
 
 
 def write_process_output(
@@ -103,8 +109,8 @@ def write_process_output(
     stderr: str,
 ) -> None:
     paths.revalidate()
-    paths.events.write_text(stdout, encoding="utf-8", newline="\n")
-    paths.stderr.write_text(stderr, encoding="utf-8", newline="\n")
+    atomic_write_text(paths.events, stdout)
+    atomic_write_text(paths.stderr, stderr)
 
 
 def write_execution(paths: CodexArtifactPaths, record: Mapping[str, JsonValue]) -> None:

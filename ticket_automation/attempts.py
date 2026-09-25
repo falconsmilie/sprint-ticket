@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 import tempfile
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -72,13 +72,13 @@ class AttemptMetadata:
     after_workspace_error: str | None = None
 
     def __post_init__(self) -> None:
-        for field, value in (
+        for field_name, value in (
             ("controller_message", self.controller_message),
             ("before_workspace_error", self.before_workspace_error),
             ("after_workspace_error", self.after_workspace_error),
         ):
             if value is not None and (not isinstance(value, str) or not value.strip()):
-                raise AttemptError(f"Attempt metadata {field} must be non-empty.")
+                raise AttemptError(f"Attempt metadata {field_name} must be non-empty.")
 
     def to_dict(self) -> dict[str, str]:
         return {
@@ -106,6 +106,11 @@ class AttemptRecord:
     execution_path: str | None
     metadata: AttemptMetadata
     artifact_directory: Path
+    artifact_layout: AttemptArtifactLayout | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     schema_version: int = ATTEMPT_RECORD_SCHEMA_VERSION
     format: str = ATTEMPT_RECORD_FORMAT
 
@@ -147,18 +152,34 @@ class StageAttempt:
     before_workspace_fingerprint: str | None
     result_path: str
     artifact_directory: Path
+    artifact_layout: AttemptArtifactLayout | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         _validate_stage_attempt(self)
 
     @classmethod
-    def from_record(cls, record: AttemptRecord) -> StageAttempt:
+    def from_record(
+        cls,
+        record: AttemptRecord,
+        *,
+        run_ownership: RunOwnership | None = None,
+    ) -> StageAttempt:
+        layout = attempt_artifact_layout(
+            record.artifact_directory.parent.parent,
+            record,
+            run_ownership=run_ownership,
+        )
         return cls(
             sequence=record.sequence,
             phase=record.phase,
             before_workspace_fingerprint=record.before_workspace_fingerprint,
             result_path=record.result_path,
             artifact_directory=record.artifact_directory,
+            artifact_layout=layout,
         )
 
 
@@ -185,6 +206,7 @@ def require_stage_attempt(
         run_ownership=run_ownership,
     )
     persisted = _load_attempt(attempt_layout.path(ATTEMPT_RECORD_FILE))
+    persisted = replace(persisted, artifact_layout=attempt_layout)
     persisted_layout = attempt_artifact_layout(
         run_dir,
         persisted,
@@ -201,7 +223,7 @@ def require_stage_attempt(
         or persisted_layout.attempt_root != attempt_layout.attempt_root
     ):
         raise AttemptError("Stage attempt identity does not match persisted evidence.")
-    return attempt
+    return replace(attempt, artifact_layout=attempt_layout)
 
 
 class AttemptError(RuntimeError):
@@ -281,7 +303,14 @@ def start_attempt(
         except Exception:
             _remove_temporary_attempt_directory(temporary_directory)
             raise
-        return record
+        return replace(
+            record,
+            artifact_layout=AttemptArtifactLayout.for_attempt(
+                run_path,
+                directory,
+                run_ownership=run_ownership,
+            ),
+        )
 
 
 def save_attempt(
@@ -300,6 +329,13 @@ def save_attempt(
         path = layout.path(ATTEMPT_RECORD_FILE)
     except AgentContractError as error:
         raise AttemptError(f"Attempt record confinement failed: {error}") from error
+    if not layout.artifact_file_exists(ATTEMPT_RECORD_FILE):
+        raise AttemptError(
+            "Attempt update requires the original persisted attempt record."
+        )
+    persisted = _load_attempt(path)
+    if not _same_attempt_identity(persisted, record):
+        raise AttemptError("Persisted attempt identity changed before update.")
     atomic_write_json(path, record.to_dict())
 
 
@@ -421,6 +457,7 @@ def load_attempt_records(
             if not layout.artifact_file_exists(ATTEMPT_RECORD_FILE):
                 continue
             record = _load_attempt(path)
+            record = replace(record, artifact_layout=layout)
             attempt_artifact_layout(
                 run_path,
                 record,
@@ -471,7 +508,7 @@ def latest_writable_attempt(run_dir: Path | str) -> AttemptRecord | None:
 
 def complete_stage_attempt(
     run_dir: Path | str,
-    attempt: AttemptRecord,
+    attempt: AttemptRecord | StageAttempt,
     *,
     stage_outcome: StageOutcome,
     after_workspace_fingerprint: str | None,
@@ -482,8 +519,8 @@ def complete_stage_attempt(
 ) -> AttemptRecord:
     """Complete the exact trusted attempt started by lifecycle orchestration."""
 
-    if not isinstance(attempt, AttemptRecord):
-        raise AttemptError("attempt must be an AttemptRecord.")
+    if not isinstance(attempt, AttemptRecord | StageAttempt):
+        raise AttemptError("attempt must be an AttemptRecord or StageAttempt.")
     if not isinstance(stage_outcome, StageOutcome):
         raise AttemptError("stage_outcome must be a StageOutcome value.")
     attempt_layout = attempt_artifact_layout(
@@ -492,6 +529,7 @@ def complete_stage_attempt(
         run_ownership=run_ownership,
     )
     persisted = _load_attempt(attempt_layout.path(ATTEMPT_RECORD_FILE))
+    persisted = replace(persisted, artifact_layout=attempt_layout)
     persisted_layout = attempt_artifact_layout(
         run_dir,
         persisted,
@@ -570,29 +608,27 @@ def attempt_artifact_layout(
             raise
         raise AttemptError(f"Attempt artifact confinement failed: {error}") from error
     expected_directory = run_path / ATTEMPTS_DIR_NAME / _directory_name(record)
-    try:
-        expected_layout = AttemptArtifactLayout.for_attempt(
-            run_path,
-            expected_directory,
-            run_ownership=run_ownership,
+    bound_layout = record.artifact_layout
+    if bound_layout is None:
+        raise AttemptError(
+            "Attempt artifact access requires the original bound artifact layout."
         )
-    except AgentContractError as error:
-        raise AttemptError(f"Attempt artifact confinement failed: {error}") from error
+    if not isinstance(bound_layout, AttemptArtifactLayout):
+        raise AttemptError("Attempt artifact layout has the wrong type.")
     try:
-        record_layout = AttemptArtifactLayout.for_attempt(
-            run_path,
-            record.artifact_directory,
-            run_ownership=run_ownership,
-        )
+        bound_layout.revalidate()
     except AgentContractError as error:
         raise AttemptError(
-            f"Attempt record does not belong to the supplied run directory: {error}"
+            f"Attempt artifact confinement in the owning run was lost: {error}"
         ) from error
-    if record_layout.attempt_root != expected_layout.attempt_root:
+    if (
+        bound_layout.run_root != run_path
+        or bound_layout.attempt_root != expected_directory
+    ):
         raise AttemptError(
-            "Attempt record does not belong to the supplied run directory."
+            "Attempt artifact layout does not match the persisted attempt identity."
         )
-    return expected_layout
+    return bound_layout
 
 
 def _validated_run_path(
@@ -755,6 +791,7 @@ def _validate_record(record: AttemptRecord) -> None:
         raise AttemptError("Attempt metadata must be an AttemptMetadata value.")
     if record.artifact_directory.name != _directory_name(record):
         raise AttemptError("Attempt directory does not match its sequence and phase.")
+    _validate_bound_layout(record)
 
 
 def _validate_stage_attempt(attempt: StageAttempt) -> None:
@@ -776,6 +813,30 @@ def _validate_stage_attempt(attempt: StageAttempt) -> None:
         raise AttemptError("Attempt artifact_directory must be a Path.")
     if attempt.artifact_directory.name != _directory_name(attempt):
         raise AttemptError("Attempt directory does not match its sequence and phase.")
+
+
+def _validate_bound_layout(record: AttemptRecord | StageAttempt) -> None:
+    layout = record.artifact_layout
+    if layout is None:
+        return
+    if not isinstance(layout, AttemptArtifactLayout):
+        raise AttemptError("Attempt artifact_layout must be an AttemptArtifactLayout.")
+    expected_run = record.artifact_directory.parent.parent.absolute()
+    if (
+        layout.run_root != expected_run
+        or layout.attempt_root != record.artifact_directory.absolute()
+    ):
+        raise AttemptError("Attempt artifact_layout does not match its directory.")
+
+
+def _same_attempt_identity(left: AttemptRecord, right: AttemptRecord) -> bool:
+    return (
+        left.sequence == right.sequence
+        and left.phase is right.phase
+        and left.started_at == right.started_at
+        and left.result_path == right.result_path
+        and left.artifact_directory == right.artifact_directory
+    )
 
 
 def _directory_name(record: AttemptRecord | StageAttempt) -> str:

@@ -36,6 +36,7 @@ from .application.guarded_writable_operation import (
 from .attempts import (
     AttemptMetadata,
     StageAttempt,
+    attempt_artifact_layout,
     complete_stage_attempt,
     require_stage_attempt,
     start_attempt,
@@ -57,6 +58,7 @@ from .models import (
     VerificationStatus,
     WorkflowState,
 )
+from .persistence import PersistenceError, exclusive_write_text
 from .persistence_codecs import (
     write_implementation_result,
     write_stage_message,
@@ -329,6 +331,11 @@ def _run_correction_stage(
     correction_round = run_record.current_correction_round + 1
     repository = GitRepository(Path(run_record.target_repository_path))
     artifact_directory = attempt.artifact_directory
+    artifact_layout = attempt_artifact_layout(
+        run_path,
+        attempt,
+        run_ownership=run_ownership,
+    )
     baseline_identity = WritableBaseline(
         repository_path=repository.path,
         branch=run_record.starting_branch,
@@ -345,6 +352,7 @@ def _run_correction_stage(
             GuardedWritableRejectionRequest(
                 phase=AttemptPhase.CORRECTING,
                 artifact_directory=artifact_directory,
+                artifact_layout=artifact_layout,
                 baseline=baseline_identity,
                 failure_message=message,
             )
@@ -356,6 +364,7 @@ def _run_correction_stage(
             correction_round=correction_round,
             ticket_path=None,
             artifact_directory=artifact_directory,
+            artifact_layout=artifact_layout,
             execution=None,
             agent_result=None,
             safety_violations=_correction_violations(audit.safety_violations),
@@ -380,6 +389,7 @@ def _run_correction_stage(
             GuardedWritableRejectionRequest(
                 phase=AttemptPhase.CORRECTING,
                 artifact_directory=artifact_directory,
+                artifact_layout=artifact_layout,
                 baseline=baseline_identity,
                 failure_message=evidence_problem,
                 safety_violations=(
@@ -399,6 +409,7 @@ def _run_correction_stage(
             correction_round=correction_round,
             ticket_path=None,
             artifact_directory=artifact_directory,
+            artifact_layout=artifact_layout,
             execution=None,
             agent_result=None,
             safety_violations=_correction_violations(audit.safety_violations),
@@ -422,6 +433,7 @@ def _run_correction_stage(
             GuardedWritableRejectionRequest(
                 phase=AttemptPhase.CORRECTING,
                 artifact_directory=artifact_directory,
+                artifact_layout=artifact_layout,
                 baseline=baseline_identity,
                 failure_message=(
                     "Repository no longer matches the recorded correction baseline."
@@ -444,6 +456,7 @@ def _run_correction_stage(
             correction_round=correction_round,
             ticket_path=None,
             artifact_directory=artifact_directory,
+            artifact_layout=artifact_layout,
             execution=None,
             agent_result=None,
             safety_violations=_correction_violations(audit.safety_violations),
@@ -471,6 +484,7 @@ def _run_correction_stage(
         )
         ticket_path = _write_correction_ticket(
             artifact_directory=artifact_directory,
+            artifact_layout=artifact_layout,
             ticket_id=active_record.ticket_id,
             round_number=correction_round,
             markdown=ticket_markdown,
@@ -495,6 +509,7 @@ def _run_correction_stage(
             GuardedWritableRejectionRequest(
                 phase=AttemptPhase.CORRECTING,
                 artifact_directory=artifact_directory,
+                artifact_layout=artifact_layout,
                 baseline=WritableBaseline(
                     repository_path=repository.path,
                     branch=active_record.starting_branch,
@@ -511,6 +526,7 @@ def _run_correction_stage(
             correction_round=correction_round,
             ticket_path=ticket_path,
             artifact_directory=artifact_directory,
+            artifact_layout=artifact_layout,
             execution=None,
             agent_result=None,
             safety_violations=_correction_violations(audit.safety_violations),
@@ -530,11 +546,7 @@ def _run_correction_stage(
         prompt=prompt,
         result_contract=CORRECTION_RESULT_CONTRACT,
         artifact_directory=artifact_directory,
-        artifact_layout=AttemptArtifactLayout.for_attempt(
-            run_path,
-            artifact_directory,
-            run_ownership=run_ownership,
-        ),
+        artifact_layout=artifact_layout,
         policy=run_record.resolved_policy.task_policy(
             AgentTaskKind.CORRECTION
         ).execution_policy,
@@ -576,6 +588,7 @@ def _run_correction_stage(
             correction_round=correction_round,
             ticket_path=ticket_path,
             artifact_directory=artifact_directory,
+            artifact_layout=artifact_layout,
             execution=audit.execution,
             agent_result=(
                 audit.execution.result
@@ -622,6 +635,7 @@ def _run_correction_stage(
             correction_round=correction_round,
             ticket_path=ticket_path,
             artifact_directory=artifact_directory,
+            artifact_layout=artifact_layout,
             execution=audit.execution,
             agent_result=None,
             safety_violations=safety_violations,
@@ -648,6 +662,7 @@ def _run_correction_stage(
             correction_round=correction_round,
             ticket_path=ticket_path,
             artifact_directory=artifact_directory,
+            artifact_layout=artifact_layout,
             execution=execution,
             agent_result=agent_result,
             safety_violations=(),
@@ -666,6 +681,7 @@ def _run_correction_stage(
         correction_round=correction_round,
         ticket_path=ticket_path,
         artifact_directory=artifact_directory,
+        artifact_layout=artifact_layout,
         execution=execution,
         agent_result=agent_result,
         safety_violations=(),
@@ -746,6 +762,7 @@ def _finish(
     correction_round: int,
     ticket_path: Path | None,
     artifact_directory: Path,
+    artifact_layout: AttemptArtifactLayout,
     execution: AgentExecution[ImplementationResult] | None,
     agent_result: ImplementationResult | None,
     safety_violations: tuple[CorrectionSafetyViolation, ...],
@@ -761,8 +778,9 @@ def _finish(
     if run_ownership is not None:
         run_ownership.validate_run_path(run_dir)
         run_ownership.validate_descendant(artifact_directory)
+    artifact_layout.revalidate()
     _write_agent_result(
-        artifact_directory,
+        artifact_layout,
         agent_result,
         outcome=outcome,
         controller_message=controller_message,
@@ -794,13 +812,13 @@ def _finish(
 
 
 def _write_agent_result(
-    artifact_directory: Path,
+    artifact_layout: AttemptArtifactLayout,
     result: ImplementationResult | None,
     *,
     outcome: StageOutcome,
     controller_message: str,
 ) -> None:
-    path = artifact_directory / ATTEMPT_RESULT_ARTIFACT_NAME
+    path = artifact_layout.path(ATTEMPT_RESULT_ARTIFACT_NAME)
     if result is not None:
         write_implementation_result(path, result)
     else:
@@ -810,17 +828,26 @@ def _write_agent_result(
 def _write_correction_ticket(
     *,
     artifact_directory: Path,
+    artifact_layout: AttemptArtifactLayout,
     ticket_id: str,
     round_number: int,
     markdown: str,
     run_ownership: RunOwnership | None = None,
 ) -> Path:
-    path = artifact_directory / CORRECTION_TICKET_FILE
+    artifact_layout.revalidate()
+    if artifact_layout.attempt_root != artifact_directory.resolve():
+        raise CorrectionError(
+            "Correction ticket layout does not match its artifact directory."
+        )
+    path = artifact_layout.path(CORRECTION_TICKET_FILE)
     if run_ownership is not None:
         run_ownership.validate_descendant(path)
-    if path.exists():
-        raise CorrectionError(f"Correction ticket already exists: {path}")
-    path.write_text(markdown, encoding="utf-8", newline="\n")
+    try:
+        exclusive_write_text(path, markdown)
+    except PersistenceError as error:
+        raise CorrectionError(
+            f"Could not create correction ticket {path}: {error}"
+        ) from error
     return path
 
 

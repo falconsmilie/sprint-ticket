@@ -21,6 +21,7 @@ from .application.agent_execution import (
 from .attempts import (
     AttemptMetadata,
     StageAttempt,
+    attempt_artifact_layout,
     attempt_result_path,
     complete_stage_attempt,
     latest_attempt,
@@ -226,6 +227,11 @@ def _run_review_stage(
         phase=AttemptPhase.REVIEWING,
         run_ownership=run_ownership,
     )
+    artifact_layout = attempt_artifact_layout(
+        run_path,
+        attempt,
+        run_ownership=run_ownership,
+    )
 
     baseline_record = load_baseline_record(run_path / BASELINE_RECORD_FILE)
     if baseline_record.branch != run_record.starting_branch:
@@ -260,6 +266,7 @@ def _run_review_stage(
             run_record=run_record,
             run_dir=run_path,
             artifact_directory=artifact_directory,
+            artifact_layout=artifact_layout,
             execution=None,
             review_result=None,
             safety_violations=(snapshot_error,),
@@ -279,6 +286,7 @@ def _run_review_stage(
             run_record=run_record,
             run_dir=run_path,
             artifact_directory=artifact_directory,
+            artifact_layout=artifact_layout,
             execution=None,
             review_result=None,
             safety_violations=starting_violations,
@@ -299,6 +307,7 @@ def _run_review_stage(
             run_record=run_record,
             run_dir=run_path,
             artifact_directory=artifact_directory,
+            artifact_layout=artifact_layout,
             execution=None,
             review_result=None,
             safety_violations=source_violations,
@@ -326,6 +335,7 @@ def _run_review_stage(
             run_record=run_record,
             run_dir=run_path,
             artifact_directory=artifact_directory,
+            artifact_layout=artifact_layout,
             execution=None,
             review_result=None,
             safety_violations=(
@@ -352,11 +362,7 @@ def _run_review_stage(
         prompt=prompt,
         result_contract=REVIEW_RESULT_CONTRACT,
         artifact_directory=artifact_directory,
-        artifact_layout=AttemptArtifactLayout.for_attempt(
-            run_path,
-            artifact_directory,
-            run_ownership=run_ownership,
-        ),
+        artifact_layout=artifact_layout,
         policy=run_record.resolved_policy.task_policy(
             AgentTaskKind.REVIEW
         ).execution_policy,
@@ -368,10 +374,8 @@ def _run_review_stage(
         request,
         on_invocation_start=mark_invocation_started,
     )
-    if run_ownership is not None:
-        run_ownership.validate_run_path(run_path)
-        run_ownership.validate_descendant(artifact_directory)
     assert request.artifact_layout is not None
+    request.artifact_layout.revalidate()
     write_execution_evidence(
         request.artifact_layout,
         evidence_from_execution(request, execution),
@@ -400,6 +404,7 @@ def _run_review_stage(
             run_record=run_record,
             run_dir=run_path,
             artifact_directory=artifact_directory,
+            artifact_layout=artifact_layout,
             execution=execution,
             review_result=None,
             safety_violations=safety_violations,
@@ -420,6 +425,7 @@ def _run_review_stage(
             run_record=run_record,
             run_dir=run_path,
             artifact_directory=artifact_directory,
+            artifact_layout=artifact_layout,
             execution=execution,
             review_result=review_result,
             safety_violations=safety_violations,
@@ -433,6 +439,7 @@ def _run_review_stage(
         run_record=run_record,
         run_dir=run_path,
         artifact_directory=artifact_directory,
+        artifact_layout=artifact_layout,
         execution=execution,
         review_result=review_result,
         run_ownership=run_ownership,
@@ -444,6 +451,7 @@ def _finish_valid_review_result(
     run_record: RunRecord,
     run_dir: Path,
     artifact_directory: Path,
+    artifact_layout: AttemptArtifactLayout,
     execution: AgentExecution[ReviewResult] | None,
     review_result: ReviewResult,
     run_ownership: RunOwnership | None,
@@ -479,6 +487,7 @@ def _finish_valid_review_result(
         run_record=run_record,
         run_dir=run_dir,
         artifact_directory=artifact_directory,
+        artifact_layout=artifact_layout,
         execution=execution,
         review_result=review_result,
         safety_violations=(),
@@ -494,6 +503,7 @@ def _finish(
     run_record: RunRecord,
     run_dir: Path,
     artifact_directory: Path,
+    artifact_layout: AttemptArtifactLayout,
     execution: AgentExecution[ReviewResult] | None,
     review_result: ReviewResult | None,
     safety_violations: tuple[ReviewSafetyViolation, ...],
@@ -505,8 +515,9 @@ def _finish(
     if run_ownership is not None:
         run_ownership.validate_run_path(run_dir)
         run_ownership.validate_descendant(artifact_directory)
+    artifact_layout.revalidate()
     _write_review_result(
-        artifact_directory,
+        artifact_layout,
         review_result,
         outcome=outcome,
         controller_message=controller_message,
@@ -539,13 +550,13 @@ def _finish(
 
 
 def _write_review_result(
-    artifact_directory: Path,
+    artifact_layout: AttemptArtifactLayout,
     result: ReviewResult | None,
     *,
     outcome: StageOutcome,
     controller_message: str,
 ) -> None:
-    path = artifact_directory / ATTEMPT_RESULT_ARTIFACT_NAME
+    path = artifact_layout.path(ATTEMPT_RESULT_ARTIFACT_NAME)
     if result is not None:
         write_review_result(path, result)
     else:

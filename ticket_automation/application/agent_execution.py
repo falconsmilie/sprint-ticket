@@ -160,6 +160,21 @@ class AttemptArtifactLayout:
     run_root: Path
     attempt_root: Path
     run_ownership: RunOwnership | None = None
+    _run_root_identity: tuple[int, int] | None = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _attempts_root_identity: tuple[int, int] | None = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _attempt_root_identity: tuple[int, int] | None = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     @classmethod
     def attempts_root(cls, run_root: Path) -> Path:
@@ -203,6 +218,13 @@ class AttemptArtifactLayout:
             raise AgentContractError(
                 "attempt artifact root must be a direct child of the owning run attempts root."
             )
+        if (
+            layout._attempts_root_identity is None
+            or layout._attempt_root_identity is None
+        ):
+            raise AgentContractError(
+                "attempts root and attempt artifact root must already exist."
+            )
         return layout
 
     def __post_init__(self) -> None:
@@ -234,19 +256,97 @@ class AttemptArtifactLayout:
             )
         object.__setattr__(self, "run_root", run_root)
         object.__setattr__(self, "attempt_root", attempt_root)
+        object.__setattr__(
+            self,
+            "_run_root_identity",
+            _directory_identity(run_root, description="run root", allow_missing=True),
+        )
+        object.__setattr__(
+            self,
+            "_attempts_root_identity",
+            _directory_identity(
+                attempt_root.parent,
+                description="attempts root",
+                allow_missing=True,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "_attempt_root_identity",
+            _directory_identity(
+                attempt_root,
+                description="attempt artifact root",
+                allow_missing=True,
+            ),
+        )
 
     def revalidate(self) -> None:
         """Revalidate controller-owned roots after an external or long-running call."""
 
-        if self.run_ownership is None:
-            _resolve_artifact_path(self.run_root, description="run root")
-            _resolve_artifact_path(
-                self.attempt_root,
-                description="attempt artifact root",
+        if self.run_ownership is not None:
+            self.run_ownership.validate_run_path(self.run_root)
+            self.run_ownership.validate_descendant(self.attempt_root)
+        current_run = _resolve_artifact_path(self.run_root, description="run root")
+        current_attempts = _resolve_artifact_path(
+            self.attempt_root.parent,
+            description="attempts root",
+        )
+        current_attempt = _resolve_artifact_path(
+            self.attempt_root,
+            description="attempt artifact root",
+        )
+        if current_run != self.run_root:
+            raise AgentContractError("run root was retargeted after layout binding.")
+        if current_attempts != self.attempt_root.parent:
+            raise AgentContractError(
+                "attempts root was retargeted after layout binding."
             )
+        if current_attempt != self.attempt_root:
+            raise AgentContractError(
+                "attempt artifact root was retargeted after layout binding."
+            )
+        self._revalidate_identity(
+            current_run,
+            field_name="_run_root_identity",
+            description="run root",
+            allow_missing=True,
+        )
+        self._revalidate_identity(
+            current_attempts,
+            field_name="_attempts_root_identity",
+            description="attempts root",
+            allow_missing=True,
+        )
+        self._revalidate_identity(
+            current_attempt,
+            field_name="_attempt_root_identity",
+            description="attempt artifact root",
+            allow_missing=True,
+        )
+
+    def _revalidate_identity(
+        self,
+        path: Path,
+        *,
+        field_name: str,
+        description: str,
+        allow_missing: bool,
+    ) -> None:
+        current = _directory_identity(
+            path,
+            description=description,
+            allow_missing=allow_missing,
+        )
+        expected = getattr(self, field_name)
+        if expected is None:
+            if current is not None:
+                object.__setattr__(self, field_name, current)
             return
-        self.run_ownership.validate_run_path(self.run_root)
-        self.run_ownership.validate_descendant(self.attempt_root)
+        if current != expected:
+            state = "missing" if current is None else "replaced"
+            raise AgentContractError(
+                f"{description} ownership was lost; the directory was {state}."
+            )
 
     @property
     def attempt_id(self) -> str:
@@ -458,8 +558,11 @@ class AgentExecutionRequest(Generic[ResultT_co]):
             raise AgentContractError("artifact_directory must be a Path.")
         layout = self.artifact_layout
         if layout is None:
+            inferred_run_root = self.artifact_directory.parent
+            if inferred_run_root.name == ATTEMPTS_DIR_NAME:
+                inferred_run_root = inferred_run_root.parent
             layout = AttemptArtifactLayout(
-                self.artifact_directory.parent,
+                inferred_run_root,
                 self.artifact_directory,
             )
             object.__setattr__(self, "artifact_layout", layout)
@@ -745,6 +848,27 @@ def _inspect_artifact_path(path: Path, *, description: str) -> os.stat_result | 
         raise AgentContractError(
             f"Could not inspect {description} safely: {error}"
         ) from error
+
+
+def _directory_identity(
+    path: Path,
+    *,
+    description: str,
+    allow_missing: bool,
+) -> tuple[int, int] | None:
+    try:
+        details = path.stat()
+    except FileNotFoundError as error:
+        if allow_missing:
+            return None
+        raise AgentContractError(f"{description} does not exist: {path}") from error
+    except OSError as error:
+        raise AgentContractError(
+            f"Could not inspect {description} identity safely: {error}"
+        ) from error
+    if not S_ISDIR(details.st_mode):
+        raise AgentContractError(f"{description} must be a directory: {path}")
+    return details.st_dev, details.st_ino
 
 
 def _validated_artifact_path(value: object) -> PurePosixPath:

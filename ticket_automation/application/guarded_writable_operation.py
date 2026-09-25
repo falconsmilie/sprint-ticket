@@ -13,11 +13,13 @@ from ..application.agent_execution import (
     EXECUTION_EVIDENCE_FILE,
     WORKSPACE_GUARD_FILE,
     AgentCapability,
+    AgentContractError,
     AgentExecution,
     AgentExecutionRequest,
     AgentExecutor,
     AgentFailureCategory,
     AgentTaskKind,
+    AttemptArtifactLayout,
     InvocationStart,
     RepositoryAccess,
 )
@@ -149,6 +151,7 @@ class GuardedWritableRejectionRequest:
     artifact_directory: Path
     baseline: WritableBaseline
     failure_message: str
+    artifact_layout: AttemptArtifactLayout
     safety_violations: tuple[WritableSafetyViolation, ...] = ()
 
     def __post_init__(self) -> None:
@@ -166,6 +169,13 @@ class GuardedWritableRejectionRequest:
             isinstance(item, WritableSafetyViolation) for item in self.safety_violations
         ):
             raise TypeError("safety_violations must be a tuple of safety violations.")
+        if not isinstance(self.artifact_layout, AttemptArtifactLayout):
+            raise TypeError("artifact_layout must be an AttemptArtifactLayout.")
+        self.artifact_layout.revalidate()
+        if self.artifact_layout.attempt_root != self.artifact_directory.resolve():
+            raise ValueError(
+                "artifact_layout attempt root must match artifact_directory."
+            )
 
 
 @dataclass(frozen=True)
@@ -360,12 +370,16 @@ def _require_persisted_guard(audit: WritableAudit[TaskResult]) -> None:
 @dataclass
 class _AttemptTracker:
     artifact_directory: Path
+    artifact_layout: AttemptArtifactLayout
     record: AttemptRecord | None
     before_snapshot: WorkspaceSnapshot | None
     before_error: str | None
     run_ownership: RunOwnership | None = None
     process_started: bool = False
     evidence_errors: list[str] = field(default_factory=list)
+
+    def revalidate(self) -> None:
+        self.artifact_layout.revalidate()
 
     @property
     def before_complete(self) -> bool:
@@ -407,6 +421,7 @@ class _AttemptTracker:
     def _update(self, *, propagate_interrupt: bool = False, **changes: object) -> None:
         if self.record is None:
             return
+        self.revalidate()
         try:
             self.record = update_attempt(
                 self.record,
@@ -416,6 +431,9 @@ class _AttemptTracker:
         except RunOwnershipError:
             raise
         except BaseException as error:
+            # If the update raced with replacement of the bound ledger, ownership
+            # loss is authoritative and must not be reduced to an evidence warning.
+            self.revalidate()
             self.evidence_errors.append(
                 f"attempt-ledger: {type(error).__name__}: {error}"
             )
@@ -443,12 +461,18 @@ class GuardedWritableOperation:
         self,
         request: GuardedWritableRequest[ResultT],
     ) -> GuardedWritableOutcome[ResultT]:
-        self._validate_run_artifacts(request.execution_request.artifact_directory)
+        layout = request.execution_request.artifact_layout
+        assert layout is not None
+        self._validate_run_artifacts(
+            request.execution_request.artifact_directory,
+            artifact_layout=layout,
+        )
         repository = GitRepository(request.baseline.repository_path)
         tracker, environment_before = self._capture_before(
             repository,
             phase=request.phase,
             artifact_directory=request.execution_request.artifact_directory,
+            artifact_layout=layout,
         )
         starting_violations = _starting_violations(
             tracker.before_snapshot,
@@ -511,27 +535,34 @@ class GuardedWritableOperation:
                 tracker.record_started(
                     execution.invocation_start is InvocationStart.STARTED
                 )
-            self._validate_run_artifacts(request.execution_request.artifact_directory)
+            self._validate_run_artifacts(
+                request.execution_request.artifact_directory,
+                artifact_layout=layout,
+            )
             contract_problem = _execution_contract_problem(
                 execution, request.execution_request
             )
             if contract_problem is not None:
                 raise ValueError(contract_problem)
-            layout = request.execution_request.artifact_layout
-            assert layout is not None
             write_execution_evidence(
                 layout,
                 evidence_from_execution(request.execution_request, execution),
             )
+            layout.revalidate()
             tracker._update(execution_path=EXECUTION_EVIDENCE_FILE)
         except RunOwnershipError:
             raise
         except BaseException as error:  # noqa: BLE001 - interruption must fail closed.
             execution_error = error
         finally:
-            self._validate_run_artifacts(request.execution_request.artifact_directory)
+            self._validate_run_artifacts(
+                request.execution_request.artifact_directory,
+                artifact_layout=layout,
+            )
             after_workspace, after_error = self._capture_workspace(repository)
+            tracker.revalidate()
             environment_after = self._capture_environment(repository)
+            tracker.revalidate()
             environment_after = _with_workspace_inspection_errors(
                 environment_after,
                 snapshot=after_workspace,
@@ -556,6 +587,7 @@ class GuardedWritableOperation:
         changed_files, change_error = _changed_files(
             repository, request.baseline.head_sha
         )
+        tracker.revalidate()
         if change_error is not None:
             post_violations += (
                 WritableSafetyViolation(
@@ -650,12 +682,17 @@ class GuardedWritableOperation:
     ) -> WritableRejectedBeforeStart[TaskResult] | WritableSafetyStopped[TaskResult]:
         """Persist safety evidence for a stage-owned pre-invocation rejection."""
 
-        self._validate_run_artifacts(request.artifact_directory)
+        layout = request.artifact_layout
+        self._validate_run_artifacts(
+            request.artifact_directory,
+            artifact_layout=layout,
+        )
         repository = GitRepository(request.baseline.repository_path)
         tracker, environment_before = self._capture_before(
             repository,
             phase=request.phase,
             artifact_directory=request.artifact_directory,
+            artifact_layout=layout,
         )
         violations = _merge_violations(
             request.safety_violations,
@@ -689,15 +726,23 @@ class GuardedWritableOperation:
         *,
         phase: AttemptPhase,
         artifact_directory: Path,
+        artifact_layout: AttemptArtifactLayout,
     ) -> tuple[_AttemptTracker, WorkspaceEnvironmentSnapshot]:
-        self._validate_run_artifacts(artifact_directory)
+        self._validate_run_artifacts(
+            artifact_directory,
+            artifact_layout=artifact_layout,
+        )
         record, association_error = _associated_attempt(
             artifact_directory,
             phase,
+            artifact_layout=artifact_layout,
             run_ownership=self._run_ownership,
         )
+        artifact_layout.revalidate()
         environment = self._capture_environment(repository)
+        artifact_layout.revalidate()
         snapshot, error = self._capture_workspace(repository)
+        artifact_layout.revalidate()
         environment = _with_workspace_inspection_errors(
             environment,
             snapshot=snapshot,
@@ -709,6 +754,7 @@ class GuardedWritableOperation:
             metadata = replace(metadata, before_workspace_error=error)
         tracker = _AttemptTracker(
             artifact_directory,
+            artifact_layout,
             record,
             snapshot,
             error,
@@ -735,9 +781,14 @@ class GuardedWritableOperation:
         failure_message: str,
         starting_violations: tuple[WritableSafetyViolation, ...],
     ) -> WritableAudit[TaskResult]:
-        self._validate_run_artifacts(tracker.artifact_directory)
+        self._validate_run_artifacts(
+            tracker.artifact_directory,
+            artifact_layout=tracker.artifact_layout,
+        )
         after_workspace, after_error = self._capture_workspace(repository)
+        tracker.revalidate()
         environment_after = self._capture_environment(repository)
+        tracker.revalidate()
         environment_after = _with_workspace_inspection_errors(
             environment_after,
             snapshot=after_workspace,
@@ -759,6 +810,7 @@ class GuardedWritableOperation:
             violations, _attempt_evidence_violations(tracker)
         )
         changed_files, change_error = _changed_files(repository, baseline.head_sha)
+        tracker.revalidate()
         if change_error is not None:
             violations += (
                 WritableSafetyViolation(
@@ -825,13 +877,19 @@ class GuardedWritableOperation:
         after: WorkspaceEnvironmentSnapshot,
         phase: AttemptPhase,
     ) -> WorkspaceGuardInspection:
-        self._validate_run_artifacts(tracker.artifact_directory)
+        self._validate_run_artifacts(
+            tracker.artifact_directory,
+            artifact_layout=tracker.artifact_layout,
+        )
         try:
             inspection = self._compare_environment(
                 before=before,
                 after=after,
                 phase=phase,
             )
+            tracker.revalidate()
+        except (AgentContractError, RunOwnershipError):
+            raise
         except BaseException as error:  # noqa: BLE001 - post evidence must fail closed.
             detail = f"workspace-guard-comparison: {type(error).__name__}: {error}"
             tracker.evidence_errors.append(detail)
@@ -855,20 +913,32 @@ class GuardedWritableOperation:
     ) -> WorkspaceGuardInspection:
         if tracker.record is None:
             return _with_guard_evidence_errors(inspection, tracker.evidence_errors)
-        path = tracker.artifact_directory / WORKSPACE_GUARD_FILE
-        self._validate_run_artifacts(path.parent)
+        path = tracker.artifact_layout.path(WORKSPACE_GUARD_FILE)
+        self._validate_run_artifacts(
+            path.parent,
+            artifact_layout=tracker.artifact_layout,
+        )
         persisted = replace(inspection, artifact_path=path)
         persisted = _with_guard_evidence_errors(persisted, tracker.evidence_errors)
         try:
             write_workspace_guard_inspection(persisted)
+            tracker.revalidate()
         except BaseException as error:  # noqa: BLE001 - audit failure must fail closed.
+            tracker.revalidate()
             tracker.evidence_errors.append(
                 f"workspace-guard-artifact: {type(error).__name__}: {error}"
             )
             return _with_guard_evidence_errors(inspection, tracker.evidence_errors)
         return persisted
 
-    def _validate_run_artifacts(self, artifact_directory: Path) -> None:
+    def _validate_run_artifacts(
+        self,
+        artifact_directory: Path,
+        *,
+        artifact_layout: AttemptArtifactLayout | None = None,
+    ) -> None:
+        if artifact_layout is not None:
+            artifact_layout.revalidate()
         if self._run_ownership is None:
             return
         self._run_ownership.validate_descendant(artifact_directory)
@@ -991,6 +1061,7 @@ def _associated_attempt(
     artifact_directory: Path,
     phase: AttemptPhase,
     *,
+    artifact_layout: AttemptArtifactLayout,
     run_ownership: RunOwnership | None = None,
 ) -> tuple[AttemptRecord | None, str | None]:
     run_dir = artifact_directory.parent.parent
@@ -1010,7 +1081,7 @@ def _associated_attempt(
         return None, f"attempt-association: {type(error).__name__}: {error}"
     if len(matches) != 1:
         return None, "attempt-association: artifact directory has no unique attempt"
-    record = matches[0]
+    record = replace(matches[0], artifact_layout=artifact_layout)
     if record.phase is not phase:
         return None, "attempt-association: attempt phase does not match the request"
     if record.status is not AttemptStatus.STARTED:

@@ -48,6 +48,34 @@ class RunOwnership:
         ownership.validate()
         return ownership
 
+    @classmethod
+    def reserve(cls, runs_root: Path | str, run_id: str) -> RunOwnership:
+        """Create and bind one direct run directory as a single reservation step."""
+
+        validate_run_id(run_id)
+        try:
+            root = Path(runs_root).resolve(strict=True)
+        except FileNotFoundError as error:
+            raise RunOwnershipError(
+                f"Runs directory does not exist: {Path(runs_root)}"
+            ) from error
+        except (OSError, RuntimeError) as error:
+            raise RunOwnershipError(
+                f"Could not resolve the runs directory safely: {error}"
+            ) from error
+        candidate = root / run_id
+        candidate.mkdir()
+        try:
+            ownership = cls(root, run_id)
+            ownership.validate()
+            return ownership
+        except BaseException:
+            try:
+                candidate.rmdir()
+            except OSError:
+                pass
+            raise
+
     def __post_init__(self) -> None:
         if not isinstance(self.runs_root, Path) or not self.runs_root.is_absolute():
             raise TypeError("runs_root must be an absolute Path.")
