@@ -10,13 +10,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..application.agent_execution import (
-    CORRECTION_TICKET_FILE,
-    AttemptArtifactLayout,
-)
+from ..application.agent_execution import CORRECTION_TICKET_FILE
 from ..application.ports.handoff import FINAL_PATCH_FILE
 from ..attempts import (
     AttemptRecord,
+    attempt_artifact_layout,
     latest_attempt,
     latest_writable_attempt,
     load_attempt_records,
@@ -468,13 +466,12 @@ def _has_result_role(record: AttemptRecord, role: ResultArtifactRole) -> bool:
 
 
 def _attempt_view(run_path: Path, record: AttemptRecord) -> AttemptReportView:
-    correction_ticket = record.artifact_directory / CORRECTION_TICKET_FILE
+    layout = attempt_artifact_layout(run_path, record)
+    correction_ticket = layout.path(CORRECTION_TICKET_FILE)
     execution = None
     if record.execution_path is not None:
         try:
-            execution = read_execution_evidence(
-                AttemptArtifactLayout(run_path, record.artifact_directory)
-            )
+            execution = read_execution_evidence(layout)
         except (OSError, ValueError):
             execution = None
     return AttemptReportView(
@@ -482,7 +479,7 @@ def _attempt_view(run_path: Path, record: AttemptRecord) -> AttemptReportView:
         phase=record.phase,
         status=record.status,
         correction_ticket=(
-            correction_ticket.relative_to(run_path).as_posix()
+            correction_ticket.relative_to(layout.run_root).as_posix()
             if correction_ticket.is_file()
             else None
         ),
@@ -514,7 +511,7 @@ def _diff_stats_or_empty(repository: GitRepository, record: RunRecord) -> str:
 
 
 def _status(value: VerificationEvidence | None) -> str:
-    return "NOT RUN" if value is None else value.status
+    return "NOT RUN" if value is None else value.status.value
 
 
 def _review_verdict(value: ReviewResult | None, error: object) -> str:

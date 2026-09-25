@@ -5,12 +5,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .attempts import AttemptRecord, attempt_result_path
+from .attempts import (
+    AttemptRecord,
+    attempt_artifact_file_exists,
+    attempt_result_path,
+)
 from .domain.task_results import (
     ImplementationResult,
     ResultValidationError,
     ReviewResult,
 )
+from .models import StageOutcome, VerificationStatus
 from .persistence import CodecError, atomic_write_json, read_json
 from .task_result_codecs import (
     decode_implementation_result,
@@ -27,12 +32,12 @@ class PersistenceCodecError(ValueError):
 
 @dataclass(frozen=True)
 class StageMessageResult:
-    status: str
+    status: StageOutcome
     message: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.status, str) or not self.status.strip():
-            raise PersistenceCodecError("stage message status must be non-empty.")
+        if not isinstance(self.status, StageOutcome):
+            raise PersistenceCodecError("stage message status must be a StageOutcome.")
         if not isinstance(self.message, str) or not self.message.strip():
             raise PersistenceCodecError("stage message must be non-empty.")
 
@@ -44,7 +49,7 @@ def _read_attempt_result_value(
     """Decode an optional attempt result as JSON without interpreting its schema."""
 
     path = attempt_result_path(run_dir, attempt)
-    if not path.is_file():
+    if not attempt_artifact_file_exists(run_dir, attempt, attempt.result_path):
         return None
     try:
         return read_json(path)
@@ -90,7 +95,10 @@ def read_stage_message_result(
     if not isinstance(value, dict) or set(value) != {"status", "message"}:
         raise PersistenceCodecError("stage message result has unsupported fields.")
     try:
-        return StageMessageResult(status=value["status"], message=value["message"])
+        return StageMessageResult(
+            status=_decode_stage_message_status(value["status"]),
+            message=value["message"],
+        )
     except (TypeError, ValueError) as error:
         raise PersistenceCodecError(str(error)) from error
 
@@ -104,7 +112,13 @@ def read_verification_failures(
         return ()
     if not isinstance(value, dict):
         raise PersistenceCodecError("verification result must be an object.")
-    if value.get("status") != "FAIL":
+    try:
+        status = VerificationStatus(value.get("status"))
+    except (TypeError, ValueError) as error:
+        raise PersistenceCodecError(
+            "verification result status is unsupported."
+        ) from error
+    if status is not VerificationStatus.FAIL:
         return ()
     encoded = value.get("correction_reasons")
     if not isinstance(encoded, list) or not encoded:
@@ -126,19 +140,45 @@ def write_stage_message_result(
     run_dir: Path | str,
     attempt: AttemptRecord,
     *,
-    status: str,
+    status: StageOutcome,
     message: str,
 ) -> Path:
     """Persist the small status/message result used by coordination stages."""
 
     path = attempt_result_path(run_dir, attempt)
-    write_stage_message(path, status=status, message=message)
+    result = StageMessageResult(status, message)
+    wire_status = (
+        VerificationStatus.PASS.value
+        if result.status is StageOutcome.COMPLETED
+        else result.status.value
+    )
+    _write_stage_message(path, result, wire_status=wire_status)
     return path
 
 
-def write_stage_message(path: Path, *, status: str, message: str) -> None:
+def write_stage_message(path: Path, *, status: StageOutcome, message: str) -> None:
     result = StageMessageResult(status, message)
-    atomic_write_json(path, {"status": result.status, "message": result.message})
+    _write_stage_message(path, result, wire_status=result.status.value)
+
+
+def _write_stage_message(
+    path: Path,
+    result: StageMessageResult,
+    *,
+    wire_status: str,
+) -> None:
+    atomic_write_json(path, {"status": wire_status, "message": result.message})
+
+
+def _decode_stage_message_status(value: object) -> StageOutcome:
+    if value == VerificationStatus.PASS.value:
+        return StageOutcome.COMPLETED
+    if not isinstance(value, str):
+        raise PersistenceCodecError("stage message status is unsupported.")
+    try:
+        return StageOutcome(value)
+    except ValueError as error:
+        raise PersistenceCodecError("stage message status is unsupported.") from error
 
 
 def write_implementation_result(path: Path, result: ImplementationResult) -> None:

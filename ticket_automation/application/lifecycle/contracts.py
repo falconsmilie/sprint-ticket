@@ -34,12 +34,12 @@ class StageContext:
 class ReportingEvidence:
     """Small result artifact emitted only by reporting/handoff coordination."""
 
-    status: str
+    status: StageOutcome
     message: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.status, str) or not self.status.strip():
-            raise ValueError("Reporting evidence status must be non-empty.")
+        if not isinstance(self.status, StageOutcome):
+            raise TypeError("Reporting evidence status must be a StageOutcome.")
         if not isinstance(self.message, str) or not self.message.strip():
             raise ValueError("Reporting evidence message must be non-empty.")
 
@@ -223,12 +223,11 @@ def decision_for_stage_result(
         and reporting_evidence.message != result.controller_message
     ):
         raise ValueError("Reporting evidence must describe the stage result message.")
-    if reporting_evidence is not None:
-        expected_status = (
-            "PASS" if result.outcome is StageOutcome.COMPLETED else result.outcome.value
-        )
-        if reporting_evidence.status != expected_status:
-            raise ValueError("Reporting evidence status must match the stage outcome.")
+    if (
+        reporting_evidence is not None
+        and reporting_evidence.status is not result.outcome
+    ):
+        raise ValueError("Reporting evidence status must match the stage outcome.")
 
     stop = None
     if result.outcome in {StageOutcome.HUMAN_REQUIRED, StageOutcome.FAILED}:

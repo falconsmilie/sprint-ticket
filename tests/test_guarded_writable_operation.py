@@ -449,7 +449,11 @@ def test_guard_artifact_persistence_failure_stops_successful_execution(
         AttemptPhase.IMPLEMENTING,
     )
 
+    write_calls = 0
+
     def fail_persistence(_inspection):
+        nonlocal write_calls
+        write_calls += 1
         raise OSError("audit destination unavailable")
 
     monkeypatch.setattr(
@@ -463,11 +467,49 @@ def test_guard_artifact_persistence_failure_stops_successful_execution(
     assert isinstance(outcome, WritableSafetyStopped)
     assert outcome.audit.workspace_guard.has_inspection_failure
     assert outcome.audit.workspace_guard.artifact_path is None
+    assert write_calls == 1
     assert not (
         request.execution_request.artifact_directory / "workspace-guard.json"
     ).exists()
     persisted_attempt = load_attempt_records(tmp_path / "run")[-1]
     assert persisted_attempt.execution_path == "execution.json"
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required")
+def test_guard_artifact_success_is_written_exactly_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = GitRepository(create_git_repo(tmp_path / "target"))
+    before = WorkspaceSnapshot.capture(repository)
+    request = _request(
+        tmp_path,
+        repository,
+        before,
+        AgentTaskKind.IMPLEMENTATION,
+        AttemptPhase.IMPLEMENTING,
+    )
+    original_write = guarded_module.write_workspace_guard_inspection
+    written = []
+
+    def record_write(inspection):
+        written.append(inspection)
+        original_write(inspection)
+
+    monkeypatch.setattr(
+        guarded_module,
+        "write_workspace_guard_inspection",
+        record_write,
+    )
+
+    outcome = GuardedWritableOperation(MatrixExecutor("tracked-success")).execute(
+        request
+    )
+
+    assert isinstance(outcome, WritableSucceeded)
+    assert written == [outcome.audit.workspace_guard]
+    assert outcome.audit.workspace_guard.artifact_path is not None
+    assert outcome.audit.workspace_guard.artifact_path.is_file()
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required")

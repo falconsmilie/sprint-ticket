@@ -21,6 +21,7 @@ from .application.agent_execution import (
     ProviderId,
     ProviderMetadataValue,
     RepositoryAccess,
+    validate_execution_semantics,
 )
 from .domain.task_results import TaskResult
 from .persistence import (
@@ -102,19 +103,15 @@ class ExecutionEvidence:
             isinstance(item, ArtifactReference) for item in self.artifacts
         ):
             raise CodecError("artifacts must be ArtifactReference values.")
-        if self.status is AgentExecutionStatus.SUCCESS:
-            if self.invocation_start is not InvocationStart.STARTED:
-                raise CodecError(
-                    "Successful evidence must record a started invocation."
-                )
-            if self.failure_category is not None or self.failure_message is not None:
-                raise CodecError("Successful evidence cannot contain failure details.")
-        elif (
-            not isinstance(self.failure_category, AgentFailureCategory)
-            or not isinstance(self.failure_message, str)
-            or not self.failure_message.strip()
-        ):
-            raise CodecError("Failed evidence requires a category and message.")
+        try:
+            validate_execution_semantics(
+                status=self.status,
+                invocation_start=self.invocation_start,
+                failure_category=self.failure_category,
+                failure_message=self.failure_message,
+            )
+        except ValueError as error:
+            raise CodecError(str(error)) from error
         object.__setattr__(
             self,
             "provider_metadata",

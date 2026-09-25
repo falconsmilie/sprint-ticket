@@ -9,13 +9,17 @@ import pytest
 
 from tests.fake_agent_executor import InMemoryAgentExecutor
 from tests.helpers import (
+    GIT,
+    create_directory_link,
     create_git_repo,
     create_trusted_prepared_run,
+    fail_stat_for_path,
     make_agent_executors,
     make_config,
     make_final_patch_capture,
     make_report_publisher,
     make_resume_agent_executor_factory,
+    remove_directory_link,
 )
 from ticket_automation.application.agent_execution import (
     IMPLEMENTATION_RESULT_CONTRACT,
@@ -34,6 +38,7 @@ from ticket_automation.application.guarded_writable_operation import (
     WritableBaseline,
     WritableSucceeded,
 )
+from ticket_automation.application.lifecycle.resume import resume_preflight_problem
 from ticket_automation.attempts import (
     AttemptError,
     StageAttempt,
@@ -63,8 +68,14 @@ from ticket_automation.models import (
     StageOutcome,
     WorkflowState,
 )
-from ticket_automation.persistence_codecs import write_stage_message_result
+from ticket_automation.persistence_codecs import (
+    PersistenceCodecError,
+    read_review_result,
+    read_stage_message_result,
+    write_stage_message_result,
+)
 from ticket_automation.runs import save_run_record
+from ticket_automation.verification_evidence import read_verification_evidence
 from ticket_automation.workflow import resume_ticket_lifecycle
 
 
@@ -114,6 +125,32 @@ def test_complete_stage_attempt_rejects_wrong_run_and_recompletion(
         )
 
 
+def test_complete_stage_attempt_accepts_a_relative_run_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    run_dir = Path("relative-run")
+    started = start_attempt(
+        run_dir,
+        phase=AttemptPhase.IMPLEMENTING,
+        before_workspace_fingerprint=None,
+        clock=fixed_clock,
+    )
+
+    completed = complete_stage_attempt(
+        run_dir,
+        started,
+        stage_outcome=StageOutcome.COMPLETED,
+        after_workspace_fingerprint="after",
+        process_started=False,
+        clock=fixed_clock,
+    )
+
+    assert completed.status is AttemptStatus.COMPLETED
+    assert completed.artifact_directory == started.artifact_directory.resolve()
+
+
 def test_stage_message_codec_rejects_an_attempt_owned_by_another_run(
     tmp_path: Path,
 ) -> None:
@@ -130,10 +167,52 @@ def test_stage_message_codec_rejects_an_attempt_owned_by_another_run(
         write_stage_message_result(
             second_run,
             started,
-            status="PASS",
+            status=StageOutcome.COMPLETED,
             message="must remain in the owning run",
         )
     assert not (second_run / "attempts").exists()
+
+
+@pytest.mark.parametrize("status", list(StageOutcome))
+def test_stage_message_status_round_trips_as_a_typed_outcome(
+    tmp_path: Path,
+    status: StageOutcome,
+) -> None:
+    record = start_attempt(
+        tmp_path,
+        phase=AttemptPhase.REPORTING,
+        before_workspace_fingerprint="before",
+        clock=fixed_clock,
+    )
+
+    path = write_stage_message_result(
+        tmp_path,
+        record,
+        status=status,
+        message="typed stage result",
+    )
+    loaded = read_stage_message_result(tmp_path, record)
+
+    assert loaded is not None
+    assert loaded.status is status
+    expected_token = "PASS" if status is StageOutcome.COMPLETED else status.value
+    assert json.loads(path.read_text(encoding="utf-8"))["status"] == expected_token
+
+
+def test_stage_message_codec_rejects_an_unknown_status_token(tmp_path: Path) -> None:
+    record = start_attempt(
+        tmp_path,
+        phase=AttemptPhase.REPORTING,
+        before_workspace_fingerprint="before",
+        clock=fixed_clock,
+    )
+    record.artifact_directory.joinpath("result.json").write_text(
+        json.dumps({"status": "UNKNOWN", "message": "tampered"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PersistenceCodecError, match="unsupported"):
+        read_stage_message_result(tmp_path, record)
 
 
 @pytest.mark.parametrize(
@@ -279,6 +358,84 @@ def test_attempt_creation_skips_an_orphaned_crash_directory(tmp_path: Path) -> N
     assert [item.sequence for item in load_attempt_records(tmp_path)] == [2]
 
 
+def test_missing_attempts_root_loads_as_an_empty_ledger(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    assert load_attempt_records(run_dir) == ()
+
+
+@pytest.mark.parametrize(
+    "blocked_path",
+    ["attempts-root", "attempt-root", "attempt-record"],
+)
+def test_attempt_loading_rejects_filesystem_inspection_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    blocked_path: str,
+) -> None:
+    record = start_attempt(
+        tmp_path / "run",
+        phase=AttemptPhase.VERIFYING,
+        before_workspace_fingerprint="before",
+        clock=fixed_clock,
+    )
+    blocked = {
+        "attempts-root": record.artifact_directory.parent,
+        "attempt-root": record.artifact_directory,
+        "attempt-record": record.path,
+    }[blocked_path]
+    fail_stat_for_path(monkeypatch, blocked)
+
+    with pytest.raises(AttemptError, match="simulated filesystem inspection failure"):
+        load_attempt_records(tmp_path / "run")
+
+
+def test_attempt_loading_uses_strict_resolution_for_the_attempts_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    record = start_attempt(
+        run_dir,
+        phase=AttemptPhase.VERIFYING,
+        before_workspace_fingerprint="before",
+        clock=fixed_clock,
+    )
+    attempts_root = record.artifact_directory.parent
+    original_resolve = Path.resolve
+
+    def fail_strict_resolution(path: Path, strict: bool = False) -> Path:
+        if path == attempts_root:
+            if strict:
+                raise PermissionError("simulated resolution failure")
+            return path.absolute()
+        return original_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", fail_strict_resolution)
+
+    with pytest.raises(AttemptError, match="simulated resolution failure"):
+        load_attempt_records(run_dir)
+
+
+def test_optional_attempt_result_rejects_inspection_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = start_attempt(
+        tmp_path / "run",
+        phase=AttemptPhase.REVIEWING,
+        before_workspace_fingerprint="before",
+        clock=fixed_clock,
+    )
+    result_path = record.artifact_directory / record.result_path
+    result_path.write_text("{}", encoding="utf-8")
+    fail_stat_for_path(monkeypatch, result_path)
+
+    with pytest.raises(AttemptError, match="simulated filesystem inspection failure"):
+        read_review_result(tmp_path / "run", record)
+
+
 def test_trusted_attempt_record_resolves_only_its_own_artifacts(tmp_path: Path) -> None:
     started = start_attempt(
         tmp_path,
@@ -299,6 +456,126 @@ def test_trusted_attempt_record_resolves_only_its_own_artifacts(tmp_path: Path) 
     assert attempt_result_path(tmp_path, loaded[0]) == (
         completed.artifact_directory / "result.json"
     )
+
+
+def test_linked_attempt_directory_is_rejected_before_external_evidence_is_parsed(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    record = start_attempt(
+        run_dir,
+        phase=AttemptPhase.REVIEWING,
+        before_workspace_fingerprint="before",
+        clock=fixed_clock,
+    )
+    external = tmp_path / "external-attempt"
+    record.artifact_directory.rename(external)
+    external.joinpath("attempt.json").write_text("not json", encoding="utf-8")
+    link_kind = create_directory_link(record.artifact_directory, external)
+    if link_kind is None:
+        pytest.skip("directory links are unavailable on this platform")
+    try:
+        with pytest.raises(AttemptError, match="confinement|owning run"):
+            load_attempt_records(run_dir)
+        with pytest.raises(AttemptError, match="confinement|owning run"):
+            attempt_result_path(run_dir, record)
+        with pytest.raises(AttemptError, match="confinement|owning run"):
+            read_review_result(run_dir, record)
+        with pytest.raises(AttemptError, match="confinement|owning run"):
+            read_verification_evidence(run_dir, record)
+    finally:
+        remove_directory_link(record.artifact_directory)
+
+
+def test_nested_artifact_directory_link_cannot_escape_its_attempt(
+    tmp_path: Path,
+) -> None:
+    record = start_attempt(
+        tmp_path / "run",
+        phase=AttemptPhase.REVIEWING,
+        before_workspace_fingerprint="before",
+        clock=fixed_clock,
+    )
+    external = tmp_path / "external-result"
+    external.mkdir()
+    external.joinpath("untrusted.json").write_text("{}", encoding="utf-8")
+    result_link = record.artifact_directory / record.result_path
+    link_kind = create_directory_link(result_link, external)
+    if link_kind is None:
+        pytest.skip("directory links are unavailable on this platform")
+    try:
+        with pytest.raises(AttemptError, match="confinement|owning attempt"):
+            attempt_result_path(tmp_path / "run", record)
+        with pytest.raises(AttemptError, match="confinement|owning attempt"):
+            read_review_result(tmp_path / "run", record)
+    finally:
+        remove_directory_link(result_link)
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required")
+def test_resume_preflight_rejects_a_linked_attempt_directory(
+    tmp_path: Path,
+) -> None:
+    repository = create_git_repo(tmp_path / "target")
+    config = make_config(repository)
+    ticket = tmp_path / "TA-CORR-001.md"
+    ticket.write_text("# Ticket\n", encoding="utf-8")
+    snapshot = create_trusted_prepared_run(
+        config,
+        ticket,
+        runs_dir=tmp_path / "runs",
+        clock=fixed_clock,
+    )
+    record = load_attempt_records(snapshot.run_dir)[0]
+    external = tmp_path / "external-baseline-attempt"
+    record.artifact_directory.rename(external)
+    link_kind = create_directory_link(record.artifact_directory, external)
+    if link_kind is None:
+        pytest.skip("directory links are unavailable on this platform")
+    try:
+        problem = resume_preflight_problem(
+            config,
+            snapshot.run_dir,
+            snapshot.run_record,
+        )
+        assert problem is not None
+        assert "Attempt evidence is invalid" in problem
+    finally:
+        remove_directory_link(record.artifact_directory)
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required")
+def test_resume_preflight_cannot_fall_back_past_an_unreadable_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = create_git_repo(tmp_path / "target")
+    config = make_config(repository)
+    ticket = tmp_path / "TA-CORR-001.md"
+    ticket.write_text("# Ticket\n", encoding="utf-8")
+    snapshot = create_trusted_prepared_run(
+        config,
+        ticket,
+        runs_dir=tmp_path / "runs",
+        clock=fixed_clock,
+    )
+    inaccessible = start_attempt(
+        snapshot.run_dir,
+        phase=AttemptPhase.PREPARING,
+        before_workspace_fingerprint=None,
+        clock=fixed_clock,
+    )
+    fail_stat_for_path(monkeypatch, inaccessible.path)
+
+    problem = resume_preflight_problem(
+        config,
+        snapshot.run_dir,
+        snapshot.run_record,
+    )
+
+    assert problem is not None
+    assert "Attempt evidence is invalid" in problem
+    assert "simulated filesystem inspection failure" in problem
 
 
 def test_trusted_attempt_record_cannot_resolve_artifacts_for_another_run(

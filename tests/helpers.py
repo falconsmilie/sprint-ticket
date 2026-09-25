@@ -40,9 +40,63 @@ from ticket_automation.providers.codex_cli.composition import (
 )
 from ticket_automation.providers.codex_cli.identity import PROVIDER_ID
 
+
+def create_directory_link(link: Path, target: Path) -> str | None:
+    """Create the platform directory-link type used by confinement tests."""
+
+    if os.name == "nt":
+        result = subprocess.run(
+            ("cmd", "/c", "mklink", "/J", str(link), str(target)),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return "junction" if result.returncode == 0 else None
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        return None
+    return "symlink"
+
+
+def remove_directory_link(link: Path) -> None:
+    """Remove a link without traversing or deleting its target."""
+
+    if os.name == "nt":
+        link.rmdir()
+    else:
+        link.unlink()
+
+
 if TYPE_CHECKING:
+    import pytest
+
     from ticket_automation.runs import RunCreationResult
     from ticket_automation.verification import VerificationProcessRunner
+
+
+def fail_stat_for_path(
+    monkeypatch: pytest.MonkeyPatch,
+    path: Path,
+    *,
+    message: str = "simulated filesystem inspection failure",
+) -> None:
+    """Make the OS stat call for exactly one path fail without hiding the error."""
+
+    original_stat = os.stat
+    denied = os.path.normcase(os.path.abspath(path))
+
+    def failing_stat(candidate, *args, **kwargs):
+        try:
+            inspected = os.path.normcase(os.path.abspath(os.fspath(candidate)))
+        except TypeError:
+            return original_stat(candidate, *args, **kwargs)
+        if inspected == denied:
+            raise PermissionError(message)
+        return original_stat(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", failing_stat)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 GIT = shutil.which("git")

@@ -9,6 +9,7 @@ import pytest
 from ticket_automation.application.agent_execution import (
     AgentCapability,
     AgentContractError,
+    AgentExecution,
     AgentExecutionStatus,
     AgentFailureCategory,
     AgentTaskKind,
@@ -19,6 +20,7 @@ from ticket_automation.application.agent_execution import (
     ProviderId,
     RepositoryAccess,
 )
+from ticket_automation.attempts import attempt_result_path, start_attempt
 from ticket_automation.execution_evidence import (
     ExecutionEvidence,
     decode_execution_evidence,
@@ -26,10 +28,17 @@ from ticket_automation.execution_evidence import (
     read_execution_evidence,
     write_execution_evidence,
 )
+from ticket_automation.models import AttemptPhase, VerificationStatus
 from ticket_automation.persistence import (
     CodecError,
     PersistenceError,
     atomic_write_json,
+)
+from ticket_automation.verification_evidence import (
+    VERIFICATION_ROUND_FORMAT,
+    VERIFICATION_SCHEMA_VERSION,
+    VerificationEvidence,
+    read_verification_evidence,
 )
 
 
@@ -196,6 +205,61 @@ def test_execution_codec_rejects_unknown_artifact_role(tmp_path: Path) -> None:
         decode_execution_evidence(payload, layout=layout)
 
 
+@pytest.mark.parametrize("category", list(AgentFailureCategory))
+@pytest.mark.parametrize("invocation_start", list(InvocationStart))
+def test_runtime_and_persisted_failure_semantics_have_exact_parity(
+    tmp_path: Path,
+    category: AgentFailureCategory,
+    invocation_start: InvocationStart,
+) -> None:
+    layout = _layout(tmp_path)
+    payload = encode_execution_evidence(
+        _evidence(layout, provider="provider-alpha", successful=False)
+    )
+    payload["invocation_start"] = invocation_start.value
+    failure = payload["failure"]
+    assert isinstance(failure, dict)
+    failure["category"] = category.value
+    pre_invocation = {
+        AgentFailureCategory.PROVIDER_UNAVAILABLE,
+        AgentFailureCategory.INVOCATION_START_FAILURE,
+        AgentFailureCategory.CAPABILITY_OR_CONFIGURATION_FAILURE,
+    }
+    expected_valid = (
+        invocation_start is InvocationStart.NOT_STARTED
+        if category in pre_invocation
+        else category is AgentFailureCategory.TIMEOUT
+        or invocation_start is not InvocationStart.NOT_STARTED
+    )
+
+    started = datetime(2026, 9, 24, 10, 0, tzinfo=UTC)
+    try:
+        AgentExecution(
+            provider_id=ProviderId("provider-alpha"),
+            task_kind=AgentTaskKind.REVIEW,
+            status=AgentExecutionStatus.FAILED,
+            invocation_start=invocation_start,
+            started_at=started,
+            ended_at=started + timedelta(seconds=2),
+            duration_seconds=2,
+            failure_category=category,
+            failure_message="Provider failed.",
+        )
+    except AgentContractError:
+        runtime_valid = False
+    else:
+        runtime_valid = True
+    try:
+        decode_execution_evidence(payload, layout=layout)
+    except CodecError:
+        evidence_valid = False
+    else:
+        evidence_valid = True
+
+    assert runtime_valid is expected_valid
+    assert evidence_valid is expected_valid
+
+
 def test_atomic_json_write_preserves_old_record_when_replace_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -222,3 +286,66 @@ def test_atomic_json_write_uses_utf8_and_one_terminal_newline(tmp_path: Path) ->
     assert payload.endswith(b"\n")
     assert not payload.endswith(b"\n\n")
     assert json.loads(payload.decode("utf-8"))["message"] == "Grüße"
+
+
+@pytest.mark.parametrize("status", list(VerificationStatus))
+def test_verification_evidence_decodes_status_as_the_owning_enum(
+    tmp_path: Path,
+    status: VerificationStatus,
+) -> None:
+    record = start_attempt(
+        tmp_path,
+        phase=AttemptPhase.VERIFYING,
+        before_workspace_fingerprint="before",
+    )
+    atomic_write_json(
+        attempt_result_path(tmp_path, record),
+        {
+            "schema_version": VERIFICATION_SCHEMA_VERSION,
+            "format": VERIFICATION_ROUND_FORMAT,
+            "round_index": 0,
+            "started_at": "2026-09-24T10:00:00Z",
+            "ended_at": "2026-09-24T10:00:00Z",
+            "duration_seconds": 0,
+            "status": status.value,
+            "commands": [],
+        },
+    )
+
+    evidence = read_verification_evidence(tmp_path, record)
+
+    assert evidence.status is status
+
+
+def test_verification_evidence_rejects_an_unknown_status_token(tmp_path: Path) -> None:
+    record = start_attempt(
+        tmp_path,
+        phase=AttemptPhase.VERIFYING,
+        before_workspace_fingerprint="before",
+    )
+    atomic_write_json(
+        attempt_result_path(tmp_path, record),
+        {
+            "schema_version": VERIFICATION_SCHEMA_VERSION,
+            "format": VERIFICATION_ROUND_FORMAT,
+            "round_index": 0,
+            "started_at": "2026-09-24T10:00:00Z",
+            "ended_at": "2026-09-24T10:00:00Z",
+            "duration_seconds": 0,
+            "status": "UNKNOWN",
+            "commands": [],
+        },
+    )
+
+    with pytest.raises(ValueError, match="unsupported status"):
+        read_verification_evidence(tmp_path, record)
+
+    with pytest.raises(TypeError, match="VerificationStatus"):
+        VerificationEvidence(
+            round_index=0,
+            status="PASS",  # type: ignore[arg-type]
+            started_at="2026-09-24T10:00:00Z",
+            ended_at="2026-09-24T10:00:00Z",
+            duration_seconds=0,
+            command_count=0,
+        )

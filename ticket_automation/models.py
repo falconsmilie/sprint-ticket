@@ -50,6 +50,14 @@ class StageOutcome(StrEnum):
     FAILED = "FAILED"
 
 
+class VerificationStatus(StrEnum):
+    """Authoritative status vocabulary for deterministic verification evidence."""
+
+    PASS = "PASS"
+    FAIL = "FAIL"
+    ERROR = "ERROR"
+
+
 class StopCategory(StrEnum):
     """Stable classification for a terminal automation stop."""
 
@@ -73,6 +81,7 @@ class ResultArtifactRole(StrEnum):
 
 
 ATTEMPT_RESULT_ARTIFACT_NAME = "result.json"
+ATTEMPTS_DIR_NAME = "attempts"
 
 
 @dataclass(frozen=True)

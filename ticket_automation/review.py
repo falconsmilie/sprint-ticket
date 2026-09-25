@@ -50,6 +50,7 @@ from .models import (
     AttemptPhase,
     AttemptStatus,
     StageOutcome,
+    VerificationStatus,
     WorkflowState,
 )
 from .persistence_codecs import (
@@ -328,7 +329,7 @@ def _run_review_stage(
         prompt=prompt,
         result_contract=REVIEW_RESULT_CONTRACT,
         artifact_directory=artifact_directory,
-        artifact_layout=AttemptArtifactLayout(run_path, artifact_directory),
+        artifact_layout=AttemptArtifactLayout.for_attempt(run_path, artifact_directory),
         policy=AgentExecutionPolicy(
             timeout_seconds=_AGENT_TIMEOUT_SECONDS,
             network_access=NetworkAccess.DENIED,
@@ -516,7 +517,7 @@ def _write_review_result(
     if result is not None:
         write_review_result(path, result)
     else:
-        write_stage_message(path, status=outcome.value, message=controller_message)
+        write_stage_message(path, status=outcome, message=controller_message)
 
 
 def _render_review_prompt(
@@ -572,7 +573,9 @@ def _read_verification_results(run_path: Path, run_record: RunRecord) -> str:
     verification_path = attempt_result_path(run_path, attempt)
     try:
         return read_verification_result_text(
-            run_path, attempt, expected_statuses=frozenset({"PASS"})
+            run_path,
+            attempt,
+            expected_statuses=frozenset({VerificationStatus.PASS}),
         )
     except ValueError as error:
         raise ReviewError(
@@ -651,7 +654,7 @@ def _inspect_review_source_fingerprint(
         expected = read_verification_source_fingerprint(
             run_path,
             run_record,
-            expected_statuses=frozenset({"PASS"}),
+            expected_statuses=frozenset({VerificationStatus.PASS}),
             verification_commands=verification_commands,
         )
     except ValueError as error:

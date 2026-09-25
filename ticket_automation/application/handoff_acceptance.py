@@ -24,6 +24,7 @@ from ..models import (
     AttemptPhase,
     AttemptStatus,
     StopCategory,
+    VerificationStatus,
     WorkflowState,
 )
 from ..persistence_codecs import PersistenceCodecError, read_review_result
@@ -558,7 +559,7 @@ def _read_policy_request(
                 source_fingerprint = read_verification_source_fingerprint(
                     request.run_dir,
                     run_record,
-                    expected_statuses=frozenset({"PASS"}),
+                    expected_statuses=frozenset({VerificationStatus.PASS}),
                     verification_commands=(
                         run_record.resolved_policy.verification_commands
                     ),

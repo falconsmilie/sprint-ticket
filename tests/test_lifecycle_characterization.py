@@ -10,9 +10,12 @@ import ticket_automation.corrections as corrections_module
 import ticket_automation.persistence as persistence_module
 from tests.helpers import (
     GIT,
+    create_directory_link,
     create_trusted_prepared_run,
+    fail_stat_for_path,
     make_agent_executor,
     make_run_dependencies,
+    remove_directory_link,
     run_git,
     run_test_stage,
 )
@@ -346,7 +349,16 @@ def test_correction_preparation_failure_persists_pre_and_post_evidence(
     assert (correction.artifact_directory / "workspace-guard.json").is_file()
 
 
-def test_required_review_finding_creates_correction_work(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "relative_runs_dir",
+    [False, True],
+    ids=["absolute-runs-dir", "relative-runs-dir"],
+)
+def test_required_review_finding_creates_correction_work(
+    tmp_path,
+    monkeypatch,
+    relative_runs_dir,
+):
     workspace = build_lifecycle_workspace(tmp_path)
     codex_runner = configure_fake_codex_actions(
         monkeypatch,
@@ -356,11 +368,15 @@ def test_required_review_finding_creates_correction_work(tmp_path, monkeypatch):
         "modify-correction",
         "review-pass",
     )
+    runs_dir = workspace.runs_dir
+    if relative_runs_dir:
+        monkeypatch.chdir(tmp_path)
+        runs_dir = runs_dir.relative_to(tmp_path)
 
     result = run_ticket_lifecycle(
         workspace.config,
         workspace.ticket,
-        runs_dir=workspace.runs_dir,
+        runs_dir=runs_dir,
         **make_run_dependencies(workspace.config, process_runner=codex_runner),
         verification_runner=ScriptedVerificationRunner([0, 0, 0]),
         clock=TickingClock(),
@@ -370,7 +386,7 @@ def test_required_review_finding_creates_correction_work(tmp_path, monkeypatch):
     assert result.run_record.stop_reason is None
     assert result.run_record.current_correction_round == 1
     attempts = assert_attempt_ledger(
-        result.run_dir,
+        result.run_dir.resolve(),
         [
             ("PREPARING", "COMPLETED"),
             ("IMPLEMENTING", "COMPLETED"),
@@ -405,6 +421,12 @@ def test_required_review_finding_creates_correction_work(tmp_path, monkeypatch):
     context = collect_report_context(result.run_dir, result.run_record)
     controller = context.controller
     agent = context.agent
+    expected_correction_ticket = (
+        Path("attempts")
+        / correction_attempt.artifact_directory.name
+        / "correction-ticket.md"
+    ).as_posix()
+    assert controller.correction_ticket_paths == (expected_correction_ticket,)
     assert isinstance(agent.implementation, ImplementationResult)
     assert controller.review_results
     assert all(
@@ -737,6 +759,109 @@ def test_final_handoff_rejects_stale_or_missing_evidence(
     assert result.run_record.stop_reason.category is StopCategory.SAFETY_VIOLATION
     assert reason in result.run_record.terminal_reason
     assert not (result.run_dir / "final.patch").exists()
+
+
+@pytest.mark.parametrize(
+    "linked_phase",
+    [AttemptPhase.VERIFYING, AttemptPhase.REVIEWING],
+    ids=["verification", "review"],
+)
+def test_final_handoff_rejects_linked_external_evidence(
+    tmp_path,
+    monkeypatch,
+    linked_phase,
+):
+    workspace = build_lifecycle_workspace(tmp_path)
+    codex_runner = configure_fake_codex_actions(
+        monkeypatch,
+        tmp_path,
+        "modify",
+        "review-pass",
+    )
+    clock = TickingClock()
+    reporting = _prepare_reporting_run(
+        workspace,
+        codex_runner=codex_runner,
+        clock=clock,
+    )
+    start_attempt(
+        reporting.run_dir,
+        phase=AttemptPhase.REPORTING,
+        before_workspace_fingerprint=None,
+        clock=clock,
+    )
+    linked_attempt = next(
+        item
+        for item in load_attempt_records(reporting.run_dir)
+        if item.phase is linked_phase
+    )
+    external = tmp_path / f"external-{linked_phase.value.lower()}-attempt"
+    linked_attempt.artifact_directory.rename(external)
+    link_kind = create_directory_link(linked_attempt.artifact_directory, external)
+    if link_kind is None:
+        pytest.skip("directory links are unavailable on this platform")
+    try:
+        result = HandoffAcceptanceService(
+            patch_capture=FileSystemFinalPatchCapture(),
+        ).accept(
+            HandoffAcceptanceRequest(
+                run_dir=reporting.run_dir,
+                run_record=reporting.run_record,
+            )
+        )
+
+        assert isinstance(result, HandoffRejected)
+        assert result.stop_category is StopCategory.SAFETY_VIOLATION
+        assert "confinement" in result.reason or "owning run" in result.reason
+        assert not (reporting.run_dir / "final.patch").exists()
+    finally:
+        remove_directory_link(linked_attempt.artifact_directory)
+
+
+def test_final_handoff_cannot_fall_back_past_an_unreadable_attempt(
+    tmp_path,
+    monkeypatch,
+):
+    workspace = build_lifecycle_workspace(tmp_path)
+    codex_runner = configure_fake_codex_actions(
+        monkeypatch,
+        tmp_path,
+        "modify",
+        "review-pass",
+    )
+    clock = TickingClock()
+    reporting = _prepare_reporting_run(
+        workspace,
+        codex_runner=codex_runner,
+        clock=clock,
+    )
+    inaccessible = start_attempt(
+        reporting.run_dir,
+        phase=AttemptPhase.VERIFYING,
+        before_workspace_fingerprint=None,
+        clock=clock,
+    )
+    start_attempt(
+        reporting.run_dir,
+        phase=AttemptPhase.REPORTING,
+        before_workspace_fingerprint=None,
+        clock=clock,
+    )
+    fail_stat_for_path(monkeypatch, inaccessible.path)
+
+    result = HandoffAcceptanceService(
+        patch_capture=FileSystemFinalPatchCapture(),
+    ).accept(
+        HandoffAcceptanceRequest(
+            run_dir=reporting.run_dir,
+            run_record=reporting.run_record,
+        )
+    )
+
+    assert isinstance(result, HandoffRejected)
+    assert result.stop_category is StopCategory.SAFETY_VIOLATION
+    assert "simulated filesystem inspection failure" in result.reason
+    assert not (reporting.run_dir / "final.patch").exists()
 
 
 def _prepare_reporting_run(workspace, *, codex_runner, clock):

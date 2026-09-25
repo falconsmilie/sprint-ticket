@@ -289,7 +289,9 @@ def test_stage_decision_factories_reject_untrusted_result_fields(tmp_path):
         decision_for_stage_result(
             snapshot.run_record,
             StubResult(WorkflowState.PREPARING, StageOutcome.COMPLETED),
-            reporting_evidence=ReportingEvidence("PASS", "stub stage result"),
+            reporting_evidence=ReportingEvidence(
+                StageOutcome.COMPLETED, "stub stage result"
+            ),
         )
 
     reporting_record = snapshot.run_record
@@ -309,14 +311,16 @@ def test_stage_decision_factories_reject_untrusted_result_fields(tmp_path):
         decision_for_stage_result(
             reporting_record,
             reporting_result,
-            reporting_evidence=ReportingEvidence("PASS", "different message"),
+            reporting_evidence=ReportingEvidence(
+                StageOutcome.COMPLETED, "different message"
+            ),
         )
     with pytest.raises(ValueError, match="status"):
         decision_for_stage_result(
             reporting_record,
             reporting_result,
             reporting_evidence=ReportingEvidence(
-                StageOutcome.HUMAN_REQUIRED.value,
+                StageOutcome.HUMAN_REQUIRED,
                 reporting_result.controller_message,
             ),
         )

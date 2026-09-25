@@ -21,7 +21,13 @@ from .attempts import (
 from .config import AppConfig, VerificationCommand
 from .git import GitRepository
 from .git_safety import WorkspaceChange, WorkspaceSnapshot, workspace_safety_changes
-from .models import PHASE_DEFINITIONS, AttemptPhase, StageOutcome, WorkflowState
+from .models import (
+    PHASE_DEFINITIONS,
+    AttemptPhase,
+    StageOutcome,
+    VerificationStatus,
+    WorkflowState,
+)
 from .persistence import atomic_write_json, format_timestamp
 from .process_output import decode_human_output
 from .resolved_config import config_from_resolved_run_policy
@@ -43,12 +49,6 @@ from .verification_evidence import (
 
 class VerificationError(RunError):
     pass
-
-
-class VerificationStatus(StrEnum):
-    PASS = "PASS"
-    FAIL = "FAIL"
-    ERROR = "ERROR"
 
 
 class VerificationErrorKind(StrEnum):

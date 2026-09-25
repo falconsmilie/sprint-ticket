@@ -56,6 +56,7 @@ from .models import (
     ATTEMPT_RESULT_ARTIFACT_NAME,
     AttemptPhase,
     StageOutcome,
+    VerificationStatus,
     WorkflowState,
 )
 from .persistence_codecs import (
@@ -500,7 +501,7 @@ def _run_correction_stage(
         prompt=prompt,
         result_contract=CORRECTION_RESULT_CONTRACT,
         artifact_directory=artifact_directory,
-        artifact_layout=AttemptArtifactLayout(run_path, artifact_directory),
+        artifact_layout=AttemptArtifactLayout.for_attempt(run_path, artifact_directory),
         policy=AgentExecutionPolicy(
             timeout_seconds=_AGENT_TIMEOUT_SECONDS,
             network_access=NetworkAccess.ALLOWED,
@@ -763,7 +764,7 @@ def _write_agent_result(
     if result is not None:
         write_implementation_result(path, result)
     else:
-        write_stage_message(path, status=outcome.value, message=controller_message)
+        write_stage_message(path, status=outcome, message=controller_message)
 
 
 def _write_correction_ticket(
@@ -995,7 +996,9 @@ def _correction_source_fingerprint(
         expected = read_verification_source_fingerprint(
             run_path,
             run_record,
-            expected_statuses=frozenset({"FAIL", "PASS"}),
+            expected_statuses=frozenset(
+                {VerificationStatus.FAIL, VerificationStatus.PASS}
+            ),
             verification_commands=verification_commands,
         )
     except ValueError as error:

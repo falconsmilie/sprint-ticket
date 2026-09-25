@@ -245,7 +245,7 @@ def _run_implementation_stage(
         prompt=prompt,
         result_contract=IMPLEMENTATION_RESULT_CONTRACT,
         artifact_directory=implementation_dir,
-        artifact_layout=AttemptArtifactLayout(run_path, implementation_dir),
+        artifact_layout=AttemptArtifactLayout.for_attempt(run_path, implementation_dir),
         policy=AgentExecutionPolicy(
             timeout_seconds=_AGENT_TIMEOUT_SECONDS,
             network_access=NetworkAccess.ALLOWED,
@@ -452,7 +452,7 @@ def _write_agent_result(
     if result is not None:
         write_implementation_result(path, result)
     else:
-        write_stage_message(path, status=outcome.value, message=controller_message)
+        write_stage_message(path, status=outcome, message=controller_message)
 
 
 def _read_snapshotted_ticket(path: Path) -> str:

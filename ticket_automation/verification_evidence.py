@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from .attempts import AttemptError, AttemptRecord, attempt_result_path, latest_attempt
 from .config import VerificationCommand
-from .models import AttemptPhase, AttemptStatus
+from .models import AttemptPhase, AttemptStatus, VerificationStatus
 from .persistence import CodecError, read_json_object
 
 if TYPE_CHECKING:
@@ -28,11 +28,17 @@ class _VerificationArtifactError(ValueError):
 @dataclass(frozen=True)
 class VerificationEvidence:
     round_index: int
-    status: str
+    status: VerificationStatus
     started_at: str
     ended_at: str
     duration_seconds: float
     command_count: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, VerificationStatus):
+            raise TypeError(
+                "Verification evidence status must be a VerificationStatus."
+            )
 
 
 def read_verification_evidence(
@@ -44,7 +50,7 @@ def read_verification_evidence(
     assert isinstance(commands, list)
     return VerificationEvidence(
         round_index=data["round_index"],
-        status=data["status"],
+        status=_verification_status(data["status"], source="result"),
         started_at=data["started_at"],
         ended_at=data["ended_at"],
         duration_seconds=float(data["duration_seconds"]),
@@ -56,13 +62,13 @@ def read_verification_result_text(
     run_path: Path,
     record: AttemptRecord,
     *,
-    expected_statuses: frozenset[str],
+    expected_statuses: frozenset[VerificationStatus],
 ) -> str:
     """Render validated verification evidence without exposing its JSON object."""
 
     data = _read_result(run_path, record)
     _validate_verification_result_shape(data)
-    if data["status"] not in expected_statuses:
+    if _verification_status(data["status"], source="result") not in expected_statuses:
         raise _VerificationArtifactError(
             "Verification result does not have an allowed status."
         )
@@ -78,10 +84,7 @@ def _validate_verification_result_shape(data: dict[str, Any]) -> None:
         raise _VerificationArtifactError(
             "Verification result has an unsupported format."
         )
-    if data.get("status") not in {"PASS", "FAIL", "ERROR"}:
-        raise _VerificationArtifactError(
-            "Verification result has an unsupported status."
-        )
+    _verification_status(data.get("status"), source="result")
     if not isinstance(data.get("round_index"), int) or isinstance(
         data.get("round_index"), bool
     ):
@@ -112,7 +115,7 @@ def read_verification_source_fingerprint(
     run_path: Path,
     run_record: RunRecord,
     *,
-    expected_statuses: frozenset[str],
+    expected_statuses: frozenset[VerificationStatus],
     verification_commands: tuple[VerificationCommand, ...],
     require_all_commands_pass: bool = False,
     require_authoritative_pass: bool = False,
@@ -198,7 +201,7 @@ def baseline_verification_evidence_problem(
         data = _read_result(run_path, record)
         _validate_verification_result(
             data,
-            expected_statuses=frozenset({"PASS"}),
+            expected_statuses=frozenset({VerificationStatus.PASS}),
             verification_commands=verification_commands,
             require_all_commands_pass=True,
         )
@@ -221,7 +224,7 @@ def _read_result(run_path: Path, record: AttemptRecord) -> dict[str, Any]:
 def _validate_verification_result(
     data: dict[str, Any],
     *,
-    expected_statuses: frozenset[str],
+    expected_statuses: frozenset[VerificationStatus],
     verification_commands: tuple[VerificationCommand, ...],
     require_all_commands_pass: bool = False,
     require_authoritative_pass: bool = False,
@@ -236,7 +239,10 @@ def _validate_verification_result(
         raise _VerificationArtifactError(
             "Verification result has an unsupported format."
         )
-    if data.get("status") not in expected_statuses:
+    if (
+        _verification_status(data.get("status"), source="result")
+        not in expected_statuses
+    ):
         raise _VerificationArtifactError(
             "Verification result does not have an allowed status."
         )
@@ -257,7 +263,8 @@ def _validate_verification_result(
                 "Verification command evidence does not match configuration."
             )
         if require_all_commands_pass and (
-            result.get("status") != "PASS"
+            _verification_status(result.get("status"), source="command")
+            is not VerificationStatus.PASS
             or result.get("exit_code") != 0
             or result.get("error_kind") is not None
             or result.get("error_message") is not None
@@ -278,6 +285,19 @@ def _validate_verification_result(
             data,
             expected_round_index=expected_round_index,
         )
+
+
+def _verification_status(value: object, *, source: str) -> VerificationStatus:
+    if not isinstance(value, str):
+        raise _VerificationArtifactError(
+            f"Verification {source} has an unsupported status."
+        )
+    try:
+        return VerificationStatus(value)
+    except ValueError as error:
+        raise _VerificationArtifactError(
+            f"Verification {source} has an unsupported status."
+        ) from error
 
 
 def _validate_authoritative_command_evidence(

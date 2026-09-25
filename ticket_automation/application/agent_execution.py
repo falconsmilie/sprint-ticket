@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from math import isclose, isfinite
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from stat import S_ISDIR, S_ISREG
 from types import MappingProxyType
 from typing import Generic, Protocol, TypeAlias, TypeVar
 
 from ..domain.task_results import ImplementationResult, ReviewResult, TaskResult
-from ..models import ATTEMPT_RESULT_ARTIFACT_NAME
+from ..models import ATTEMPT_RESULT_ARTIFACT_NAME, ATTEMPTS_DIR_NAME
 
 
 class AgentContractError(ValueError):
@@ -86,6 +88,52 @@ class AgentFailureCategory(StrEnum):
     CAPABILITY_OR_CONFIGURATION_FAILURE = "capability-or-configuration-failure"
 
 
+def validate_execution_semantics(
+    *,
+    status: AgentExecutionStatus,
+    invocation_start: InvocationStart,
+    failure_category: AgentFailureCategory | None,
+    failure_message: str | None,
+) -> None:
+    """Validate the shared runtime and persisted execution outcome vocabulary."""
+
+    if not isinstance(status, AgentExecutionStatus):
+        raise AgentContractError("status must be an AgentExecutionStatus value.")
+    if not isinstance(invocation_start, InvocationStart):
+        raise AgentContractError("invocation_start must be an InvocationStart value.")
+    if status is AgentExecutionStatus.SUCCESS:
+        if invocation_start is not InvocationStart.STARTED:
+            raise AgentContractError("successful execution must have started.")
+        if failure_category is not None or failure_message is not None:
+            raise AgentContractError(
+                "successful execution must not contain failure details."
+            )
+        return
+    if not isinstance(failure_category, AgentFailureCategory):
+        raise AgentContractError("failed execution must contain a failure category.")
+    if not isinstance(failure_message, str) or not failure_message.strip():
+        raise AgentContractError("failed execution must contain a failure message.")
+    pre_invocation_failures = {
+        AgentFailureCategory.PROVIDER_UNAVAILABLE,
+        AgentFailureCategory.INVOCATION_START_FAILURE,
+        AgentFailureCategory.CAPABILITY_OR_CONFIGURATION_FAILURE,
+    }
+    if (
+        failure_category in pre_invocation_failures
+        and invocation_start is not InvocationStart.NOT_STARTED
+    ):
+        raise AgentContractError(
+            f"{failure_category.value} must be recorded before invocation start."
+        )
+    if (
+        failure_category not in {*pre_invocation_failures, AgentFailureCategory.TIMEOUT}
+        and invocation_start is InvocationStart.NOT_STARTED
+    ):
+        raise AgentContractError(
+            f"{failure_category.value} requires a started or uncertain invocation."
+        )
+
+
 class ArtifactRole(StrEnum):
     """Stable provider-neutral meanings for attempt-owned artifacts."""
 
@@ -111,13 +159,54 @@ class AttemptArtifactLayout:
     run_root: Path
     attempt_root: Path
 
+    @classmethod
+    def attempts_root(cls, run_root: Path) -> Path:
+        """Resolve the canonical attempts root without allowing a run escape."""
+
+        resolved_run = _resolve_artifact_path(run_root, description="run root")
+        attempts_root = _resolve_artifact_path(
+            resolved_run / ATTEMPTS_DIR_NAME,
+            description="attempts root",
+        )
+        try:
+            attempts_relative = attempts_root.relative_to(resolved_run)
+        except ValueError as error:
+            raise AgentContractError(
+                "attempts root must remain inside the owning run."
+            ) from error
+        if not attempts_relative.parts:
+            raise AgentContractError("attempts root must remain inside the owning run.")
+        return attempts_root
+
+    @classmethod
+    def for_attempt(cls, run_root: Path, attempt_root: Path) -> AttemptArtifactLayout:
+        """Build the canonical layout for a direct child of ``run/attempts``."""
+
+        resolved_run = _resolve_artifact_path(run_root, description="run root")
+        attempts_root = cls.attempts_root(resolved_run)
+        layout = cls(resolved_run, attempt_root)
+        try:
+            attempt_relative = layout.attempt_root.relative_to(attempts_root)
+        except ValueError as error:
+            raise AgentContractError(
+                "attempt artifact root must remain inside the owning run attempts root."
+            ) from error
+        if len(attempt_relative.parts) != 1:
+            raise AgentContractError(
+                "attempt artifact root must be a direct child of the owning run attempts root."
+            )
+        return layout
+
     def __post_init__(self) -> None:
         if not isinstance(self.run_root, Path) or not isinstance(
             self.attempt_root, Path
         ):
             raise AgentContractError("artifact layout roots must be Path values.")
-        run_root = self.run_root.resolve(strict=False)
-        attempt_root = self.attempt_root.resolve(strict=False)
+        run_root = _resolve_artifact_path(self.run_root, description="run root")
+        attempt_root = _resolve_artifact_path(
+            self.attempt_root,
+            description="attempt artifact root",
+        )
         try:
             relative = attempt_root.relative_to(run_root)
         except ValueError as error:
@@ -139,9 +228,34 @@ class AttemptArtifactLayout:
     def artifact_directory(self) -> Path:
         return self.attempt_root
 
+    @staticmethod
+    def path_is_directory(path: Path, *, description: str) -> bool:
+        """Inspect a directory path without suppressing filesystem failures."""
+
+        resolved = _resolve_artifact_path(path, description=description)
+        details = _inspect_artifact_path(resolved, description=description)
+        return details is not None and S_ISDIR(details.st_mode)
+
+    @staticmethod
+    def path_is_file(path: Path, *, description: str) -> bool:
+        """Inspect a file path, returning false only for missing/non-file paths."""
+
+        resolved = _resolve_artifact_path(path, description=description)
+        details = _inspect_artifact_path(resolved, description=description)
+        return details is not None and S_ISREG(details.st_mode)
+
+    def artifact_file_exists(self, relative_path: str | PurePosixPath) -> bool:
+        """Inspect an attempt-owned file while preserving controlled failures."""
+
+        path = self.path(relative_path)
+        return self.path_is_file(path, description="attempt artifact")
+
     def path(self, relative_path: str | PurePosixPath) -> Path:
         relative = _validated_artifact_path(relative_path)
-        candidate = (self.attempt_root / Path(*relative.parts)).resolve(strict=False)
+        candidate = _resolve_artifact_path(
+            self.attempt_root / Path(*relative.parts),
+            description="artifact path",
+        )
         try:
             candidate.relative_to(self.attempt_root)
         except ValueError as error:
@@ -174,7 +288,7 @@ class AttemptArtifactLayout:
     ) -> ArtifactReference:
         if not isinstance(role, ArtifactRole):
             raise AgentContractError("artifact role must be an ArtifactRole value.")
-        resolved = path.resolve(strict=False)
+        resolved = _resolve_artifact_path(path, description="artifact reference")
         try:
             resolved.relative_to(self.attempt_root)
             run_relative = resolved.relative_to(self.run_root).as_posix()
@@ -182,7 +296,10 @@ class AttemptArtifactLayout:
             raise AgentContractError(
                 "artifact reference must remain inside the owning attempt."
             ) from error
-        if require_exists and not resolved.is_file():
+        if require_exists and not self.path_is_file(
+            resolved,
+            description="artifact reference",
+        ):
             raise AgentContractError(f"referenced artifact does not exist: {resolved}")
         return ArtifactReference(role, run_relative, media_type)
 
@@ -192,14 +309,20 @@ class AttemptArtifactLayout:
         if not isinstance(reference, ArtifactReference):
             raise AgentContractError("reference must be an ArtifactReference.")
         relative = _validated_artifact_path(reference.run_relative_path)
-        resolved = (self.run_root / Path(*relative.parts)).resolve(strict=False)
+        resolved = _resolve_artifact_path(
+            self.run_root / Path(*relative.parts),
+            description="artifact reference",
+        )
         try:
             resolved.relative_to(self.attempt_root)
         except ValueError as error:
             raise AgentContractError(
                 "artifact reference does not belong to the owning attempt."
             ) from error
-        if require_exists and not resolved.is_file():
+        if require_exists and not self.path_is_file(
+            resolved,
+            description="artifact reference",
+        ):
             raise AgentContractError(f"referenced artifact does not exist: {resolved}")
         return resolved
 
@@ -313,7 +436,10 @@ class AgentExecutionRequest(Generic[ResultT_co]):
             raise AgentContractError(
                 "artifact_layout must be an AttemptArtifactLayout."
             )
-        elif layout.attempt_root != self.artifact_directory.resolve(strict=False):
+        elif layout.attempt_root != _resolve_artifact_path(
+            self.artifact_directory,
+            description="artifact directory",
+        ):
             raise AgentContractError(
                 "artifact_directory must match the artifact layout attempt root."
             )
@@ -434,14 +560,18 @@ class AgentExecution(Generic[ResultT_co]):
             self._validate_success()
         else:
             self._validate_failure()
+        validate_execution_semantics(
+            status=self.status,
+            invocation_start=self.invocation_start,
+            failure_category=self.failure_category,
+            failure_message=self.failure_message,
+        )
 
     @property
     def successful(self) -> bool:
         return self.status is AgentExecutionStatus.SUCCESS
 
     def _validate_success(self) -> None:
-        if self.invocation_start is not InvocationStart.STARTED:
-            raise AgentContractError("successful execution must have started.")
         if self.result is None:
             raise AgentContractError(
                 "successful execution must contain a typed result."
@@ -450,48 +580,10 @@ class AgentExecution(Generic[ResultT_co]):
             raise AgentContractError(
                 "successful execution result does not match its task kind."
             )
-        if self.failure_category is not None or self.failure_message is not None:
-            raise AgentContractError(
-                "successful execution must not contain failure details."
-            )
 
     def _validate_failure(self) -> None:
         if self.result is not None:
             raise AgentContractError("failed execution must not contain a result.")
-        if not isinstance(self.failure_category, AgentFailureCategory):
-            raise AgentContractError(
-                "failed execution must contain a failure category."
-            )
-        if (
-            not isinstance(self.failure_message, str)
-            or not self.failure_message.strip()
-        ):
-            raise AgentContractError("failed execution must contain a failure message.")
-        if (
-            self.failure_category
-            in {
-                AgentFailureCategory.PROVIDER_UNAVAILABLE,
-                AgentFailureCategory.INVOCATION_START_FAILURE,
-                AgentFailureCategory.CAPABILITY_OR_CONFIGURATION_FAILURE,
-            }
-            and self.invocation_start is not InvocationStart.NOT_STARTED
-        ):
-            raise AgentContractError(
-                f"{self.failure_category.value} must be recorded before invocation start."
-            )
-        if (
-            self.failure_category
-            not in {
-                AgentFailureCategory.PROVIDER_UNAVAILABLE,
-                AgentFailureCategory.INVOCATION_START_FAILURE,
-                AgentFailureCategory.CAPABILITY_OR_CONFIGURATION_FAILURE,
-                AgentFailureCategory.TIMEOUT,
-            }
-            and self.invocation_start is InvocationStart.NOT_STARTED
-        ):
-            raise AgentContractError(
-                f"{self.failure_category.value} requires a started or uncertain invocation."
-            )
 
 
 class AgentExecutor(Protocol):
@@ -568,6 +660,62 @@ def _validate_timestamp(value: object, *, field_name: str) -> None:
         raise AgentContractError(f"{field_name} must be a timezone-aware datetime.")
 
 
+def _resolve_artifact_path(path: Path, *, description: str) -> Path:
+    """Resolve existing components while distinguishing absence from OS errors."""
+
+    try:
+        absolute = Path(os.path.abspath(path))
+    except (OSError, RuntimeError, ValueError) as error:
+        raise AgentContractError(
+            f"Could not resolve {description} safely: {error}"
+        ) from error
+    try:
+        return absolute.resolve(strict=True)
+    except FileNotFoundError as error:
+        # ``Path.resolve(strict=False)`` suppresses all OSErrors on supported
+        # Python versions. Walk to the nearest missing component explicitly so
+        # only genuine absence is tolerated and dangling links still fail.
+        try:
+            absolute.lstat()
+        except FileNotFoundError:
+            parent = absolute.parent
+            if parent == absolute:
+                raise AgentContractError(
+                    f"Could not resolve {description} safely: {error}"
+                ) from error
+            return (
+                _resolve_artifact_path(
+                    parent,
+                    description=description,
+                )
+                / absolute.name
+            )
+        except OSError as inspection_error:
+            raise AgentContractError(
+                f"Could not inspect {description} while resolving it safely: "
+                f"{inspection_error}"
+            ) from inspection_error
+        raise AgentContractError(
+            f"Could not resolve {description} safely: an existing path component "
+            "has a missing target."
+        ) from error
+    except (OSError, RuntimeError) as error:
+        raise AgentContractError(
+            f"Could not resolve {description} safely: {error}"
+        ) from error
+
+
+def _inspect_artifact_path(path: Path, *, description: str) -> os.stat_result | None:
+    try:
+        return path.stat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise AgentContractError(
+            f"Could not inspect {description} safely: {error}"
+        ) from error
+
+
 def _validated_artifact_path(value: object) -> PurePosixPath:
     if not isinstance(value, str | PurePosixPath):
         raise AgentContractError("artifact path must be a POSIX relative path.")
@@ -641,4 +789,5 @@ __all__ = [
     "ProviderMetadataValue",
     "RepositoryAccess",
     "required_execution_capabilities",
+    "validate_execution_semantics",
 ]

@@ -834,16 +834,6 @@ class GuardedWritableOperation:
                 f"workspace-guard-artifact: {type(error).__name__}: {error}"
             )
             return _with_guard_evidence_errors(inspection, tracker.evidence_errors)
-        evidence_error_count = len(tracker.evidence_errors)
-        if len(tracker.evidence_errors) != evidence_error_count:
-            persisted = _with_guard_evidence_errors(persisted, tracker.evidence_errors)
-            try:
-                write_workspace_guard_inspection(persisted)
-            except BaseException as error:  # noqa: BLE001 - audit failure must fail closed.
-                tracker.evidence_errors.append(
-                    f"workspace-guard-artifact: {type(error).__name__}: {error}"
-                )
-                return _with_guard_evidence_errors(inspection, tracker.evidence_errors)
         return persisted
 
     def _executor_capability_problem(

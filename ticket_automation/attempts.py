@@ -15,9 +15,14 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .application.agent_execution import EXECUTION_EVIDENCE_FILE
+from .application.agent_execution import (
+    EXECUTION_EVIDENCE_FILE,
+    AgentContractError,
+    AttemptArtifactLayout,
+)
 from .models import (
     ATTEMPT_STATUS_BY_STAGE_OUTCOME,
+    ATTEMPTS_DIR_NAME,
     PHASE_DEFINITIONS,
     AttemptPhase,
     AttemptStatus,
@@ -31,7 +36,6 @@ from .persistence import (
     timestamp_now,
 )
 
-ATTEMPTS_DIR_NAME = "attempts"
 ATTEMPT_RECORD_FILE = "attempt.json"
 ATTEMPT_RECORD_FORMAT = "ticket_automation.attempt"
 ATTEMPT_RECORD_SCHEMA_VERSION = 1
@@ -152,8 +156,9 @@ def require_stage_attempt(
             f"Stage received {attempt.phase.value} attempt evidence; "
             f"expected {phase.value}."
         )
-    attempt_result_path(run_dir, attempt)
-    persisted = _load_attempt(attempt.artifact_directory / ATTEMPT_RECORD_FILE)
+    attempt_layout = attempt_artifact_layout(run_dir, attempt)
+    persisted = _load_attempt(attempt_layout.path(ATTEMPT_RECORD_FILE))
+    persisted_layout = attempt_artifact_layout(run_dir, persisted)
     if persisted.status is not AttemptStatus.STARTED:
         raise AttemptError("Stage execution requires an active started attempt.")
     if (
@@ -162,8 +167,7 @@ def require_stage_attempt(
         or persisted.before_workspace_fingerprint
         != attempt.before_workspace_fingerprint
         or persisted.result_path != attempt.result_path
-        or _path_identity(persisted.artifact_directory)
-        != _path_identity(attempt.artifact_directory)
+        or persisted_layout.attempt_root != attempt_layout.attempt_root
     ):
         raise AttemptError("Stage attempt identity does not match persisted evidence.")
     return attempt
@@ -307,17 +311,40 @@ def load_attempt_records(run_dir: Path | str) -> tuple[AttemptRecord, ...]:
     completely; otherwise callers must stop rather than infer state from it.
     """
 
-    root = Path(run_dir) / ATTEMPTS_DIR_NAME
-    if not root.is_dir():
-        return ()
+    run_path = Path(run_dir)
+    try:
+        root = AttemptArtifactLayout.attempts_root(run_path)
+        if not AttemptArtifactLayout.path_is_directory(
+            root,
+            description="attempts root",
+        ):
+            return ()
+        directories = sorted(root.iterdir(), key=lambda item: item.name)
+    except (AgentContractError, OSError, RuntimeError) as error:
+        raise AttemptError(
+            f"Could not inspect the owning run attempts directory safely: {error}"
+        ) from error
     records: list[AttemptRecord] = []
-    for directory in sorted(root.iterdir(), key=lambda item: item.name):
-        if not directory.is_dir() or directory.name.startswith("."):
+    for directory in directories:
+        if directory.name.startswith("."):
             continue
-        path = directory / ATTEMPT_RECORD_FILE
-        if not path.exists():
-            continue
-        records.append(_load_attempt(path))
+        try:
+            layout = AttemptArtifactLayout.for_attempt(run_path, directory)
+            if not AttemptArtifactLayout.path_is_directory(
+                layout.attempt_root,
+                description="attempt root",
+            ):
+                continue
+            path = layout.path(ATTEMPT_RECORD_FILE)
+            if not layout.artifact_file_exists(ATTEMPT_RECORD_FILE):
+                continue
+            record = _load_attempt(path)
+            attempt_artifact_layout(run_path, record)
+        except (AgentContractError, OSError, RuntimeError) as error:
+            raise AttemptError(
+                f"Could not inspect attempt directory {directory} safely: {error}"
+            ) from error
+        records.append(record)
     ordered = tuple(sorted(records, key=lambda item: item.sequence))
     sequences = [record.sequence for record in ordered]
     if len(sequences) != len(set(sequences)):
@@ -415,13 +442,14 @@ def complete_stage_attempt(
         raise AttemptError("attempt must be an AttemptRecord.")
     if not isinstance(stage_outcome, StageOutcome):
         raise AttemptError("stage_outcome must be a StageOutcome value.")
-    attempt_result_path(run_dir, attempt)
-    persisted = _load_attempt(attempt.path)
+    attempt_layout = attempt_artifact_layout(run_dir, attempt)
+    persisted = _load_attempt(attempt_layout.path(ATTEMPT_RECORD_FILE))
+    persisted_layout = attempt_artifact_layout(run_dir, persisted)
     if (
         persisted.sequence != attempt.sequence
         or persisted.phase is not attempt.phase
         or persisted.result_path != attempt.result_path
-        or persisted.artifact_directory != attempt.artifact_directory
+        or persisted_layout.attempt_root != attempt_layout.attempt_root
     ):
         raise AttemptError("Persisted attempt identity changed during stage dispatch.")
     if persisted.status is not AttemptStatus.STARTED:
@@ -434,7 +462,11 @@ def complete_stage_attempt(
         process_started=process_started,
         execution_path=(
             EXECUTION_EVIDENCE_FILE
-            if (persisted.artifact_directory / EXECUTION_EVIDENCE_FILE).is_file()
+            if attempt_artifact_file_exists(
+                run_dir,
+                persisted,
+                EXECUTION_EVIDENCE_FILE,
+            )
             else persisted.execution_path
         ),
         metadata=persisted.metadata if metadata is None else metadata,
@@ -445,21 +477,67 @@ def complete_stage_attempt(
 def attempt_result_path(
     run_dir: Path | str, record: AttemptRecord | StageAttempt
 ) -> Path:
-    return _attempt_artifact_path(run_dir, record, record.result_path)
+    return attempt_artifact_path(run_dir, record, record.result_path)
 
 
-def _attempt_artifact_path(
+def attempt_artifact_layout(
+    run_dir: Path | str,
+    record: AttemptRecord | StageAttempt,
+) -> AttemptArtifactLayout:
+    """Return the one physically confined path owner for an attempt record."""
+
+    if not isinstance(record, AttemptRecord | StageAttempt):
+        raise AttemptError("record must be an AttemptRecord or StageAttempt.")
+    expected_directory = Path(run_dir) / ATTEMPTS_DIR_NAME / _directory_name(record)
+    try:
+        expected_layout = AttemptArtifactLayout.for_attempt(
+            Path(run_dir),
+            expected_directory,
+        )
+    except AgentContractError as error:
+        raise AttemptError(f"Attempt artifact confinement failed: {error}") from error
+    try:
+        record_layout = AttemptArtifactLayout.for_attempt(
+            Path(run_dir),
+            record.artifact_directory,
+        )
+    except AgentContractError as error:
+        raise AttemptError(
+            f"Attempt record does not belong to the supplied run directory: {error}"
+        ) from error
+    if record_layout.attempt_root != expected_layout.attempt_root:
+        raise AttemptError(
+            "Attempt record does not belong to the supplied run directory."
+        )
+    return expected_layout
+
+
+def attempt_artifact_path(
     run_dir: Path | str,
     record: AttemptRecord | StageAttempt,
     relative_path: str,
 ) -> Path:
-    expected_directory = Path(run_dir) / ATTEMPTS_DIR_NAME / _directory_name(record)
-    if _path_identity(record.artifact_directory) != _path_identity(expected_directory):
-        raise AttemptError(
-            "Attempt record does not belong to the supplied run directory."
-        )
+    layout = attempt_artifact_layout(run_dir, record)
     _validate_relative_artifact_path(relative_path, field="artifact path")
-    return expected_directory / PurePosixPath(relative_path)
+    try:
+        return layout.path(relative_path)
+    except AgentContractError as error:
+        raise AttemptError(f"Attempt artifact confinement failed: {error}") from error
+
+
+def attempt_artifact_file_exists(
+    run_dir: Path | str,
+    record: AttemptRecord | StageAttempt,
+    relative_path: str,
+) -> bool:
+    """Return false for a missing artifact and reject inspection failures."""
+
+    layout = attempt_artifact_layout(run_dir, record)
+    _validate_relative_artifact_path(relative_path, field="artifact path")
+    try:
+        return layout.artifact_file_exists(relative_path)
+    except AgentContractError as error:
+        raise AttemptError(f"Attempt artifact inspection failed: {error}") from error
 
 
 def _load_attempt(path: Path) -> AttemptRecord:
@@ -500,8 +578,16 @@ def _load_attempt(path: Path) -> AttemptRecord:
 def _next_sequence(root: Path) -> int:
     sequences: list[int] = []
     for directory in root.iterdir():
-        if not directory.is_dir():
-            continue
+        try:
+            if not AttemptArtifactLayout.path_is_directory(
+                directory,
+                description="attempt sequence entry",
+            ):
+                continue
+        except AgentContractError as error:
+            raise AttemptError(
+                f"Could not inspect attempt sequence entries safely: {error}"
+            ) from error
         match = _ATTEMPT_DIRECTORY_PATTERN.fullmatch(directory.name)
         if match is not None:
             sequences.append(int(match.group(1)))
@@ -722,13 +808,6 @@ def _metadata_string(data: dict[str, Any], field: str) -> str | None:
     return value
 
 
-def _path_identity(path: Path) -> Path:
-    try:
-        return path.resolve(strict=False)
-    except OSError:
-        return path.absolute()
-
-
 def _remove_temporary_attempt_directory(path: Path) -> None:
     try:
         for item in path.iterdir():
@@ -747,6 +826,9 @@ __all__ = [
     "AttemptMetadata",
     "AttemptRecord",
     "StageAttempt",
+    "attempt_artifact_file_exists",
+    "attempt_artifact_layout",
+    "attempt_artifact_path",
     "attempt_result_path",
     "complete_attempt",
     "complete_stage_attempt",

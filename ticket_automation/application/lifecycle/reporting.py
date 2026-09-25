@@ -69,7 +69,7 @@ class ReportingStageHandler:
             context.run_record,
             result,
             reporting_evidence=ReportingEvidence(
-                status=("PASS" if outcome is StageOutcome.COMPLETED else outcome.value),
+                status=outcome,
                 message=handoff.reason,
             ),
             stop_category=stop_category,
