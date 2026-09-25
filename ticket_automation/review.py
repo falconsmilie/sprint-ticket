@@ -67,6 +67,7 @@ from .runs import (
     RunError,
     RunRecord,
     load_baseline_record,
+    load_baseline_record_for_owner,
     load_run_record,
     load_run_record_for_owner,
 )
@@ -233,7 +234,11 @@ def _run_review_stage(
         run_ownership=run_ownership,
     )
 
-    baseline_record = load_baseline_record(run_path / BASELINE_RECORD_FILE)
+    baseline_record = (
+        load_baseline_record(run_path / BASELINE_RECORD_FILE)
+        if run_ownership is None
+        else load_baseline_record_for_owner(run_ownership)
+    )
     if baseline_record.branch != run_record.starting_branch:
         raise ReviewError("Run record and baseline branch do not match.")
     if baseline_record.head_sha != run_record.baseline_sha:
@@ -301,6 +306,7 @@ def _run_review_stage(
         run_record,
         repository_snapshot,
         verification_commands=config.verification.commands,
+        run_ownership=run_ownership,
     )
     if source_violations:
         return _finish(
@@ -320,15 +326,25 @@ def _run_review_stage(
         )
     try:
         prompt = _render_review_prompt(
-            ticket_text=_read_snapshotted_ticket(run_path / RUN_TICKET_FILE),
+            ticket_text=_read_snapshotted_ticket(
+                run_path / RUN_TICKET_FILE,
+                run_ownership=run_ownership,
+            ),
             run_record=run_record,
             current_branch=(
                 "<detached>"
                 if repository_snapshot.branch is None
                 else repository_snapshot.branch
             ),
-            verification_results=_read_verification_results(run_path, run_record),
-            implementation_summary=_read_implementation_summary(run_path),
+            verification_results=_read_verification_results(
+                run_path,
+                run_record,
+                run_ownership=run_ownership,
+            ),
+            implementation_summary=_read_implementation_summary(
+                run_path,
+                run_ownership=run_ownership,
+            ),
         )
     except ReviewError as error:
         return _finish(
@@ -370,6 +386,9 @@ def _run_review_stage(
             RepositoryAccess.READ_ONLY
         ),
     )
+    if run_ownership is not None:
+        run_ownership.validate_run_path(run_path)
+    request.artifact_layout.revalidate()
     execution = agent_executor.execute(
         request,
         on_invocation_start=mark_invocation_started,
@@ -591,9 +610,18 @@ def _render_review_prompt(
     return template
 
 
-def _read_snapshotted_ticket(path: Path) -> str:
+def _read_snapshotted_ticket(
+    path: Path,
+    *,
+    run_ownership: RunOwnership | None = None,
+) -> str:
     try:
-        return path.read_bytes().decode("utf-8")
+        contents = (
+            path.read_bytes()
+            if run_ownership is None
+            else run_ownership.read_descendant(path, lambda source: source.read_bytes())
+        )
+        return contents.decode("utf-8")
     except OSError as error:
         raise ReviewError(
             f"Could not read snapshotted ticket: {path}: {error}"
@@ -604,21 +632,32 @@ def _read_snapshotted_ticket(path: Path) -> str:
         ) from error
 
 
-def _read_verification_results(run_path: Path, run_record: RunRecord) -> str:
+def _read_verification_results(
+    run_path: Path,
+    run_record: RunRecord,
+    *,
+    run_ownership: RunOwnership | None = None,
+) -> str:
     del run_record
     attempt = latest_attempt(
         run_path,
         phases=(AttemptPhase.VERIFYING,),
         statuses=(AttemptStatus.COMPLETED,),
+        run_ownership=run_ownership,
     )
     if attempt is None:
         raise ReviewError("Missing deterministic verification results.")
-    verification_path = attempt_result_path(run_path, attempt)
+    verification_path = attempt_result_path(
+        run_path,
+        attempt,
+        run_ownership=run_ownership,
+    )
     try:
         return read_verification_result_text(
             run_path,
             attempt,
             expected_statuses=frozenset({VerificationStatus.PASS}),
+            run_ownership=run_ownership,
         )
     except ValueError as error:
         raise ReviewError(
@@ -626,16 +665,25 @@ def _read_verification_results(run_path: Path, run_record: RunRecord) -> str:
         ) from error
 
 
-def _read_implementation_summary(run_path: Path) -> str:
+def _read_implementation_summary(
+    run_path: Path,
+    *,
+    run_ownership: RunOwnership | None = None,
+) -> str:
     attempt = latest_attempt(
         run_path,
         phases=(AttemptPhase.IMPLEMENTING,),
         statuses=(AttemptStatus.COMPLETED,),
+        run_ownership=run_ownership,
     )
     if attempt is None:
         return "No implementation summary is available."
     try:
-        result = read_implementation_result(run_path, attempt)
+        result = read_implementation_result(
+            run_path,
+            attempt,
+            run_ownership=run_ownership,
+        )
     except PersistenceCodecError:
         return (
             "Implementation summary is unavailable because the result artifact "
@@ -692,6 +740,7 @@ def _inspect_review_source_fingerprint(
     current: WorkspaceSnapshot,
     *,
     verification_commands: tuple[VerificationCommand, ...],
+    run_ownership: RunOwnership | None = None,
 ) -> tuple[ReviewSafetyViolation, ...]:
     try:
         expected = read_verification_source_fingerprint(
@@ -699,6 +748,7 @@ def _inspect_review_source_fingerprint(
             run_record,
             expected_statuses=frozenset({VerificationStatus.PASS}),
             verification_commands=verification_commands,
+            run_ownership=run_ownership,
         )
     except ValueError as error:
         return (

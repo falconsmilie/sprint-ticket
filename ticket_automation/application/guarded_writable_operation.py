@@ -527,6 +527,10 @@ class GuardedWritableOperation:
         after_workspace: WorkspaceSnapshot | None = None
         after_error: str | None = None
         try:
+            self._validate_run_artifacts(
+                request.execution_request.artifact_directory,
+                artifact_layout=layout,
+            )
             execution = self._executor.execute(
                 request.execution_request,
                 on_invocation_start=tracker.mark_started,

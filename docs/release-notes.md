@@ -21,3 +21,7 @@ Run resume and status now reject traversal IDs, linked run directories, and run
 records whose identity does not match their directory. Attempt-ledger writes are
 physically confined to the owning run, and final patch/report publication uses
 atomic replacement rather than following a pre-existing file link.
+Authoritative lifecycle reads retain the controller's bound run identity as well;
+a direct-directory replacement during resume, handoff, review/correction evidence
+loading, verification evidence loading, or reporting is rejected before its data
+can influence workflow or presentation decisions.

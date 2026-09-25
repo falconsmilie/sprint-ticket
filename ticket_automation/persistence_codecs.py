@@ -17,6 +17,7 @@ from .domain.task_results import (
 )
 from .models import StageOutcome, VerificationStatus
 from .persistence import CodecError, atomic_write_json, read_json
+from .run_ownership import RunOwnership
 from .task_result_codecs import (
     decode_implementation_result,
     decode_review_result,
@@ -45,14 +46,29 @@ class StageMessageResult:
 def _read_attempt_result_value(
     run_dir: Path | str,
     attempt: AttemptRecord,
+    *,
+    run_ownership: RunOwnership | None = None,
 ) -> object | None:
     """Decode an optional attempt result as JSON without interpreting its schema."""
 
-    path = attempt_result_path(run_dir, attempt)
-    if not attempt_artifact_file_exists(run_dir, attempt, attempt.result_path):
+    path = attempt_result_path(
+        run_dir,
+        attempt,
+        run_ownership=run_ownership,
+    )
+    if not attempt_artifact_file_exists(
+        run_dir,
+        attempt,
+        attempt.result_path,
+        run_ownership=run_ownership,
+    ):
         return None
     try:
-        return read_json(path)
+        return (
+            read_json(path)
+            if run_ownership is None
+            else run_ownership.read_descendant(path, read_json)
+        )
     except CodecError as error:
         raise PersistenceCodecError(
             f"Attempt result artifact could not be read as JSON: {path}: {error}"
@@ -62,8 +78,14 @@ def _read_attempt_result_value(
 def read_implementation_result(
     run_dir: Path | str,
     attempt: AttemptRecord,
+    *,
+    run_ownership: RunOwnership | None = None,
 ) -> ImplementationResult | None:
-    value = _read_attempt_result_value(run_dir, attempt)
+    value = _read_attempt_result_value(
+        run_dir,
+        attempt,
+        run_ownership=run_ownership,
+    )
     if value is None:
         return None
     try:
@@ -75,8 +97,14 @@ def read_implementation_result(
 def read_review_result(
     run_dir: Path | str,
     attempt: AttemptRecord,
+    *,
+    run_ownership: RunOwnership | None = None,
 ) -> ReviewResult | None:
-    value = _read_attempt_result_value(run_dir, attempt)
+    value = _read_attempt_result_value(
+        run_dir,
+        attempt,
+        run_ownership=run_ownership,
+    )
     if value is None:
         return None
     try:
@@ -88,8 +116,14 @@ def read_review_result(
 def read_stage_message_result(
     run_dir: Path | str,
     attempt: AttemptRecord,
+    *,
+    run_ownership: RunOwnership | None = None,
 ) -> StageMessageResult | None:
-    value = _read_attempt_result_value(run_dir, attempt)
+    value = _read_attempt_result_value(
+        run_dir,
+        attempt,
+        run_ownership=run_ownership,
+    )
     if value is None:
         return None
     if not isinstance(value, dict) or set(value) != {"status", "message"}:
@@ -106,8 +140,14 @@ def read_stage_message_result(
 def read_verification_failures(
     run_dir: Path | str,
     attempt: AttemptRecord,
+    *,
+    run_ownership: RunOwnership | None = None,
 ) -> tuple[VerificationFailure, ...]:
-    value = _read_attempt_result_value(run_dir, attempt)
+    value = _read_attempt_result_value(
+        run_dir,
+        attempt,
+        run_ownership=run_ownership,
+    )
     if value is None:
         return ()
     if not isinstance(value, dict):

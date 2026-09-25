@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
 
+import ticket_automation.persistence_codecs as persistence_codecs_module
 from tests.architecture_fitness import parse_imports
 from ticket_automation.attempts import complete_attempt, start_attempt
 from ticket_automation.correction_planner import (
@@ -29,6 +31,7 @@ from ticket_automation.domain.task_results import (
     ReviewVerdict,
 )
 from ticket_automation.models import AttemptPhase, AttemptStatus
+from ticket_automation.run_ownership import RunOwnership, RunOwnershipError
 from ticket_automation.task_result_codecs import encode_review_result
 from ticket_automation.verification import VerificationError, VerificationFailure
 
@@ -300,6 +303,41 @@ def test_plan_pending_correction_reconstructs_owned_verification_failure(
     cause_set = plan_pending_correction(tmp_path)
 
     assert cause_set == plan_verification_correction((failure,))
+
+
+def test_owned_correction_plan_rejects_run_replacement_during_result_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "runs" / "run-1"
+    failure = _failure(run_dir, exit_code=None)
+    _completed_attempt(
+        run_dir,
+        phase=AttemptPhase.VERIFYING,
+        payload={"status": "FAIL", "correction_reasons": [failure.to_dict()]},
+    )
+    ownership = RunOwnership.acquire(run_dir.parent, run_dir.name)
+    moved_run = tmp_path / "original-correction-run"
+    original_read_json = persistence_codecs_module.read_json
+    replaced = False
+
+    def replace_run_after_read(path):
+        nonlocal replaced
+        value = original_read_json(path)
+        if not replaced:
+            run_dir.rename(moved_run)
+            shutil.copytree(moved_run, run_dir)
+            replaced = True
+        return value
+
+    monkeypatch.setattr(
+        persistence_codecs_module,
+        "read_json",
+        replace_run_after_read,
+    )
+
+    with pytest.raises(RunOwnershipError, match="ownership was lost|replaced"):
+        plan_pending_correction(run_dir, run_ownership=ownership)
 
 
 def test_plan_pending_correction_maps_persisted_review_result(tmp_path: Path) -> None:

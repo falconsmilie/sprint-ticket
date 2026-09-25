@@ -205,7 +205,10 @@ def require_stage_attempt(
         attempt,
         run_ownership=run_ownership,
     )
-    persisted = _load_attempt(attempt_layout.path(ATTEMPT_RECORD_FILE))
+    persisted = _load_attempt(
+        attempt_layout.path(ATTEMPT_RECORD_FILE),
+        run_ownership=run_ownership,
+    )
     persisted = replace(persisted, artifact_layout=attempt_layout)
     persisted_layout = attempt_artifact_layout(
         run_dir,
@@ -333,7 +336,7 @@ def save_attempt(
         raise AttemptError(
             "Attempt update requires the original persisted attempt record."
         )
-    persisted = _load_attempt(path)
+    persisted = _load_attempt(path, run_ownership=run_ownership)
     if not _same_attempt_identity(persisted, record):
         raise AttemptError("Persisted attempt identity changed before update.")
     atomic_write_json(path, record.to_dict())
@@ -432,8 +435,17 @@ def load_attempt_records(
             root,
             description="attempts root",
         ):
+            if run_ownership is not None:
+                run_ownership.validate_run_path(run_path)
             return ()
-        directories = sorted(root.iterdir(), key=lambda item: item.name)
+        directories = (
+            sorted(root.iterdir(), key=lambda item: item.name)
+            if run_ownership is None
+            else run_ownership.read_descendant(
+                root,
+                lambda source: sorted(source.iterdir(), key=lambda item: item.name),
+            )
+        )
     except (AgentContractError, OSError, RuntimeError) as error:
         raise AttemptError(
             f"Could not inspect the owning run attempts directory safely: {error}"
@@ -456,7 +468,7 @@ def load_attempt_records(
             path = layout.path(ATTEMPT_RECORD_FILE)
             if not layout.artifact_file_exists(ATTEMPT_RECORD_FILE):
                 continue
-            record = _load_attempt(path)
+            record = _load_attempt(path, run_ownership=run_ownership)
             record = replace(record, artifact_layout=layout)
             attempt_artifact_layout(
                 run_path,
@@ -482,10 +494,11 @@ def latest_attempt(
     *,
     phases: Iterable[AttemptPhase] | None = None,
     statuses: Iterable[AttemptStatus] | None = None,
+    run_ownership: RunOwnership | None = None,
 ) -> AttemptRecord | None:
     phase_set = None if phases is None else _phase_filter(phases)
     status_set = None if statuses is None else _status_filter(statuses)
-    for record in reversed(load_attempt_records(run_dir)):
+    for record in reversed(load_attempt_records(run_dir, run_ownership=run_ownership)):
         if phase_set is not None and record.phase not in phase_set:
             continue
         if status_set is not None and record.status not in status_set:
@@ -494,7 +507,11 @@ def latest_attempt(
     return None
 
 
-def latest_writable_attempt(run_dir: Path | str) -> AttemptRecord | None:
+def latest_writable_attempt(
+    run_dir: Path | str,
+    *,
+    run_ownership: RunOwnership | None = None,
+) -> AttemptRecord | None:
     return latest_attempt(
         run_dir,
         phases=(
@@ -503,6 +520,7 @@ def latest_writable_attempt(run_dir: Path | str) -> AttemptRecord | None:
             if definition.writes_target_repository
         ),
         statuses=(AttemptStatus.COMPLETED,),
+        run_ownership=run_ownership,
     )
 
 
@@ -528,7 +546,10 @@ def complete_stage_attempt(
         attempt,
         run_ownership=run_ownership,
     )
-    persisted = _load_attempt(attempt_layout.path(ATTEMPT_RECORD_FILE))
+    persisted = _load_attempt(
+        attempt_layout.path(ATTEMPT_RECORD_FILE),
+        run_ownership=run_ownership,
+    )
     persisted = replace(persisted, artifact_layout=attempt_layout)
     persisted_layout = attempt_artifact_layout(
         run_dir,
@@ -683,9 +704,17 @@ def attempt_artifact_file_exists(
         raise AttemptError(f"Attempt artifact inspection failed: {error}") from error
 
 
-def _load_attempt(path: Path) -> AttemptRecord:
+def _load_attempt(
+    path: Path,
+    *,
+    run_ownership: RunOwnership | None = None,
+) -> AttemptRecord:
     try:
-        data = read_json_object(path)
+        data = (
+            read_json_object(path)
+            if run_ownership is None
+            else run_ownership.read_descendant(path, read_json_object)
+        )
     except CodecError as error:
         raise AttemptError(f"Could not read attempt record {path}: {error}") from error
     if not isinstance(data, dict):
@@ -721,6 +750,8 @@ def _load_attempt(path: Path) -> AttemptRecord:
             schema_version=data["schema_version"],
             format=data["format"],
         )
+        if run_ownership is not None:
+            run_ownership.validate_descendant(path)
         return record
     except (KeyError, TypeError, ValueError, AttemptError) as error:
         raise AttemptError(f"Invalid attempt record {path}: {error}") from error

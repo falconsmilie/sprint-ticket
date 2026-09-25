@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TypeVar
 
 _RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_ReadResultT = TypeVar("_ReadResultT")
 
 
 class RunOwnershipError(RuntimeError):
@@ -201,6 +204,27 @@ class RunOwnership:
                     f"Run-owned path was retargeted outside its owner: {requested}"
                 ) from error
         return requested
+
+    def read_descendant(
+        self,
+        path: Path | str,
+        reader: Callable[[Path], _ReadResultT],
+    ) -> _ReadResultT:
+        """Read below this run and reject ownership loss during the read.
+
+        A path check made only before opening a file cannot detect replacement of
+        the owning run while the read is in progress.  The ``finally`` check is
+        deliberately part of this primitive so no decoded value or suppressed
+        reader error can escape after the physical owner changes.
+        """
+
+        if not callable(reader):
+            raise TypeError("reader must be callable.")
+        source = self.validate_descendant(path)
+        try:
+            return reader(source)
+        finally:
+            self.validate_descendant(source)
 
 
 def validate_unlinked_run_directory(path: Path | str) -> Path:

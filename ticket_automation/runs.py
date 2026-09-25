@@ -511,7 +511,10 @@ def load_run_record_for_owner(ownership: RunOwnership) -> RunRecord:
     if not isinstance(ownership, RunOwnership):
         raise TypeError("ownership must be a RunOwnership.")
     run_dir = ownership.validate()
-    record = load_run_record(run_dir / RUN_RECORD_FILE)
+    record = ownership.read_descendant(
+        run_dir / RUN_RECORD_FILE,
+        load_run_record,
+    )
     if record.run_id != ownership.run_id:
         raise RunError(
             "Run record identity does not match its owning directory: "
@@ -523,6 +526,7 @@ def load_run_record_for_owner(ownership: RunOwnership) -> RunRecord:
         raise RunError(
             "Run record ticket path does not match its owning run directory."
         )
+    ownership.validate()
     return record
 
 
@@ -544,6 +548,17 @@ def save_owned_run_record(ownership: RunOwnership, record: RunRecord) -> None:
 def load_baseline_record(path: Path | str) -> BaselineRecord:
     data = _load_json_object(Path(path))
     return BaselineRecord.from_dict(data)
+
+
+def load_baseline_record_for_owner(ownership: RunOwnership) -> BaselineRecord:
+    """Load the baseline only while its physical run owner remains bound."""
+
+    if not isinstance(ownership, RunOwnership):
+        raise TypeError("ownership must be a RunOwnership.")
+    return ownership.read_descendant(
+        ownership.run_dir / BASELINE_RECORD_FILE,
+        load_baseline_record,
+    )
 
 
 def save_baseline_record(record: BaselineRecord, path: Path | str) -> None:
@@ -888,6 +903,7 @@ __all__ = [
     "format_status",
     "list_run_records",
     "load_baseline_record",
+    "load_baseline_record_for_owner",
     "load_owned_run_record",
     "load_run_record",
     "load_run_record_for_owner",

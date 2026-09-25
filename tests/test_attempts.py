@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -48,6 +49,7 @@ from ticket_automation.attempts import (
     complete_attempt,
     complete_stage_attempt,
     latest_attempt,
+    latest_writable_attempt,
     load_attempt_records,
     start_attempt,
     update_attempt,
@@ -889,6 +891,64 @@ def test_resume_preflight_rejects_a_linked_attempt_directory(
         assert "Attempt evidence is invalid" in problem
     finally:
         remove_directory_link(record.artifact_directory)
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required")
+def test_resume_preflight_rejects_a_replaced_run_bound_to_the_controller(
+    tmp_path: Path,
+) -> None:
+    repository = create_git_repo(tmp_path / "target")
+    config = make_config(repository)
+    ticket = tmp_path / "TA-CORR-001.md"
+    ticket.write_text("# Ticket\n", encoding="utf-8")
+    snapshot = create_trusted_prepared_run(
+        config,
+        ticket,
+        runs_dir=tmp_path / "runs",
+        clock=fixed_clock,
+    )
+    original_run = tmp_path / "original-run"
+    snapshot.run_dir.rename(original_run)
+    shutil.copytree(original_run, snapshot.run_dir)
+
+    with pytest.raises(RunOwnershipError, match="ownership was lost|replaced"):
+        resume_preflight_problem(
+            config,
+            snapshot.run_dir,
+            snapshot.run_record,
+            run_ownership=snapshot.run_ownership,
+        )
+
+
+def test_latest_attempt_readers_reject_a_replaced_bound_run(tmp_path: Path) -> None:
+    run_dir = tmp_path / "runs" / "run-1"
+    record = start_attempt(
+        run_dir,
+        phase=AttemptPhase.IMPLEMENTING,
+        before_workspace_fingerprint=None,
+        clock=fixed_clock,
+    )
+    complete_attempt(
+        record,
+        status=AttemptStatus.COMPLETED,
+        after_workspace_fingerprint="after",
+        clock=fixed_clock,
+    )
+    ownership = RunOwnership.acquire(run_dir.parent, run_dir.name)
+    original_run = tmp_path / "original-attempt-run"
+    run_dir.rename(original_run)
+    shutil.copytree(original_run, run_dir)
+
+    with pytest.raises(RunOwnershipError, match="ownership was lost|replaced"):
+        latest_attempt(run_dir, run_ownership=ownership)
+    with pytest.raises(RunOwnershipError, match="ownership was lost|replaced"):
+        latest_writable_attempt(run_dir, run_ownership=ownership)
+    with pytest.raises(RunOwnershipError, match="ownership was lost|replaced"):
+        read_stage_message_result(
+            run_dir,
+            record,
+            run_ownership=ownership,
+        )
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required")

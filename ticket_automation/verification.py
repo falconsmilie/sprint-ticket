@@ -41,6 +41,7 @@ from .runs import (
     RunError,
     RunRecord,
     load_baseline_record,
+    load_baseline_record_for_owner,
     load_run_record,
     load_run_record_for_owner,
 )
@@ -396,11 +397,21 @@ def run_baseline_verification_stage(
     )
     assert attempt.artifact_layout is not None
     artifact_layout = attempt.artifact_layout
-    baseline = load_baseline_record(run_path / BASELINE_RECORD_FILE)
+    baseline = (
+        load_baseline_record(run_path / BASELINE_RECORD_FILE)
+        if run_ownership is None
+        else load_baseline_record_for_owner(run_ownership)
+    )
     repository = GitRepository(Path(run_record.target_repository_path))
     try:
         snapshot = WorkspaceSnapshot.capture(repository)
-        violations = _baseline_violations(run_path, run_record, baseline, snapshot)
+        violations = _baseline_violations(
+            run_path,
+            run_record,
+            baseline,
+            snapshot,
+            run_ownership=run_ownership,
+        )
         before = snapshot.fingerprint
     except (OSError, RuntimeError, ValueError) as error:
         snapshot = None
@@ -761,6 +772,7 @@ def _run_command(
 ) -> VerificationCommandResult:
     started = _utcnow(clock)
     try:
+        artifact_layout.revalidate()
         process = runner.run(
             VerificationProcessCommand(command.argv, cwd),
             timeout_seconds=command.timeout_seconds,
@@ -846,6 +858,8 @@ def _baseline_violations(
     record: RunRecord,
     baseline: BaselineRecord,
     snapshot: WorkspaceSnapshot,
+    *,
+    run_ownership: RunOwnership | None = None,
 ) -> tuple[VerificationSafetyViolation, ...]:
     changes = list(
         workspace_safety_changes(
@@ -865,7 +879,16 @@ def _baseline_violations(
                 "Current workspace does not match the clean baseline.",
             )
         )
-    if not (run_path / RUN_TICKET_FILE).is_file():
+    ticket_path = run_path / RUN_TICKET_FILE
+    ticket_exists = (
+        ticket_path.is_file()
+        if run_ownership is None
+        else run_ownership.read_descendant(
+            ticket_path,
+            lambda source: source.is_file(),
+        )
+    )
+    if not ticket_exists:
         changes.append(
             WorkspaceChange(
                 "ticket", "snapshotted ticket", "missing", "Ticket snapshot is missing."

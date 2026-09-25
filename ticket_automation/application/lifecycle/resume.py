@@ -20,12 +20,14 @@ from ...models import (
     WorkflowState,
     phase_for_active_state,
 )
+from ...run_ownership import RunOwnership
 from ...runs import (
     BASELINE_RECORD_FILE,
     RUN_TICKET_FILE,
     RunError,
     RunRecord,
     load_baseline_record,
+    load_baseline_record_for_owner,
 )
 from ...verification_evidence import (
     baseline_verification_evidence_problem,
@@ -37,19 +39,46 @@ def resume_preflight_problem(
     config: AppConfig,
     run_dir: Path,
     run_record: RunRecord,
+    *,
+    run_ownership: RunOwnership | None = None,
 ) -> str | None:
+    if run_ownership is not None:
+        run_dir = run_ownership.validate_run_path(run_dir)
     try:
-        load_attempt_records(run_dir)
+        load_attempt_records(run_dir, run_ownership=run_ownership)
     except AttemptError as error:
         return f"Attempt evidence is invalid: {error}"
     baseline_path = run_dir / BASELINE_RECORD_FILE
     ticket_path = run_dir / RUN_TICKET_FILE
-    if not baseline_path.is_file():
+    if run_ownership is not None:
+        run_ownership.validate_descendant(baseline_path)
+        run_ownership.validate_descendant(ticket_path)
+    baseline_exists = (
+        baseline_path.is_file()
+        if run_ownership is None
+        else run_ownership.read_descendant(
+            baseline_path,
+            lambda source: source.is_file(),
+        )
+    )
+    if not baseline_exists:
         return f"Required baseline artifact is missing: {baseline_path}"
-    if not ticket_path.is_file():
+    ticket_exists = (
+        ticket_path.is_file()
+        if run_ownership is None
+        else run_ownership.read_descendant(
+            ticket_path,
+            lambda source: source.is_file(),
+        )
+    )
+    if not ticket_exists:
         return f"Required snapshotted ticket artifact is missing: {ticket_path}"
     try:
-        baseline = load_baseline_record(baseline_path)
+        baseline = (
+            load_baseline_record(baseline_path)
+            if run_ownership is None
+            else load_baseline_record_for_owner(run_ownership)
+        )
     except RunError as error:
         return f"Baseline artifact is not internally consistent: {error}"
     if baseline.branch != run_record.starting_branch:
@@ -59,7 +88,15 @@ def resume_preflight_problem(
     if not baseline.clean_worktree or baseline.has_staged_files:
         return "Recorded repository baseline is not clean."
     try:
-        ticket_sha256 = hashlib.sha256(ticket_path.read_bytes()).hexdigest()
+        ticket_contents = (
+            ticket_path.read_bytes()
+            if run_ownership is None
+            else run_ownership.read_descendant(
+                ticket_path,
+                lambda source: source.read_bytes(),
+            )
+        )
+        ticket_sha256 = hashlib.sha256(ticket_contents).hexdigest()
     except OSError as error:
         return f"Could not inspect snapshotted ticket artifact: {error}"
     if ticket_sha256 != baseline.ticket_sha256:
@@ -103,13 +140,21 @@ def resume_preflight_problem(
             run_record,
             baseline,
             verification_commands=config.verification.commands,
+            run_ownership=run_ownership,
         )
         if problem is not None:
             return problem
     return None
 
 
-def resume_problem(run_dir: Path, run_record: RunRecord) -> str | None:
+def resume_problem(
+    run_dir: Path,
+    run_record: RunRecord,
+    *,
+    run_ownership: RunOwnership | None = None,
+) -> str | None:
+    if run_ownership is not None:
+        run_dir = run_ownership.validate_run_path(run_dir)
     interrupted_writable = latest_attempt(
         run_dir,
         phases=(
@@ -118,6 +163,7 @@ def resume_problem(run_dir: Path, run_record: RunRecord) -> str | None:
             if candidate_definition.writes_target_repository
         ),
         statuses=(AttemptStatus.STARTED,),
+        run_ownership=run_ownership,
     )
     if interrupted_writable is not None:
         definition = PHASE_DEFINITIONS[interrupted_writable.phase]
@@ -134,7 +180,11 @@ def resume_problem(run_dir: Path, run_record: RunRecord) -> str | None:
             "working tree may contain partial source modifications."
         )
     if run_record.state in {WorkflowState.PREPARING, WorkflowState.PREPARED}:
-        baseline = load_baseline_record(run_dir / BASELINE_RECORD_FILE)
+        baseline = (
+            load_baseline_record(run_dir / BASELINE_RECORD_FILE)
+            if run_ownership is None
+            else load_baseline_record_for_owner(run_ownership)
+        )
         return _workspace_fingerprint_problem(
             run_record,
             baseline.workspace_fingerprint,
@@ -143,7 +193,10 @@ def resume_problem(run_dir: Path, run_record: RunRecord) -> str | None:
     if (
         definition is not None and definition.automatically_retry_interrupted
     ) or run_record.state is WorkflowState.CORRECTION_PENDING:
-        writable_attempt = latest_writable_attempt(run_dir)
+        writable_attempt = latest_writable_attempt(
+            run_dir,
+            run_ownership=run_ownership,
+        )
         if (
             writable_attempt is None
             or writable_attempt.after_workspace_fingerprint is None

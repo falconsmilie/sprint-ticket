@@ -51,7 +51,13 @@ from ..run_ownership import (
     RunOwnershipError,
     validate_unlinked_run_directory,
 )
-from ..runs import RUN_RECORD_FILE, RunError, RunRecord, load_run_record
+from ..runs import (
+    RUN_RECORD_FILE,
+    RunError,
+    RunRecord,
+    load_run_record,
+    load_run_record_for_owner,
+)
 from ..verification_evidence import VerificationEvidence, read_verification_evidence
 
 FINAL_REPORT_FILE = "report.md"
@@ -204,19 +210,35 @@ def run_report_stage(
         )
     except RunOwnershipError as error:
         raise ReportError(str(error)) from error
-    run_record = load_run_record(run_path / RUN_RECORD_FILE)
+    run_record = (
+        load_run_record(run_path / RUN_RECORD_FILE)
+        if run_ownership is None
+        else load_run_record_for_owner(run_ownership)
+    )
     if run_record.state != WorkflowState.READY_FOR_HUMAN:
         raise ReportError(
             f"Report requires a READY_FOR_HUMAN run; found {run_record.state.value}."
         )
     final_patch_path = run_path / FINAL_PATCH_FILE
     try:
-        patch_text = final_patch_path.read_text(encoding="utf-8")
+        patch_text = (
+            final_patch_path.read_text(encoding="utf-8")
+            if run_ownership is None
+            else run_ownership.read_descendant(
+                final_patch_path,
+                lambda source: source.read_text(encoding="utf-8"),
+            )
+        )
     except OSError as error:
         raise ReportError(
             f"The controller did not persist the final patch before reporting: {error}"
         ) from error
-    context = collect_report_context(run_path, run_record, patch_text=patch_text)
+    context = collect_report_context(
+        run_path,
+        run_record,
+        patch_text=patch_text,
+        run_ownership=run_ownership,
+    )
     final_report_path = run_path / FINAL_REPORT_FILE
     if run_ownership is not None:
         run_ownership.validate_descendant(final_report_path)
@@ -247,12 +269,29 @@ def generate_terminal_report_best_effort(
             if run_ownership is None
             else run_ownership.validate_run_path(run_dir)
         )
-        record = load_run_record(run_path / RUN_RECORD_FILE)
+        record = (
+            load_run_record(run_path / RUN_RECORD_FILE)
+            if run_ownership is None
+            else load_run_record_for_owner(run_ownership)
+        )
         try:
-            patch_text = (run_path / FINAL_PATCH_FILE).read_text(encoding="utf-8")
+            final_patch_path = run_path / FINAL_PATCH_FILE
+            patch_text = (
+                final_patch_path.read_text(encoding="utf-8")
+                if run_ownership is None
+                else run_ownership.read_descendant(
+                    final_patch_path,
+                    lambda source: source.read_text(encoding="utf-8"),
+                )
+            )
         except OSError:
             patch_text = ""
-        context = collect_report_context(run_path, record, patch_text=patch_text)
+        context = collect_report_context(
+            run_path,
+            record,
+            patch_text=patch_text,
+            run_ownership=run_ownership,
+        )
         path = run_path / FINAL_REPORT_FILE
         if run_ownership is not None:
             run_ownership.validate_descendant(path)
@@ -267,26 +306,50 @@ def collect_report_context(
     run_record: RunRecord,
     *,
     patch_text: str | None = None,
+    run_ownership: RunOwnership | None = None,
 ) -> ReportViewModel:
     run_path = Path(run_dir)
+    if run_ownership is not None:
+        run_path = run_ownership.validate_run_path(run_path)
     repository = GitRepository(Path(run_record.target_repository_path))
     patch = (
         patch_text if patch_text is not None else _diff_or_empty(repository, run_record)
     )
-    records = load_attempt_records(run_path)
-    attempts = tuple(_attempt_view(run_path, record) for record in records)
+    records = load_attempt_records(run_path, run_ownership=run_ownership)
+    attempts = tuple(
+        _attempt_view(
+            run_path,
+            record,
+            run_ownership=run_ownership,
+        )
+        for record in records
+    )
     verification = tuple(
         evidence
         for record in records
         if _has_result_role(record, ResultArtifactRole.VERIFICATION_ROUND)
-        if (evidence := _verification_view(run_path, record)) is not None
+        if (
+            evidence := _verification_view(
+                run_path,
+                record,
+                run_ownership=run_ownership,
+            )
+        )
+        is not None
     )
     baseline = _latest_attempt_result(
-        run_path, ResultArtifactRole.BASELINE_VERIFICATION
+        run_path,
+        ResultArtifactRole.BASELINE_VERIFICATION,
+        run_ownership=run_ownership,
     )
-    reviews, review_result_errors = _review_results(run_path, records)
+    reviews, review_result_errors = _review_results(
+        run_path,
+        records,
+        run_ownership=run_ownership,
+    )
     implementation, implementation_result_error = _latest_implementation_result(
-        run_path
+        run_path,
+        run_ownership=run_ownership,
     )
     correction_tickets = tuple(
         item.correction_ticket
@@ -297,7 +360,10 @@ def collect_report_context(
     diff_stats = _diff_stats_or_empty(repository, run_record)
     safety = inspect_git_safety(run_record)
     try:
-        final_review = _latest_review_result(run_path)
+        final_review = _latest_review_result(
+            run_path,
+            run_ownership=run_ownership,
+        )
         final_review_error = None
     except ResultValidationError as error:
         final_review = None
@@ -320,7 +386,10 @@ def collect_report_context(
             review_result_errors=review_result_errors,
             correction_ticket_paths=correction_tickets,
             git_safety=safety,
-            latest_writable_attempt=latest_writable_attempt(run_path),
+            latest_writable_attempt=latest_writable_attempt(
+                run_path,
+                run_ownership=run_ownership,
+            ),
             final_patch_path=FINAL_PATCH_FILE,
             final_report_path=FINAL_REPORT_FILE,
         ),
@@ -430,20 +499,47 @@ def count_patch_changes(patch_text: str) -> tuple[int, int]:
     return additions, deletions
 
 
-def latest_verification_round(run_dir: Path | str) -> VerificationEvidence | None:
-    return _latest_attempt_result(Path(run_dir), ResultArtifactRole.VERIFICATION_ROUND)
+def latest_verification_round(
+    run_dir: Path | str,
+    *,
+    run_ownership: RunOwnership | None = None,
+) -> VerificationEvidence | None:
+    return _latest_attempt_result(
+        Path(run_dir),
+        ResultArtifactRole.VERIFICATION_ROUND,
+        run_ownership=run_ownership,
+    )
 
 
-def latest_review_result(run_dir: Path | str) -> ReviewResult | None:
-    return _latest_review_result(Path(run_dir))
+def latest_review_result(
+    run_dir: Path | str,
+    *,
+    run_ownership: RunOwnership | None = None,
+) -> ReviewResult | None:
+    return _latest_review_result(
+        Path(run_dir),
+        run_ownership=run_ownership,
+    )
 
 
-def _latest_review_result(run_path: Path) -> ReviewResult | None:
-    record = _latest_attempt_for_role(run_path, ResultArtifactRole.REVIEW_RESULT)
+def _latest_review_result(
+    run_path: Path,
+    *,
+    run_ownership: RunOwnership | None = None,
+) -> ReviewResult | None:
+    record = _latest_attempt_for_role(
+        run_path,
+        ResultArtifactRole.REVIEW_RESULT,
+        run_ownership=run_ownership,
+    )
     if record is None:
         return None
     try:
-        return read_review_result(run_path, record)
+        return read_review_result(
+            run_path,
+            record,
+            run_ownership=run_ownership,
+        )
     except PersistenceCodecError as error:
         raise ResultValidationError(str(error)) from error
 
@@ -451,6 +547,8 @@ def _latest_review_result(run_path: Path) -> ReviewResult | None:
 def _review_results(
     run_path: Path,
     records: tuple[AttemptRecord, ...],
+    *,
+    run_ownership: RunOwnership | None = None,
 ) -> tuple[tuple[ReviewResult, ...], tuple[str, ...]]:
     results: list[ReviewResult] = []
     errors: list[str] = []
@@ -458,7 +556,11 @@ def _review_results(
         if not _has_result_role(record, ResultArtifactRole.REVIEW_RESULT):
             continue
         try:
-            result = read_review_result(run_path, record)
+            result = read_review_result(
+                run_path,
+                record,
+                run_ownership=run_ownership,
+            )
             if result is None:
                 continue
             results.append(result)
@@ -469,14 +571,25 @@ def _review_results(
 
 def _latest_implementation_result(
     run_path: Path,
+    *,
+    run_ownership: RunOwnership | None = None,
 ) -> tuple[ImplementationResult | None, str | None]:
     record = _latest_attempt_for_role(
-        run_path, ResultArtifactRole.IMPLEMENTATION_RESULT
+        run_path,
+        ResultArtifactRole.IMPLEMENTATION_RESULT,
+        run_ownership=run_ownership,
     )
     if record is None:
         return None, None
     try:
-        return read_implementation_result(run_path, record), None
+        return (
+            read_implementation_result(
+                run_path,
+                record,
+                run_ownership=run_ownership,
+            ),
+            None,
+        )
     except PersistenceCodecError as error:
         return None, str(error)
 
@@ -484,18 +597,35 @@ def _latest_implementation_result(
 def _latest_attempt_result(
     run_path: Path,
     role: ResultArtifactRole,
+    *,
+    run_ownership: RunOwnership | None = None,
 ) -> VerificationEvidence | None:
-    record = _latest_attempt_for_role(run_path, role)
+    record = _latest_attempt_for_role(
+        run_path,
+        role,
+        run_ownership=run_ownership,
+    )
     if record is None:
         return None
-    return _verification_view(run_path, record)
+    return _verification_view(
+        run_path,
+        record,
+        run_ownership=run_ownership,
+    )
 
 
 def _verification_view(
-    run_path: Path, record: AttemptRecord
+    run_path: Path,
+    record: AttemptRecord,
+    *,
+    run_ownership: RunOwnership | None = None,
 ) -> VerificationEvidence | None:
     try:
-        return read_verification_evidence(run_path, record)
+        return read_verification_evidence(
+            run_path,
+            record,
+            run_ownership=run_ownership,
+        )
     except ValueError:
         return None
 
@@ -503,21 +633,36 @@ def _verification_view(
 def _latest_attempt_for_role(
     run_path: Path,
     role: ResultArtifactRole,
+    *,
+    run_ownership: RunOwnership | None = None,
 ) -> AttemptRecord | None:
     phases = tuple(
         phase
         for phase, definition in PHASE_DEFINITIONS.items()
         if definition.result_artifact_role is role
     )
-    return latest_attempt(run_path, phases=phases)
+    return latest_attempt(
+        run_path,
+        phases=phases,
+        run_ownership=run_ownership,
+    )
 
 
 def _has_result_role(record: AttemptRecord, role: ResultArtifactRole) -> bool:
     return PHASE_DEFINITIONS[record.phase].result_artifact_role is role
 
 
-def _attempt_view(run_path: Path, record: AttemptRecord) -> AttemptReportView:
-    layout = attempt_artifact_layout(run_path, record)
+def _attempt_view(
+    run_path: Path,
+    record: AttemptRecord,
+    *,
+    run_ownership: RunOwnership | None = None,
+) -> AttemptReportView:
+    layout = attempt_artifact_layout(
+        run_path,
+        record,
+        run_ownership=run_ownership,
+    )
     correction_ticket = layout.path(CORRECTION_TICKET_FILE)
     execution = None
     if record.execution_path is not None:

@@ -376,7 +376,9 @@ class AttemptArtifactLayout:
         """Inspect an attempt-owned file while preserving controlled failures."""
 
         path = self.path(relative_path)
-        return self.path_is_file(path, description="attempt artifact")
+        exists = self.path_is_file(path, description="attempt artifact")
+        self.revalidate()
+        return exists
 
     def path(self, relative_path: str | PurePosixPath) -> Path:
         self.revalidate()

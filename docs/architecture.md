@@ -70,6 +70,10 @@ verification calls. Replacement of either directory stops before post-call evide
 or attempt updates are written. Mutable text artifacts are atomically replaced, and
 immutable text/byte artifacts are exclusively created, so pre-existing file links
 cannot redirect an authoritative or diagnostic write.
+The bound run token is also required by authoritative lifecycle reads after it is
+acquired. Resume, handoff, correction planning, review, verification evidence, and
+terminal reporting therefore reject a replaced run directory instead of rebinding
+to and interpreting the replacement.
 
 ## Enforced rules
 

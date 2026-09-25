@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import FrozenInstanceError, dataclass, replace
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import pytest
 
 import ticket_automation.corrections as corrections_module
 import ticket_automation.persistence as persistence_module
+import ticket_automation.persistence_codecs as persistence_codecs_module
 from tests.helpers import (
     GIT,
     create_directory_link,
@@ -49,8 +51,12 @@ from ticket_automation.git_safety import WorkspaceSnapshot
 from ticket_automation.implementation import run_implementation_stage
 from ticket_automation.infrastructure.final_patch import FileSystemFinalPatchCapture
 from ticket_automation.models import AttemptPhase, StopCategory, WorkflowState
-from ticket_automation.presentation.reporting import collect_report_context
+from ticket_automation.presentation.reporting import (
+    collect_report_context,
+    run_report_stage,
+)
 from ticket_automation.review import run_review_stage
+from ticket_automation.run_ownership import RunOwnershipError
 from ticket_automation.runs import load_run_record, save_run_record
 from ticket_automation.verification import run_verification_stage
 from ticket_automation.workflow import resume_ticket_lifecycle, run_ticket_lifecycle
@@ -949,6 +955,338 @@ def test_final_handoff_rejects_linked_external_evidence(
         assert not (reporting.run_dir / "final.patch").exists()
     finally:
         remove_directory_link(linked_attempt.artifact_directory)
+
+
+def test_final_handoff_stops_before_reading_a_replaced_bound_run(
+    tmp_path,
+    monkeypatch,
+):
+    workspace = build_lifecycle_workspace(tmp_path)
+    codex_runner = configure_fake_codex_actions(
+        monkeypatch,
+        tmp_path,
+        "modify",
+        "review-pass",
+    )
+    clock = TickingClock()
+    reporting = _prepare_reporting_run(
+        workspace,
+        codex_runner=codex_runner,
+        clock=clock,
+    )
+    start_attempt(
+        reporting.run_dir,
+        phase=AttemptPhase.REPORTING,
+        before_workspace_fingerprint=None,
+        clock=clock,
+        run_ownership=reporting.run_ownership,
+    )
+    original_capture = WorkspaceSnapshot.capture
+    moved_run = tmp_path / "original-handoff-run"
+    replacement_created = False
+
+    def replace_run_after_workspace_capture(repository):
+        nonlocal replacement_created
+        snapshot = original_capture(repository)
+        if not replacement_created:
+            reporting.run_dir.rename(moved_run)
+            shutil.copytree(moved_run, reporting.run_dir)
+            replacement_created = True
+        return snapshot
+
+    patch_capture_called = False
+
+    class RecordingPatchCapture:
+        def capture(self, request: FinalPatchCaptureRequest) -> FinalPatchReference:
+            nonlocal patch_capture_called
+            patch_capture_called = True
+            return FileSystemFinalPatchCapture().capture(request)
+
+    monkeypatch.setattr(
+        WorkspaceSnapshot,
+        "capture",
+        staticmethod(replace_run_after_workspace_capture),
+    )
+
+    result = HandoffAcceptanceService(
+        patch_capture=RecordingPatchCapture(),
+    ).accept(
+        HandoffAcceptanceRequest(
+            run_dir=reporting.run_dir,
+            run_record=reporting.run_record,
+            run_ownership=reporting.run_ownership,
+        )
+    )
+
+    assert isinstance(result, HandoffRejected)
+    assert "ownership was lost" in result.reason
+    assert not patch_capture_called
+    assert not (reporting.run_dir / "final.patch").exists()
+
+
+def test_review_does_not_dispatch_substituted_result_read_from_replaced_run(
+    tmp_path,
+    monkeypatch,
+):
+    workspace = build_lifecycle_workspace(tmp_path)
+    codex_runner = configure_fake_codex_actions(
+        monkeypatch,
+        tmp_path,
+        "modify",
+        "review-pass",
+    )
+    original_read_json = persistence_codecs_module.read_json
+    moved_run = tmp_path / "original-review-run"
+    replaced = False
+    source_fingerprint = None
+
+    def replace_run_after_implementation_result_read(path):
+        nonlocal replaced, source_fingerprint
+        value = original_read_json(path)
+        if not replaced and "implementation" in Path(path).parent.name:
+            run_dir = Path(path).parents[2]
+            source_fingerprint = WorkspaceSnapshot.capture(
+                GitRepository(workspace.repository)
+            ).fingerprint
+            run_dir.rename(moved_run)
+            shutil.copytree(moved_run, run_dir)
+            replaced = True
+        return value
+
+    monkeypatch.setattr(
+        persistence_codecs_module,
+        "read_json",
+        replace_run_after_implementation_result_read,
+    )
+    dependencies = make_run_dependencies(
+        workspace.config,
+        process_runner=codex_runner,
+    )
+
+    result = run_ticket_lifecycle(
+        workspace.config,
+        workspace.ticket,
+        runs_dir=workspace.runs_dir,
+        **dependencies,
+        verification_runner=ScriptedVerificationRunner([0, 0]),
+        clock=TickingClock(),
+    )
+
+    assert replaced
+    assert result.controller_error is not None
+    assert "ownership was lost" in result.controller_error
+    assert json.loads(codex_runner.action_path.read_text(encoding="utf-8")) == [
+        "review-pass"
+    ]
+    assert load_run_record(moved_run / "run.json").state is WorkflowState.REVIEWING
+    assert load_run_record(result.run_dir / "run.json").state is WorkflowState.REVIEWING
+    assert source_fingerprint is not None
+    assert WorkspaceSnapshot.capture(
+        GitRepository(workspace.repository)
+    ).fingerprint == (source_fingerprint)
+
+
+def test_final_handoff_rejects_run_replacement_during_patch_capture(
+    tmp_path,
+    monkeypatch,
+):
+    workspace = build_lifecycle_workspace(tmp_path)
+    codex_runner = configure_fake_codex_actions(
+        monkeypatch,
+        tmp_path,
+        "modify",
+        "review-pass",
+    )
+    clock = TickingClock()
+    reporting = _prepare_reporting_run(
+        workspace,
+        codex_runner=codex_runner,
+        clock=clock,
+    )
+    start_attempt(
+        reporting.run_dir,
+        phase=AttemptPhase.REPORTING,
+        before_workspace_fingerprint=None,
+        clock=clock,
+        run_ownership=reporting.run_ownership,
+    )
+    moved_run = tmp_path / "original-patch-capture-run"
+    source_fingerprint = WorkspaceSnapshot.capture(
+        GitRepository(workspace.repository)
+    ).fingerprint
+
+    class ReplacingPatchCapture:
+        def capture(self, request: FinalPatchCaptureRequest) -> FinalPatchReference:
+            reference = FileSystemFinalPatchCapture().capture(request)
+            reporting.run_dir.rename(moved_run)
+            shutil.copytree(moved_run, reporting.run_dir)
+            return reference
+
+    result = HandoffAcceptanceService(
+        patch_capture=ReplacingPatchCapture(),
+    ).accept(
+        HandoffAcceptanceRequest(
+            run_dir=reporting.run_dir,
+            run_record=reporting.run_record,
+            run_ownership=reporting.run_ownership,
+        )
+    )
+
+    assert isinstance(result, HandoffRejected)
+    assert result.stop_category is StopCategory.SAFETY_VIOLATION
+    assert "ownership was lost" in result.reason
+    assert load_run_record(moved_run / "run.json").state is WorkflowState.REPORTING
+    assert load_run_record(reporting.run_dir / "run.json").state is (
+        WorkflowState.REPORTING
+    )
+    assert WorkspaceSnapshot.capture(
+        GitRepository(workspace.repository)
+    ).fingerprint == (source_fingerprint)
+
+
+def test_final_handoff_rejects_run_replacement_during_final_workspace_capture(
+    tmp_path,
+    monkeypatch,
+):
+    workspace = build_lifecycle_workspace(tmp_path)
+    codex_runner = configure_fake_codex_actions(
+        monkeypatch,
+        tmp_path,
+        "modify",
+        "review-pass",
+    )
+    clock = TickingClock()
+    reporting = _prepare_reporting_run(
+        workspace,
+        codex_runner=codex_runner,
+        clock=clock,
+    )
+    start_attempt(
+        reporting.run_dir,
+        phase=AttemptPhase.REPORTING,
+        before_workspace_fingerprint=None,
+        clock=clock,
+        run_ownership=reporting.run_ownership,
+    )
+    moved_run = tmp_path / "original-final-workspace-capture-run"
+    source_fingerprint = WorkspaceSnapshot.capture(
+        GitRepository(workspace.repository)
+    ).fingerprint
+    original_capture = WorkspaceSnapshot.capture
+    patch_was_captured = False
+    run_was_replaced = False
+
+    class RecordingPatchCapture:
+        def capture(self, request: FinalPatchCaptureRequest) -> FinalPatchReference:
+            nonlocal patch_was_captured
+            reference = FileSystemFinalPatchCapture().capture(request)
+            patch_was_captured = True
+            return reference
+
+    def replace_run_after_final_workspace_capture(repository):
+        nonlocal run_was_replaced
+        snapshot = original_capture(repository)
+        if patch_was_captured and not run_was_replaced:
+            reporting.run_dir.rename(moved_run)
+            shutil.copytree(moved_run, reporting.run_dir)
+            run_was_replaced = True
+        return snapshot
+
+    monkeypatch.setattr(
+        WorkspaceSnapshot,
+        "capture",
+        staticmethod(replace_run_after_final_workspace_capture),
+    )
+
+    result = HandoffAcceptanceService(
+        patch_capture=RecordingPatchCapture(),
+    ).accept(
+        HandoffAcceptanceRequest(
+            run_dir=reporting.run_dir,
+            run_record=reporting.run_record,
+            run_ownership=reporting.run_ownership,
+        )
+    )
+
+    assert patch_was_captured
+    assert run_was_replaced
+    assert isinstance(result, HandoffRejected)
+    assert result.stop_category is StopCategory.SAFETY_VIOLATION
+    assert "ownership was lost" in result.reason
+    assert load_run_record(moved_run / "run.json").state is WorkflowState.REPORTING
+    assert load_run_record(reporting.run_dir / "run.json").state is (
+        WorkflowState.REPORTING
+    )
+    assert WorkspaceSnapshot.capture(
+        GitRepository(workspace.repository)
+    ).fingerprint == (source_fingerprint)
+
+
+def test_terminal_report_rejects_run_replacement_during_patch_read(
+    tmp_path,
+    monkeypatch,
+):
+    workspace = build_lifecycle_workspace(tmp_path)
+    codex_runner = configure_fake_codex_actions(
+        monkeypatch,
+        tmp_path,
+        "modify",
+        "review-pass",
+    )
+    clock = TickingClock()
+    reporting = _prepare_reporting_run(
+        workspace,
+        codex_runner=codex_runner,
+        clock=clock,
+    )
+    start_attempt(
+        reporting.run_dir,
+        phase=AttemptPhase.REPORTING,
+        before_workspace_fingerprint=None,
+        clock=clock,
+        run_ownership=reporting.run_ownership,
+    )
+    handoff = HandoffAcceptanceService(
+        patch_capture=FileSystemFinalPatchCapture(),
+    ).accept(
+        HandoffAcceptanceRequest(
+            run_dir=reporting.run_dir,
+            run_record=reporting.run_record,
+            run_ownership=reporting.run_ownership,
+        )
+    )
+    assert isinstance(handoff, HandoffAccepted)
+    ready = reporting.run_record.transition_to(
+        WorkflowState.READY_FOR_HUMAN,
+        updated_timestamp=clock().isoformat(),
+    )
+    save_run_record(ready, reporting.run_dir / "run.json")
+
+    final_patch = reporting.run_dir / "final.patch"
+    moved_run = tmp_path / "original-report-run"
+    original_read_text = Path.read_text
+    replaced = False
+
+    def replace_run_after_patch_read(path, *args, **kwargs):
+        nonlocal replaced
+        value = original_read_text(path, *args, **kwargs)
+        if not replaced and path == final_patch:
+            reporting.run_dir.rename(moved_run)
+            shutil.copytree(moved_run, reporting.run_dir)
+            replaced = True
+        return value
+
+    monkeypatch.setattr(Path, "read_text", replace_run_after_patch_read)
+
+    with pytest.raises(RunOwnershipError, match="ownership was lost|replaced"):
+        run_report_stage(
+            reporting.run_dir,
+            run_ownership=reporting.run_ownership,
+        )
+
+    assert replaced
+    assert not (moved_run / "final-report.md").exists()
+    assert not (reporting.run_dir / "final-report.md").exists()
 
 
 def test_final_handoff_cannot_fall_back_past_an_unreadable_attempt(

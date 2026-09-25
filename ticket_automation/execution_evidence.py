@@ -225,10 +225,12 @@ def write_execution_evidence(
 
 
 def read_execution_evidence(layout: AttemptArtifactLayout) -> ExecutionEvidence:
-    return decode_execution_evidence(
-        read_json_object(layout.named_path(ArtifactRole.EXECUTION_EVIDENCE)),
-        layout=layout,
-    )
+    path = layout.named_path(ArtifactRole.EXECUTION_EVIDENCE)
+    try:
+        data = read_json_object(path)
+    finally:
+        layout.revalidate()
+    return decode_execution_evidence(data, layout=layout)
 
 
 def encode_execution_evidence(evidence: ExecutionEvidence) -> JsonObject:

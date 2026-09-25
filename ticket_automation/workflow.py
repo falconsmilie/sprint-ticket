@@ -329,14 +329,33 @@ def _resume_ticket_lifecycle_locked(
     if run_record.state in TERMINAL_WORKFLOW_STATES:
         return _empty_result(run_dir, run_record, preflight_result)
 
-    compatibility_problem = agent_executor_factory.compatibility_problem(
-        run_record.resolved_policy
-    )
-    problem = compatibility_problem
-    if problem is None:
-        problem = resume_preflight_problem(config, run_dir, run_record)
-    if problem is None:
-        problem = resume_problem(run_dir, run_record)
+    try:
+        compatibility_problem = agent_executor_factory.compatibility_problem(
+            run_record.resolved_policy
+        )
+        problem = compatibility_problem
+        if problem is None:
+            problem = resume_preflight_problem(
+                config,
+                run_dir,
+                run_record,
+                run_ownership=run_ownership,
+            )
+        if problem is None:
+            problem = resume_problem(
+                run_dir,
+                run_record,
+                run_ownership=run_ownership,
+            )
+        _require_owned_run(run_dir, run_ownership)
+    except RunOwnershipError as error:
+        return _ownership_failure_result(
+            run_dir,
+            run_record,
+            preflight_result,
+            LifecycleProgress(),
+            error,
+        )
     if problem is not None:
         run_record = _mark_human_required(
             run_dir,

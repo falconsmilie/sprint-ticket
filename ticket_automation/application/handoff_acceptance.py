@@ -299,16 +299,21 @@ class HandoffAcceptanceService:
             if request.attempt is None:
                 # Preserve the established direct-service call shape. Lifecycle
                 # orchestration always supplies the exact controller-owned attempt.
-                reporting_attempt = _load_current_reporting_attempt(request.run_dir)
+                reporting_attempt = _load_current_reporting_attempt(
+                    request.run_dir,
+                    run_ownership=request.run_ownership,
+                )
                 update_attempt(
                     reporting_attempt,
                     before_workspace_fingerprint=initial_workspace.fingerprint,
+                    run_ownership=request.run_ownership,
                 )
             else:
                 reporting_attempt = require_stage_attempt(
                     request.run_dir,
                     request.attempt,
                     phase=AttemptPhase.REPORTING,
+                    run_ownership=request.run_ownership,
                 )
                 if (
                     reporting_attempt.before_workspace_fingerprint
@@ -329,10 +334,20 @@ class HandoffAcceptanceService:
                 _seal=_HANDOFF_OUTCOME_SEAL,
             )
 
-        policy_request = _read_policy_request(
-            request,
-            workspace=initial_workspace,
-        )
+        try:
+            policy_request = _read_policy_request(
+                request,
+                workspace=initial_workspace,
+            )
+            _require_owned_handoff_run(request)
+        except RunOwnershipError as error:
+            return HandoffRejected(
+                stop_category=StopCategory.SAFETY_VIOLATION,
+                reason=str(error),
+                initial_workspace=initial_workspace,
+                final_workspace=initial_workspace,
+                _seal=_HANDOFF_OUTCOME_SEAL,
+            )
         problem = evaluate_handoff_policy(policy_request)
         if problem is not None:
             return HandoffRejected(
@@ -355,11 +370,14 @@ class HandoffAcceptanceService:
                     run_ownership=request.run_ownership,
                 )
             )
+            _require_owned_handoff_run(request)
             _validate_captured_patch(
                 patch,
                 expected_destination=request.run_dir / FINAL_PATCH_FILE,
+                run_ownership=request.run_ownership,
             )
             final_workspace = WorkspaceSnapshot.capture(repository)
+            _require_owned_handoff_run(request)
         except (GitCommandError, OSError, RuntimeError, TypeError, ValueError) as error:
             return HandoffRejected(
                 stop_category=StopCategory.SAFETY_VIOLATION,
@@ -573,12 +591,16 @@ def _read_policy_request(
     verification: VerificationHandoffEvidence | None = None
     review: ReviewHandoffEvidence | None = None
     try:
-        attempt_records = load_attempt_records(request.run_dir)
+        attempt_records = load_attempt_records(
+            request.run_dir,
+            run_ownership=request.run_ownership,
+        )
         attempts = tuple(_handoff_attempt_evidence(item) for item in attempt_records)
         attempt_problem = _agent_execution_evidence_problem(
             request.run_dir,
             run_record,
             attempt_records,
+            run_ownership=request.run_ownership,
         )
     except (AttemptError, OSError, TypeError, ValueError) as error:
         attempt_records = ()
@@ -608,6 +630,7 @@ def _read_policy_request(
                     ).resolve(strict=False),
                     expected_attempt_sequence=verification_attempt.sequence,
                     expected_round_index=run_record.current_correction_round,
+                    run_ownership=request.run_ownership,
                 )
                 verification = VerificationHandoffEvidence(
                     attempt_sequence=verification_attempt.sequence,
@@ -635,6 +658,7 @@ def _read_policy_request(
                         for item in attempt_records
                         if item.sequence == review_attempt.sequence
                     ),
+                    run_ownership=request.run_ownership,
                 )
                 if result is None:
                     raise PersistenceCodecError(
@@ -682,6 +706,8 @@ def _agent_execution_evidence_problem(
     run_dir: Path,
     run_record: RunRecord,
     attempts: tuple[AttemptRecord, ...],
+    *,
+    run_ownership: RunOwnership | None = None,
 ) -> str | None:
     """Require neutral, policy-bound evidence for every completed agent task."""
 
@@ -694,7 +720,11 @@ def _agent_execution_evidence_problem(
                 raise ValueError(
                     "attempt does not reference neutral execution evidence"
                 )
-            layout = attempt_artifact_layout(run_dir, attempt)
+            layout = attempt_artifact_layout(
+                run_dir,
+                attempt,
+                run_ownership=run_ownership,
+            )
             evidence = read_execution_evidence(layout)
             expected = run_record.resolved_policy.task_policy(task_kind)
             if evidence.provider_id != expected.provider_id:
@@ -715,9 +745,17 @@ def _agent_execution_evidence_problem(
                 raise ValueError("typed result artifact reference is missing")
             layout.resolve(evidence.typed_result_artifact, require_exists=True)
             if task_kind is AgentTaskKind.REVIEW:
-                stage_result = read_review_result(run_dir, attempt)
+                stage_result = read_review_result(
+                    run_dir,
+                    attempt,
+                    run_ownership=run_ownership,
+                )
             else:
-                stage_result = read_implementation_result(run_dir, attempt)
+                stage_result = read_implementation_result(
+                    run_dir,
+                    attempt,
+                    run_ownership=run_ownership,
+                )
             if stage_result is None or stage_result != evidence.typed_result:
                 raise ValueError(
                     "typed stage result does not match neutral execution evidence"
@@ -768,8 +806,12 @@ def _require_owned_handoff_run(request: HandoffAcceptanceRequest) -> None:
         )
 
 
-def _load_current_reporting_attempt(run_dir: Path) -> AttemptRecord:
-    attempts = load_attempt_records(run_dir)
+def _load_current_reporting_attempt(
+    run_dir: Path,
+    *,
+    run_ownership: RunOwnership | None = None,
+) -> AttemptRecord:
+    attempts = load_attempt_records(run_dir, run_ownership=run_ownership)
     reporting_attempt = next(
         (item for item in reversed(attempts) if item.phase is AttemptPhase.REPORTING),
         None,
@@ -787,13 +829,23 @@ def _validate_captured_patch(
     patch: FinalPatchReference,
     *,
     expected_destination: Path,
+    run_ownership: RunOwnership | None = None,
 ) -> None:
     if not isinstance(patch, FinalPatchReference):
         raise TypeError("Patch capture returned an invalid reference type.")
     expected = expected_destination.resolve(strict=False)
     if patch.path.resolve(strict=False) != expected:
         raise ValueError("Patch capture returned an unexpected artifact path.")
-    data = expected.read_bytes()
+    if run_ownership is not None:
+        expected = run_ownership.validate_descendant(expected)
+    data = (
+        expected.read_bytes()
+        if run_ownership is None
+        else run_ownership.read_descendant(
+            expected,
+            lambda source: source.read_bytes(),
+        )
+    )
     if len(data) != patch.size_bytes:
         raise ValueError("Captured patch size does not match its reference.")
     if hashlib.sha256(data).hexdigest() != patch.sha256:

@@ -29,6 +29,8 @@ class FileSystemFinalPatchCapture:
                     "Final patch destination does not match its configured run owner."
                 )
         atomic_write_text(request.destination, patch)
+        if request.run_ownership is not None:
+            request.run_ownership.validate_descendant(request.destination)
         return FinalPatchReference(
             path=request.destination,
             sha256=hashlib.sha256(encoded).hexdigest(),

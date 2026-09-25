@@ -19,6 +19,7 @@ from .persistence_codecs import (
     read_review_result,
     read_verification_failures,
 )
+from .run_ownership import RunOwnership
 from .verification import VerificationFailure
 
 
@@ -82,15 +83,33 @@ def plan_review_correction(result: ReviewResult) -> CorrectionCauseSet:
     return CorrectionCauseSet(causes)
 
 
-def plan_pending_correction(run_dir: Path | str) -> CorrectionCauseSet:
+def plan_pending_correction(
+    run_dir: Path | str,
+    *,
+    run_ownership: RunOwnership | None = None,
+) -> CorrectionCauseSet:
     run_path = Path(run_dir)
-    verification_failures = _load_latest_verification_failures(run_path)
+    if run_ownership is not None:
+        run_path = run_ownership.validate_run_path(run_path)
+    verification_failures = _load_latest_verification_failures(
+        run_path,
+        run_ownership=run_ownership,
+    )
     if verification_failures:
-        return plan_verification_correction(verification_failures)
+        plan = plan_verification_correction(verification_failures)
+        if run_ownership is not None:
+            run_ownership.validate_run_path(run_path)
+        return plan
 
-    review_result = _load_latest_review_result(run_path)
+    review_result = _load_latest_review_result(
+        run_path,
+        run_ownership=run_ownership,
+    )
     if review_result is not None:
-        return plan_review_correction(review_result)
+        plan = plan_review_correction(review_result)
+        if run_ownership is not None:
+            run_ownership.validate_run_path(run_path)
+        return plan
 
     raise CorrectionError(
         "Run is in CORRECTING state but no verification failures or REQUIRED review "
@@ -100,32 +119,48 @@ def plan_pending_correction(run_dir: Path | str) -> CorrectionCauseSet:
 
 def _load_latest_verification_failures(
     run_path: Path,
+    *,
+    run_ownership: RunOwnership | None = None,
 ) -> tuple[VerificationFailure, ...]:
     attempt = latest_attempt(
         run_path,
         phases=(AttemptPhase.VERIFYING,),
         statuses=(AttemptStatus.COMPLETED,),
+        run_ownership=run_ownership,
     )
     if attempt is None:
         return ()
     try:
-        return read_verification_failures(run_path, attempt)
+        return read_verification_failures(
+            run_path,
+            attempt,
+            run_ownership=run_ownership,
+        )
     except PersistenceCodecError as error:
         raise CorrectionError(
             f"Verification correction source is invalid: {error}"
         ) from error
 
 
-def _load_latest_review_result(run_path: Path) -> ReviewResult | None:
+def _load_latest_review_result(
+    run_path: Path,
+    *,
+    run_ownership: RunOwnership | None = None,
+) -> ReviewResult | None:
     attempt = latest_attempt(
         run_path,
         phases=(AttemptPhase.REVIEWING,),
         statuses=(AttemptStatus.COMPLETED,),
+        run_ownership=run_ownership,
     )
     if attempt is None:
         return None
     try:
-        return read_review_result(run_path, attempt)
+        return read_review_result(
+            run_path,
+            attempt,
+            run_ownership=run_ownership,
+        )
     except PersistenceCodecError as error:
         raise CorrectionError(
             f"Review correction source is invalid: {error}"

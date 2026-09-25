@@ -48,7 +48,10 @@ class CorrectionStageHandler:
             )
 
         context.run_ownership.validate_run_path(context.run_dir)
-        cause_set = plan_pending_correction(context.run_dir)
+        cause_set = plan_pending_correction(
+            context.run_dir,
+            run_ownership=context.run_ownership,
+        )
         context.run_ownership.validate_run_path(context.run_dir)
         result = run_correction_stage(
             self.config,

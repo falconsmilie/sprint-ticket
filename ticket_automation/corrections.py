@@ -72,6 +72,7 @@ from .runs import (
     RunError,
     RunRecord,
     load_baseline_record,
+    load_baseline_record_for_owner,
     load_run_record,
     load_run_record_for_owner,
 )
@@ -322,7 +323,11 @@ def _run_correction_stage(
         run_ownership=run_ownership,
     )
 
-    baseline_record = load_baseline_record(run_path / BASELINE_RECORD_FILE)
+    baseline_record = (
+        load_baseline_record(run_path / BASELINE_RECORD_FILE)
+        if run_ownership is None
+        else load_baseline_record_for_owner(run_ownership)
+    )
     if baseline_record.branch != run_record.starting_branch:
         raise CorrectionError("Run record and baseline branch do not match.")
     if baseline_record.head_sha != run_record.baseline_sha:
@@ -383,6 +388,7 @@ def _run_correction_stage(
         run_record,
         baseline_record,
         verification_commands=config.verification.commands,
+        run_ownership=run_ownership,
     )
     if evidence_problem is not None:
         rejected = writable_operation.reject_before_start(
@@ -427,6 +433,7 @@ def _run_correction_stage(
         run_path,
         run_record,
         verification_commands=config.verification.commands,
+        run_ownership=run_ownership,
     )
     if starting_violations:
         rejected = writable_operation.reject_before_start(
@@ -491,7 +498,10 @@ def _run_correction_stage(
             run_ownership=run_ownership,
         )
         prompt = render_correction_prompt(
-            original_ticket=_read_snapshotted_ticket(run_path / RUN_TICKET_FILE),
+            original_ticket=_read_snapshotted_ticket(
+                run_path / RUN_TICKET_FILE,
+                run_ownership=run_ownership,
+            ),
             correction_ticket=ticket_markdown,
             repository_context=_render_repository_context(
                 repository,
@@ -1023,9 +1033,18 @@ def _render_repository_context(
     return "\n".join(lines)
 
 
-def _read_snapshotted_ticket(path: Path) -> str:
+def _read_snapshotted_ticket(
+    path: Path,
+    *,
+    run_ownership: RunOwnership | None = None,
+) -> str:
     try:
-        return path.read_bytes().decode("utf-8")
+        contents = (
+            path.read_bytes()
+            if run_ownership is None
+            else run_ownership.read_descendant(path, lambda source: source.read_bytes())
+        )
+        return contents.decode("utf-8")
     except OSError as error:
         raise CorrectionError(
             f"Could not read snapshotted ticket: {path}: {error}"
@@ -1061,6 +1080,7 @@ def _correction_source_fingerprint(
     run_record: RunRecord,
     *,
     verification_commands: tuple[VerificationCommand, ...],
+    run_ownership: RunOwnership | None = None,
 ) -> tuple[str | None, tuple[CorrectionSafetyViolation, ...]]:
     try:
         expected = read_verification_source_fingerprint(
@@ -1070,6 +1090,7 @@ def _correction_source_fingerprint(
                 {VerificationStatus.FAIL, VerificationStatus.PASS}
             ),
             verification_commands=verification_commands,
+            run_ownership=run_ownership,
         )
     except ValueError as error:
         return (

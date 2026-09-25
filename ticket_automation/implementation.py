@@ -61,6 +61,7 @@ from .runs import (
     RunError,
     RunRecord,
     load_baseline_record,
+    load_baseline_record_for_owner,
     load_run_record,
     load_run_record_for_owner,
 )
@@ -199,14 +200,21 @@ def _run_implementation_stage(
         run_ownership=run_ownership,
     )
 
-    baseline_record = load_baseline_record(run_path / BASELINE_RECORD_FILE)
+    baseline_record = (
+        load_baseline_record(run_path / BASELINE_RECORD_FILE)
+        if run_ownership is None
+        else load_baseline_record_for_owner(run_ownership)
+    )
     if baseline_record.branch != run_record.starting_branch:
         raise ImplementationError("Run record and baseline branch do not match.")
     if baseline_record.head_sha != run_record.baseline_sha:
         raise ImplementationError("Run record and baseline HEAD do not match.")
 
     repository = GitRepository(Path(run_record.target_repository_path))
-    ticket_text = _read_snapshotted_ticket(run_path / RUN_TICKET_FILE)
+    ticket_text = _read_snapshotted_ticket(
+        run_path / RUN_TICKET_FILE,
+        run_ownership=run_ownership,
+    )
     prompt = _render_implementation_prompt(ticket_text)
     implementation_dir = attempt.artifact_directory
     artifact_layout = attempt_artifact_layout(
@@ -231,6 +239,7 @@ def _run_implementation_stage(
         run_record,
         baseline_record,
         verification_commands=config.verification.commands,
+        run_ownership=run_ownership,
     )
     if evidence_problem is not None:
         rejected = writable_operation.reject_before_start(
@@ -501,9 +510,18 @@ def _write_agent_result(
         write_stage_message(path, status=outcome, message=controller_message)
 
 
-def _read_snapshotted_ticket(path: Path) -> str:
+def _read_snapshotted_ticket(
+    path: Path,
+    *,
+    run_ownership: RunOwnership | None = None,
+) -> str:
     try:
-        return path.read_bytes().decode("utf-8")
+        contents = (
+            path.read_bytes()
+            if run_ownership is None
+            else run_ownership.read_descendant(path, lambda source: source.read_bytes())
+        )
+        return contents.decode("utf-8")
     except OSError as error:
         raise ImplementationError(
             f"Could not read snapshotted ticket: {path}: {error}"

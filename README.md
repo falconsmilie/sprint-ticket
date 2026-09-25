@@ -155,6 +155,9 @@ directory before provider policy is restored or a repository lock is acquired.
 Attempt creation and update revalidate physical path ownership before writing.
 The run token is acquired as part of directory reservation, and an active attempt
 binds both its attempts root and attempt-directory identity across external calls.
+Resume, handoff, correction planning, review inputs, verification evidence, and
+reporting also carry that same token through authoritative reads, so replacing a
+direct run directory cannot substitute evidence during an active lifecycle.
 Lifecycle operations fail closed if any of those owned directories is replaced.
 Mutable artifacts use atomic replacement and immutable artifacts use exclusive
 creation, so an existing file link is replaced or rejected rather than followed.

@@ -12,6 +12,7 @@ from .attempts import AttemptError, AttemptRecord, attempt_result_path, latest_a
 from .config import VerificationCommand
 from .models import AttemptPhase, AttemptStatus, VerificationStatus
 from .persistence import CodecError, read_json_object
+from .run_ownership import RunOwnership
 
 if TYPE_CHECKING:
     from .runs import BaselineRecord, RunRecord
@@ -42,9 +43,12 @@ class VerificationEvidence:
 
 
 def read_verification_evidence(
-    run_path: Path, record: AttemptRecord
+    run_path: Path,
+    record: AttemptRecord,
+    *,
+    run_ownership: RunOwnership | None = None,
 ) -> VerificationEvidence:
-    data = _read_result(run_path, record)
+    data = _read_result(run_path, record, run_ownership=run_ownership)
     _validate_verification_result_shape(data)
     commands = data["commands"]
     assert isinstance(commands, list)
@@ -63,10 +67,11 @@ def read_verification_result_text(
     record: AttemptRecord,
     *,
     expected_statuses: frozenset[VerificationStatus],
+    run_ownership: RunOwnership | None = None,
 ) -> str:
     """Render validated verification evidence without exposing its JSON object."""
 
-    data = _read_result(run_path, record)
+    data = _read_result(run_path, record, run_ownership=run_ownership)
     _validate_verification_result_shape(data)
     if _verification_status(data["status"], source="result") not in expected_statuses:
         raise _VerificationArtifactError(
@@ -122,12 +127,14 @@ def read_verification_source_fingerprint(
     expected_command_cwd: Path | None = None,
     expected_attempt_sequence: int | None = None,
     expected_round_index: int | None = None,
+    run_ownership: RunOwnership | None = None,
 ) -> str:
     try:
         record = latest_attempt(
             run_path,
             phases=(AttemptPhase.VERIFYING,),
             statuses=(AttemptStatus.COMPLETED,),
+            run_ownership=run_ownership,
         )
         if record is None:
             raise _VerificationArtifactError(
@@ -141,7 +148,11 @@ def read_verification_source_fingerprint(
                 "Completed verification evidence is not the current verification "
                 "attempt."
             )
-        data = _read_result(run_path, record)
+        data = _read_result(
+            run_path,
+            record,
+            run_ownership=run_ownership,
+        )
         _validate_verification_result(
             data,
             expected_statuses=expected_statuses,
@@ -169,6 +180,7 @@ def baseline_verification_evidence_problem(
     baseline_record: BaselineRecord,
     *,
     verification_commands: tuple[VerificationCommand, ...],
+    run_ownership: RunOwnership | None = None,
 ) -> str | None:
     if (
         baseline_record.verification_commands_fingerprint
@@ -176,9 +188,19 @@ def baseline_verification_evidence_problem(
     ):
         return "Configured verification commands no longer match the recorded baseline."
     try:
-        ticket_sha256 = hashlib.sha256(
-            (run_path / "ticket.md").read_bytes()
-        ).hexdigest()
+        ticket_path = run_path / "ticket.md"
+        if run_ownership is not None:
+            run_ownership.validate_run_path(run_path)
+            run_ownership.validate_descendant(ticket_path)
+        ticket_contents = (
+            ticket_path.read_bytes()
+            if run_ownership is None
+            else run_ownership.read_descendant(
+                ticket_path,
+                lambda source: source.read_bytes(),
+            )
+        )
+        ticket_sha256 = hashlib.sha256(ticket_contents).hexdigest()
     except OSError as error:
         return f"Could not inspect the snapshotted baseline ticket: {error}"
     if ticket_sha256 != baseline_record.ticket_sha256:
@@ -189,6 +211,7 @@ def baseline_verification_evidence_problem(
             run_path,
             phases=(AttemptPhase.PREPARING,),
             statuses=(AttemptStatus.COMPLETED,),
+            run_ownership=run_ownership,
         )
         if record is None:
             return "No completed clean-baseline verification attempt exists."
@@ -198,7 +221,11 @@ def baseline_verification_evidence_problem(
             != baseline_record.workspace_fingerprint
         ):
             return "Clean-baseline verification does not match the recorded baseline workspace."
-        data = _read_result(run_path, record)
+        data = _read_result(
+            run_path,
+            record,
+            run_ownership=run_ownership,
+        )
         _validate_verification_result(
             data,
             expected_statuses=frozenset({VerificationStatus.PASS}),
@@ -210,10 +237,23 @@ def baseline_verification_evidence_problem(
     return None
 
 
-def _read_result(run_path: Path, record: AttemptRecord) -> dict[str, Any]:
-    path = attempt_result_path(run_path, record)
+def _read_result(
+    run_path: Path,
+    record: AttemptRecord,
+    *,
+    run_ownership: RunOwnership | None = None,
+) -> dict[str, Any]:
+    path = attempt_result_path(
+        run_path,
+        record,
+        run_ownership=run_ownership,
+    )
     try:
-        data = read_json_object(path)
+        data = (
+            read_json_object(path)
+            if run_ownership is None
+            else run_ownership.read_descendant(path, read_json_object)
+        )
     except CodecError as error:
         raise _VerificationArtifactError(
             f"Could not read verification result: {error}"
