@@ -11,7 +11,7 @@ from ...application.agent_execution import (
     ArtifactRole,
     AttemptArtifactLayout,
 )
-from ...persistence import JsonValue, atomic_write_json
+from ...persistence import JsonValue, atomic_write_json, atomic_write_text
 
 PROMPT_ARTIFACT = "prompt.md"
 EVENTS_ARTIFACT = "events.jsonl"
@@ -46,6 +46,7 @@ class CodexArtifactPaths:
         )
 
     def references(self) -> tuple[ArtifactReference, ...]:
+        self.revalidate()
         references = [
             self.layout.reference(ArtifactRole.PROMPT, self.prompt, "text/markdown"),
             self.layout.reference(
@@ -70,8 +71,24 @@ class CodexArtifactPaths:
             )
         return tuple(references)
 
+    def revalidate(self) -> None:
+        """Reject cached provider paths after their owning run is retargeted."""
+
+        self.layout.revalidate()
+        expected = {
+            "prompt": self.layout.path(PROMPT_ARTIFACT),
+            "events": self.layout.path(EVENTS_ARTIFACT),
+            "stderr": self.layout.path(STDERR_ARTIFACT),
+            "execution": self.layout.path(EXECUTION_ARTIFACT),
+            "result": self.layout.path(RESULT_ARTIFACT),
+        }
+        for name, path in expected.items():
+            if getattr(self, name) != path:
+                raise RuntimeError(f"Cached Codex artifact path changed: {name}.")
+
 
 def prepare(paths: CodexArtifactPaths, prompt: str) -> None:
+    paths.revalidate()
     paths.directory.mkdir(parents=True, exist_ok=True)
     paths.result.unlink(missing_ok=True)
     paths.prompt.write_text(prompt, encoding="utf-8", newline="\n")
@@ -85,12 +102,19 @@ def write_process_output(
     stdout: str,
     stderr: str,
 ) -> None:
+    paths.revalidate()
     paths.events.write_text(stdout, encoding="utf-8", newline="\n")
     paths.stderr.write_text(stderr, encoding="utf-8", newline="\n")
 
 
 def write_execution(paths: CodexArtifactPaths, record: Mapping[str, JsonValue]) -> None:
+    paths.revalidate()
     atomic_write_json(paths.execution, record)
+
+
+def write_result(paths: CodexArtifactPaths, result: str) -> None:
+    paths.revalidate()
+    atomic_write_text(paths.result, result)
 
 
 __all__ = [
@@ -103,4 +127,5 @@ __all__ = [
     "prepare",
     "write_execution",
     "write_process_output",
+    "write_result",
 ]

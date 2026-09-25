@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+import ticket_automation.persistence as persistence_module
+import ticket_automation.workflow as workflow_module
 from tests.fake_agent_executor import InMemoryAgentExecutor
 from tests.helpers import (
     GIT,
+    create_directory_link,
     create_git_repo,
     create_test_run_snapshot,
     create_trusted_prepared_run,
@@ -20,6 +24,7 @@ from tests.helpers import (
     make_report_publisher,
     make_resume_agent_executor_factory,
     make_run_dependencies,
+    remove_directory_link,
     run_test_stage,
 )
 from ticket_automation.application.agent_execution import (
@@ -732,14 +737,18 @@ def test_resume_restarts_reporting_in_a_new_attempt(tmp_path):
 def test_rendering_failure_cannot_reclassify_an_accepted_handoff(tmp_path, monkeypatch):
     repository = create_git_repo(tmp_path / "target")
     config = make_config(repository)
-    original_write_text = Path.write_text
+    real_replace = persistence_module.os.replace
 
-    def fail_report_write(path, data, *args, **kwargs):
-        if path.name == "report.md":
+    def fail_report_replace(source, destination):
+        if Path(destination).name == "report.md":
             raise OSError("disk unavailable")
-        return original_write_text(path, data, *args, **kwargs)
+        return real_replace(source, destination)
 
-    monkeypatch.setattr(Path, "write_text", fail_report_write)
+    monkeypatch.setattr(
+        persistence_module.os,
+        "replace",
+        fail_report_replace,
+    )
     result = run_ticket_lifecycle(
         config,
         _ticket(tmp_path),
@@ -756,6 +765,415 @@ def test_rendering_failure_cannot_reclassify_an_accepted_handoff(tmp_path, monke
     )
     assert load_attempt_records(result.run_dir)[-1].status == "COMPLETED"
     assert (result.run_dir / "final.patch").is_file()
+    assert not tuple(result.run_dir.glob(".report.md.*.tmp"))
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required")
+def test_failed_atomic_report_replacement_preserves_an_existing_report(
+    tmp_path,
+    monkeypatch,
+):
+    repository = create_git_repo(tmp_path / "target")
+    config = make_config(repository)
+    result = run_ticket_lifecycle(
+        config,
+        _ticket(tmp_path),
+        runs_dir=tmp_path / "runs",
+        verification_runner=PassingVerificationRunner(),
+        **make_run_dependencies(config, process_runner=CompletingCodexRunner()),
+        clock=fixed_clock,
+    )
+    report_path = result.run_dir / "report.md"
+    report_path.write_text("existing report\n", encoding="utf-8")
+    real_replace = persistence_module.os.replace
+
+    def fail_report_replace(source, destination):
+        if Path(destination) == report_path:
+            raise OSError("disk unavailable")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(persistence_module.os, "replace", fail_report_replace)
+
+    publication = make_report_publisher().publish(result.run_dir, result.run_record)
+
+    assert publication is None
+    assert report_path.read_text(encoding="utf-8") == "existing report\n"
+    assert not tuple(result.run_dir.glob(".report.md.*.tmp"))
+    assert load_run_record(result.run_dir / "run.json").state is (
+        WorkflowState.READY_FOR_HUMAN
+    )
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required")
+def test_patch_capture_retarget_fails_without_transition_or_external_writes(
+    tmp_path,
+):
+    probe_target = tmp_path / "probe-target"
+    probe_link = tmp_path / "probe-link"
+    probe_target.mkdir()
+    if create_directory_link(probe_link, probe_target) is None:
+        pytest.skip("directory links are unavailable on this platform")
+    remove_directory_link(probe_link)
+
+    repository = create_git_repo(tmp_path / "target")
+    config = make_config(repository)
+    external_run = tmp_path / "external-run"
+    external_patch_contents = "external patch evidence\n"
+
+    class RetargetingPatchCapture:
+        def __init__(self):
+            self.delegate = make_final_patch_capture()
+            self.linked_run: Path | None = None
+
+        def capture(self, request):
+            linked_run = request.destination.parent
+            linked_run.rename(external_run)
+            external_run.joinpath("final.patch").write_text(
+                external_patch_contents,
+                encoding="utf-8",
+            )
+            assert create_directory_link(linked_run, external_run) is not None
+            self.linked_run = linked_run
+            return self.delegate.capture(request)
+
+    patch_capture = RetargetingPatchCapture()
+    dependencies = make_run_dependencies(
+        config,
+        process_runner=CompletingCodexRunner(),
+    )
+    dependencies["final_patch_capture"] = patch_capture
+    try:
+        result = run_ticket_lifecycle(
+            config,
+            _ticket(tmp_path),
+            runs_dir=tmp_path / "runs",
+            verification_runner=PassingVerificationRunner(),
+            **dependencies,
+            clock=fixed_clock,
+        )
+
+        assert result.run_record.state is not WorkflowState.READY_FOR_HUMAN
+        assert result.report_result is None
+        assert result.controller_error is not None
+        assert "ownership was lost" in result.controller_error
+        assert load_run_record(external_run / "run.json").state is (
+            WorkflowState.REPORTING
+        )
+        assert external_run.joinpath("final.patch").read_text(encoding="utf-8") == (
+            external_patch_contents
+        )
+        assert not external_run.joinpath("report.md").exists()
+    finally:
+        if patch_capture.linked_run is not None and patch_capture.linked_run.exists():
+            remove_directory_link(patch_capture.linked_run)
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required")
+def test_report_publisher_rejects_a_linked_run_without_external_mutation(tmp_path):
+    repository = create_git_repo(tmp_path / "target")
+    config = make_config(repository)
+    result = run_ticket_lifecycle(
+        config,
+        _ticket(tmp_path),
+        runs_dir=tmp_path / "runs",
+        verification_runner=PassingVerificationRunner(),
+        **make_run_dependencies(config, process_runner=CompletingCodexRunner()),
+        clock=fixed_clock,
+    )
+    linked_run = tmp_path / "linked-run"
+    if create_directory_link(linked_run, result.run_dir) is None:
+        pytest.skip("directory links are unavailable on this platform")
+    before_files = {
+        path.relative_to(result.run_dir).as_posix(): path.read_bytes()
+        for path in result.run_dir.rglob("*")
+        if path.is_file()
+    }
+    try:
+        publication = make_report_publisher().publish(
+            linked_run,
+            result.run_record,
+        )
+
+        after_files = {
+            path.relative_to(result.run_dir).as_posix(): path.read_bytes()
+            for path in result.run_dir.rglob("*")
+            if path.is_file()
+        }
+        assert publication is None
+        assert after_files == before_files
+    finally:
+        remove_directory_link(linked_run)
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required")
+def test_report_publisher_replaces_a_hardlink_without_mutating_its_target(
+    tmp_path,
+):
+    repository = create_git_repo(tmp_path / "target")
+    config = make_config(repository)
+    result = run_ticket_lifecycle(
+        config,
+        _ticket(tmp_path),
+        runs_dir=tmp_path / "runs",
+        verification_runner=PassingVerificationRunner(),
+        **make_run_dependencies(config, process_runner=CompletingCodexRunner()),
+        clock=fixed_clock,
+    )
+    external_report = tmp_path / "external-report.md"
+    external_report.write_text("external report evidence\n", encoding="utf-8")
+    report_path = result.run_dir / "report.md"
+    report_path.unlink()
+    os.link(external_report, report_path)
+
+    publication = make_report_publisher().publish(
+        result.run_dir,
+        result.run_record,
+    )
+
+    assert publication is not None
+    assert external_report.read_text(encoding="utf-8") == "external report evidence\n"
+    assert report_path.read_text(encoding="utf-8").startswith(
+        f"# {result.run_record.ticket_id} report"
+    )
+    assert not os.path.samefile(external_report, report_path)
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required")
+def test_lifecycle_fails_closed_if_the_selected_run_is_retargeted(
+    tmp_path,
+    monkeypatch,
+):
+    probe_target = tmp_path / "probe-target"
+    probe_link = tmp_path / "probe-link"
+    probe_target.mkdir()
+    link_kind = create_directory_link(probe_link, probe_target)
+    if link_kind is None:
+        pytest.skip("directory links are unavailable on this platform")
+    remove_directory_link(probe_link)
+
+    repository = create_git_repo(tmp_path / "target")
+    config = make_config(repository)
+    moved_run = tmp_path / "moved-run"
+    retargeted_path: Path | None = None
+    original_dispatch = workflow_module.dispatch_stage
+
+    def dispatch_then_retarget(context, handlers):
+        nonlocal retargeted_path
+        decision = original_dispatch(context, handlers)
+        if context.run_record.state is WorkflowState.PREPARING:
+            retargeted_path = context.run_dir
+            context.run_dir.rename(moved_run)
+            assert create_directory_link(context.run_dir, moved_run) is not None
+        return decision
+
+    monkeypatch.setattr(workflow_module, "dispatch_stage", dispatch_then_retarget)
+    try:
+        result = run_ticket_lifecycle(
+            config,
+            _ticket(tmp_path),
+            runs_dir=tmp_path / "runs",
+            verification_runner=PassingVerificationRunner(),
+            **make_run_dependencies(config, process_runner=CompletingCodexRunner()),
+            clock=fixed_clock,
+        )
+
+        assert result.run_record.state is WorkflowState.PREPARING
+        assert result.report_result is None
+        assert result.controller_error is not None
+        assert "ownership was lost" in result.controller_error
+        assert [item.name for item in result.safety_violations] == [
+            "run-directory-ownership"
+        ]
+        assert load_run_record(moved_run / "run.json").state is WorkflowState.PREPARING
+        attempts = load_attempt_records(moved_run)
+        assert len(attempts) == 1
+        assert attempts[0].status == "STARTED"
+        assert not (moved_run / "final.patch").exists()
+        assert not (moved_run / "report.md").exists()
+    finally:
+        if retargeted_path is not None and retargeted_path.exists():
+            remove_directory_link(retargeted_path)
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required")
+def test_agent_cannot_redirect_post_execution_evidence_after_run_retarget(
+    tmp_path,
+):
+    probe_target = tmp_path / "probe-target"
+    probe_link = tmp_path / "probe-link"
+    probe_target.mkdir()
+    if create_directory_link(probe_link, probe_target) is None:
+        pytest.skip("directory links are unavailable on this platform")
+    remove_directory_link(probe_link)
+
+    repository = create_git_repo(tmp_path / "target")
+    config = make_config(repository)
+    runs_dir = tmp_path / "runs"
+    moved_run = tmp_path / "moved-run"
+    external_target = tmp_path / "external-target"
+    external_target.mkdir()
+    external_target.joinpath("sentinel.txt").write_bytes(b"unchanged\n")
+    before = {
+        path.relative_to(external_target): path.read_bytes()
+        for path in external_target.rglob("*")
+        if path.is_file()
+    }
+
+    class RetargetingCodexRunner:
+        def run(
+            self,
+            command,
+            *,
+            stdin,
+            timeout_seconds,
+            on_process_start=None,
+        ):
+            del stdin, timeout_seconds
+            if on_process_start is not None:
+                on_process_start()
+            command.cwd.joinpath("file.txt").write_text(
+                "implemented\n",
+                encoding="utf-8",
+            )
+            output = Path(command.argv[command.argv.index("--output-last-message") + 1])
+            output.write_text(
+                json.dumps(
+                    {
+                        "status": "COMPLETED",
+                        "summary": "implementation passed",
+                        "tests_run": [],
+                        "assumptions": [],
+                        "known_issues": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            run_dir = next(path for path in runs_dir.iterdir() if path.is_dir())
+            run_dir.rename(moved_run)
+            assert create_directory_link(run_dir, external_target) is not None
+            return CodexProcessResult(returncode=0, stdout="", stderr="")
+
+    executor = make_agent_executor(
+        config,
+        process_runner=RetargetingCodexRunner(),
+    )
+
+    retargeted_path: Path | None = None
+    try:
+        result = run_ticket_lifecycle(
+            config,
+            _ticket(tmp_path),
+            runs_dir=runs_dir,
+            verification_runner=PassingVerificationRunner(),
+            **make_run_dependencies(
+                config,
+                agent_executor=executor,
+            ),
+            clock=fixed_clock,
+        )
+        retargeted_path = result.run_dir
+
+        after = {
+            path.relative_to(external_target): path.read_bytes()
+            for path in external_target.rglob("*")
+            if path.is_file()
+        }
+        assert after == before
+        assert (
+            load_run_record(moved_run / "run.json").state is WorkflowState.IMPLEMENTING
+        )
+        assert result.report_result is None
+        assert result.controller_error is not None
+        assert "ownership was lost" in result.controller_error
+        assert [item.name for item in result.safety_violations] == [
+            "run-directory-ownership"
+        ]
+        implementation_attempt = load_attempt_records(moved_run)[-1]
+        assert implementation_attempt.phase is AttemptPhase.IMPLEMENTING
+        assert implementation_attempt.status == "STARTED"
+        assert not (external_target / "execution.json").exists()
+        assert not (external_target / "result.json").exists()
+        assert not (external_target / "report.md").exists()
+    finally:
+        if retargeted_path is not None and retargeted_path.exists():
+            remove_directory_link(retargeted_path)
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required")
+def test_verification_runner_cannot_redirect_result_after_run_retarget(tmp_path):
+    probe_target = tmp_path / "probe-target"
+    probe_link = tmp_path / "probe-link"
+    probe_target.mkdir()
+    if create_directory_link(probe_link, probe_target) is None:
+        pytest.skip("directory links are unavailable on this platform")
+    remove_directory_link(probe_link)
+
+    repository = create_git_repo(tmp_path / "target")
+    config = make_config(repository)
+    runs_dir = tmp_path / "runs"
+    moved_run = tmp_path / "moved-run"
+    external_target = tmp_path / "external-target"
+    external_target.mkdir()
+    external_target.joinpath("sentinel.txt").write_bytes(b"unchanged\n")
+    before = {
+        path.relative_to(external_target): path.read_bytes()
+        for path in external_target.rglob("*")
+        if path.is_file()
+    }
+
+    class RetargetingVerificationRunner:
+        calls = 0
+
+        def run(self, command, *, timeout_seconds):
+            del command, timeout_seconds
+            self.calls += 1
+            if self.calls == 2:
+                run_dir = next(path for path in runs_dir.iterdir() if path.is_dir())
+                run_dir.rename(moved_run)
+                assert create_directory_link(run_dir, external_target) is not None
+            return VerificationProcessResult(
+                returncode=0,
+                stdout="verification passed\n",
+                stderr="",
+            )
+
+    runner = RetargetingVerificationRunner()
+    executor = WorkspaceChangingExecutor(
+        make_agent_executor(config, process_runner=CompletingCodexRunner())
+    )
+    retargeted_path: Path | None = None
+    try:
+        result = run_ticket_lifecycle(
+            config,
+            _ticket(tmp_path),
+            runs_dir=runs_dir,
+            verification_runner=runner,
+            **make_run_dependencies(config, agent_executor=executor),
+            clock=fixed_clock,
+        )
+        retargeted_path = result.run_dir
+
+        after = {
+            path.relative_to(external_target): path.read_bytes()
+            for path in external_target.rglob("*")
+            if path.is_file()
+        }
+        assert after == before
+        assert load_run_record(moved_run / "run.json").state is WorkflowState.VERIFYING
+        assert result.report_result is None
+        assert result.controller_error is not None
+        assert "ownership was lost" in result.controller_error
+        assert [item.name for item in result.safety_violations] == [
+            "run-directory-ownership"
+        ]
+        verification_attempt = load_attempt_records(moved_run)[-1]
+        assert verification_attempt.phase is AttemptPhase.VERIFYING
+        assert verification_attempt.status == "STARTED"
+        assert not (external_target / "result.json").exists()
+        assert not (external_target / "report.md").exists()
+    finally:
+        if retargeted_path is not None and retargeted_path.exists():
+            remove_directory_link(retargeted_path)
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required")

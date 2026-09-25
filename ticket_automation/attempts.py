@@ -35,6 +35,11 @@ from .persistence import (
     read_json_object,
     timestamp_now,
 )
+from .run_ownership import (
+    RunOwnership,
+    RunOwnershipError,
+    validate_unlinked_run_directory,
+)
 
 ATTEMPT_RECORD_FILE = "attempt.json"
 ATTEMPT_RECORD_FORMAT = "ticket_automation.attempt"
@@ -162,6 +167,7 @@ def require_stage_attempt(
     attempt: StageAttempt,
     *,
     phase: AttemptPhase,
+    run_ownership: RunOwnership | None = None,
 ) -> StageAttempt:
     """Validate a stage capability against its controller-owned persisted record."""
 
@@ -173,9 +179,17 @@ def require_stage_attempt(
             f"Stage received {attempt.phase.value} attempt evidence; "
             f"expected {phase.value}."
         )
-    attempt_layout = attempt_artifact_layout(run_dir, attempt)
+    attempt_layout = attempt_artifact_layout(
+        run_dir,
+        attempt,
+        run_ownership=run_ownership,
+    )
     persisted = _load_attempt(attempt_layout.path(ATTEMPT_RECORD_FILE))
-    persisted_layout = attempt_artifact_layout(run_dir, persisted)
+    persisted_layout = attempt_artifact_layout(
+        run_dir,
+        persisted,
+        run_ownership=run_ownership,
+    )
     if persisted.status is not AttemptStatus.STARTED:
         raise AttemptError("Stage execution requires an active started attempt.")
     if (
@@ -201,6 +215,7 @@ def start_attempt(
     before_workspace_fingerprint: str | None,
     execution_path: str | None = None,
     clock: Callable[[], datetime] | None = None,
+    run_ownership: RunOwnership | None = None,
 ) -> AttemptRecord:
     """Create a fully recorded attempt before exposing its final directory.
 
@@ -212,10 +227,25 @@ def start_attempt(
 
     _validate_phase_value(phase, field="phase")
     run_path = Path(run_dir)
-    attempts_root = run_path / ATTEMPTS_DIR_NAME
-    attempts_root.mkdir(parents=True, exist_ok=True)
+    try:
+        if run_ownership is None:
+            run_path.mkdir(parents=True, exist_ok=True)
+        run_path = _validated_run_path(run_path, run_ownership=run_ownership)
+        attempts_root = AttemptArtifactLayout.attempts_root(run_path)
+        attempts_root.mkdir(parents=True, exist_ok=True)
+        attempts_root = AttemptArtifactLayout.attempts_root(run_path)
+    except RunOwnershipError as error:
+        if run_ownership is not None:
+            raise
+        raise AttemptError(
+            f"Could not prepare the owning run attempts directory safely: {error}"
+        ) from error
+    except (AgentContractError, OSError, RuntimeError) as error:
+        raise AttemptError(
+            f"Could not prepare the owning run attempts directory safely: {error}"
+        ) from error
     while True:
-        sequence = _next_sequence(attempts_root)
+        sequence = _next_sequence(run_path, attempts_root)
         directory = attempts_root / f"{sequence:03d}-{_phase_slug(phase)}"
         temporary_directory = Path(
             tempfile.mkdtemp(
@@ -254,9 +284,23 @@ def start_attempt(
         return record
 
 
-def save_attempt(record: AttemptRecord) -> None:
+def save_attempt(
+    record: AttemptRecord,
+    *,
+    run_ownership: RunOwnership | None = None,
+) -> None:
     _validate_record(record)
-    atomic_write_json(record.path, record.to_dict())
+    run_dir = record.artifact_directory.parent.parent
+    layout = attempt_artifact_layout(
+        run_dir,
+        record,
+        run_ownership=run_ownership,
+    )
+    try:
+        path = layout.path(ATTEMPT_RECORD_FILE)
+    except AgentContractError as error:
+        raise AttemptError(f"Attempt record confinement failed: {error}") from error
+    atomic_write_json(path, record.to_dict())
 
 
 def update_attempt(
@@ -270,6 +314,7 @@ def update_attempt(
     metadata: AttemptMetadata | None = None,
     ended: bool = False,
     clock: Callable[[], datetime] | None = None,
+    run_ownership: RunOwnership | None = None,
 ) -> AttemptRecord:
     updated = replace(
         record,
@@ -293,7 +338,7 @@ def update_attempt(
         metadata=record.metadata if metadata is None else metadata,
         ended_at=timestamp_now(clock) if ended else record.ended_at,
     )
-    save_attempt(updated)
+    save_attempt(updated, run_ownership=run_ownership)
     return updated
 
 
@@ -306,6 +351,7 @@ def complete_attempt(
     execution_path: str | None = None,
     metadata: AttemptMetadata | None = None,
     clock: Callable[[], datetime] | None = None,
+    run_ownership: RunOwnership | None = None,
 ) -> AttemptRecord:
     return update_attempt(
         record,
@@ -316,10 +362,15 @@ def complete_attempt(
         metadata=metadata,
         ended=True,
         clock=clock,
+        run_ownership=run_ownership,
     )
 
 
-def load_attempt_records(run_dir: Path | str) -> tuple[AttemptRecord, ...]:
+def load_attempt_records(
+    run_dir: Path | str,
+    *,
+    run_ownership: RunOwnership | None = None,
+) -> tuple[AttemptRecord, ...]:
     """Load trusted records, rejecting malformed final attempt directories.
 
     Directories without ``attempt.json`` are harmless crash diagnostics. They
@@ -328,7 +379,17 @@ def load_attempt_records(run_dir: Path | str) -> tuple[AttemptRecord, ...]:
     completely; otherwise callers must stop rather than infer state from it.
     """
 
-    run_path = Path(run_dir)
+    try:
+        run_path = _validated_run_path(
+            Path(run_dir),
+            run_ownership=run_ownership,
+        )
+    except RunOwnershipError as error:
+        if run_ownership is not None:
+            raise
+        raise AttemptError(
+            f"Could not inspect the owning run attempts directory safely: {error}"
+        ) from error
     try:
         root = AttemptArtifactLayout.attempts_root(run_path)
         if not AttemptArtifactLayout.path_is_directory(
@@ -346,7 +407,11 @@ def load_attempt_records(run_dir: Path | str) -> tuple[AttemptRecord, ...]:
         if directory.name.startswith("."):
             continue
         try:
-            layout = AttemptArtifactLayout.for_attempt(run_path, directory)
+            layout = AttemptArtifactLayout.for_attempt(
+                run_path,
+                directory,
+                run_ownership=run_ownership,
+            )
             if not AttemptArtifactLayout.path_is_directory(
                 layout.attempt_root,
                 description="attempt root",
@@ -356,7 +421,13 @@ def load_attempt_records(run_dir: Path | str) -> tuple[AttemptRecord, ...]:
             if not layout.artifact_file_exists(ATTEMPT_RECORD_FILE):
                 continue
             record = _load_attempt(path)
-            attempt_artifact_layout(run_path, record)
+            attempt_artifact_layout(
+                run_path,
+                record,
+                run_ownership=run_ownership,
+            )
+        except RunOwnershipError:
+            raise
         except (AgentContractError, OSError, RuntimeError) as error:
             raise AttemptError(
                 f"Could not inspect attempt directory {directory} safely: {error}"
@@ -407,6 +478,7 @@ def complete_stage_attempt(
     process_started: bool | None,
     metadata: AttemptMetadata | None = None,
     clock: Callable[[], datetime] | None = None,
+    run_ownership: RunOwnership | None = None,
 ) -> AttemptRecord:
     """Complete the exact trusted attempt started by lifecycle orchestration."""
 
@@ -414,9 +486,17 @@ def complete_stage_attempt(
         raise AttemptError("attempt must be an AttemptRecord.")
     if not isinstance(stage_outcome, StageOutcome):
         raise AttemptError("stage_outcome must be a StageOutcome value.")
-    attempt_layout = attempt_artifact_layout(run_dir, attempt)
+    attempt_layout = attempt_artifact_layout(
+        run_dir,
+        attempt,
+        run_ownership=run_ownership,
+    )
     persisted = _load_attempt(attempt_layout.path(ATTEMPT_RECORD_FILE))
-    persisted_layout = attempt_artifact_layout(run_dir, persisted)
+    persisted_layout = attempt_artifact_layout(
+        run_dir,
+        persisted,
+        run_ownership=run_ownership,
+    )
     if (
         persisted.sequence != attempt.sequence
         or persisted.phase is not attempt.phase
@@ -438,40 +518,71 @@ def complete_stage_attempt(
                 run_dir,
                 persisted,
                 EXECUTION_EVIDENCE_FILE,
+                run_ownership=run_ownership,
             )
             else persisted.execution_path
         ),
         metadata=persisted.metadata if metadata is None else metadata,
         clock=clock,
+        run_ownership=run_ownership,
     )
 
 
 def attempt_result_path(
-    run_dir: Path | str, record: AttemptRecord | StageAttempt
+    run_dir: Path | str,
+    record: AttemptRecord | StageAttempt,
+    *,
+    run_ownership: RunOwnership | None = None,
 ) -> Path:
-    return attempt_artifact_path(run_dir, record, record.result_path)
+    return attempt_artifact_path(
+        run_dir,
+        record,
+        record.result_path,
+        run_ownership=run_ownership,
+    )
 
 
 def attempt_artifact_layout(
     run_dir: Path | str,
     record: AttemptRecord | StageAttempt,
+    *,
+    run_ownership: RunOwnership | None = None,
 ) -> AttemptArtifactLayout:
     """Return the one physically confined path owner for an attempt record."""
 
     if not isinstance(record, AttemptRecord | StageAttempt):
         raise AttemptError("record must be an AttemptRecord or StageAttempt.")
-    expected_directory = Path(run_dir) / ATTEMPTS_DIR_NAME / _directory_name(record)
+    requested_path = Path(run_dir).absolute()
+    expected_record_directory = (
+        requested_path / ATTEMPTS_DIR_NAME / _directory_name(record)
+    )
+    if record.artifact_directory.absolute() != expected_record_directory:
+        raise AttemptError(
+            "Attempt record does not belong to the supplied run directory."
+        )
+    try:
+        run_path = _validated_run_path(
+            requested_path,
+            run_ownership=run_ownership,
+        )
+    except RunOwnershipError as error:
+        if run_ownership is not None:
+            raise
+        raise AttemptError(f"Attempt artifact confinement failed: {error}") from error
+    expected_directory = run_path / ATTEMPTS_DIR_NAME / _directory_name(record)
     try:
         expected_layout = AttemptArtifactLayout.for_attempt(
-            Path(run_dir),
+            run_path,
             expected_directory,
+            run_ownership=run_ownership,
         )
     except AgentContractError as error:
         raise AttemptError(f"Attempt artifact confinement failed: {error}") from error
     try:
         record_layout = AttemptArtifactLayout.for_attempt(
-            Path(run_dir),
+            run_path,
             record.artifact_directory,
+            run_ownership=run_ownership,
         )
     except AgentContractError as error:
         raise AttemptError(
@@ -484,12 +595,30 @@ def attempt_artifact_layout(
     return expected_layout
 
 
+def _validated_run_path(
+    run_dir: Path,
+    *,
+    run_ownership: RunOwnership | None = None,
+) -> Path:
+    if run_ownership is None:
+        return validate_unlinked_run_directory(run_dir)
+    if not isinstance(run_ownership, RunOwnership):
+        raise TypeError("run_ownership must be a RunOwnership or None.")
+    return run_ownership.validate_run_path(run_dir)
+
+
 def attempt_artifact_path(
     run_dir: Path | str,
     record: AttemptRecord | StageAttempt,
     relative_path: str,
+    *,
+    run_ownership: RunOwnership | None = None,
 ) -> Path:
-    layout = attempt_artifact_layout(run_dir, record)
+    layout = attempt_artifact_layout(
+        run_dir,
+        record,
+        run_ownership=run_ownership,
+    )
     _validate_relative_artifact_path(relative_path, field="artifact path")
     try:
         return layout.path(relative_path)
@@ -501,10 +630,16 @@ def attempt_artifact_file_exists(
     run_dir: Path | str,
     record: AttemptRecord | StageAttempt,
     relative_path: str,
+    *,
+    run_ownership: RunOwnership | None = None,
 ) -> bool:
     """Return false for a missing artifact and reject inspection failures."""
 
-    layout = attempt_artifact_layout(run_dir, record)
+    layout = attempt_artifact_layout(
+        run_dir,
+        record,
+        run_ownership=run_ownership,
+    )
     _validate_relative_artifact_path(relative_path, field="artifact path")
     try:
         return layout.artifact_file_exists(relative_path)
@@ -555,12 +690,15 @@ def _load_attempt(path: Path) -> AttemptRecord:
         raise AttemptError(f"Invalid attempt record {path}: {error}") from error
 
 
-def _next_sequence(root: Path) -> int:
+def _next_sequence(run_dir: Path, root: Path) -> int:
     sequences: list[int] = []
     for directory in root.iterdir():
+        if directory.name.startswith("."):
+            continue
         try:
+            layout = AttemptArtifactLayout.for_attempt(run_dir, directory)
             if not AttemptArtifactLayout.path_is_directory(
-                directory,
+                layout.attempt_root,
                 description="attempt sequence entry",
             ):
                 continue

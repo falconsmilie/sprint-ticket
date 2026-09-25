@@ -16,3 +16,8 @@ other schema versions are unsupported and are not modified or deleted.
 Prompts and result schemas ship inside the `ticket_automation` package. The
 scripted provider and provider contract fixtures remain test-only support and
 are not registered by the production composition root.
+
+Run resume and status now reject traversal IDs, linked run directories, and run
+records whose identity does not match their directory. Attempt-ledger writes are
+physically confined to the owning run, and final patch/report publication uses
+atomic replacement rather than following a pre-existing file link.

@@ -52,9 +52,13 @@ from .review import ReviewStageResult
 from .runs import (
     RUN_RECORD_FILE,
     RunError,
+    RunOwnership,
+    RunOwnershipError,
     RunRecord,
     create_run_snapshot,
     load_run_record,
+    load_run_record_for_owner,
+    save_owned_run_record,
     save_run_record,
 )
 from .verification import VerificationProcessRunner, VerificationStageResult
@@ -105,7 +109,14 @@ class LifecycleController:
         run_dir: Path,
         preflight_result: PreflightResult,
         run_record: RunRecord,
+        *,
+        run_ownership: RunOwnership | None = None,
     ) -> LifecycleResult:
+        run_ownership = _controller_run_ownership(
+            run_dir,
+            run_record,
+            run_ownership,
+        )
         return _drive_lifecycle(
             run_dir,
             preflight_result,
@@ -115,6 +126,7 @@ class LifecycleController:
             repository_lock=self.repository_lock,
             report_publisher=self.report_publisher,
             clock=self.clock,
+            run_ownership=run_ownership,
         )
 
     def drive_safely(
@@ -124,7 +136,27 @@ class LifecycleController:
         run_record: RunRecord,
         *,
         exception_prefix: str,
+        run_ownership: RunOwnership | None = None,
     ) -> LifecycleResult:
+        try:
+            run_ownership = _controller_run_ownership(
+                run_dir,
+                run_record,
+                run_ownership,
+            )
+        except (RunOwnershipError, ValueError) as error:
+            ownership_error = (
+                error
+                if isinstance(error, RunOwnershipError)
+                else RunOwnershipError(str(error))
+            )
+            return _ownership_failure_result(
+                run_dir,
+                run_record,
+                preflight_result,
+                self.progress,
+                ownership_error,
+            )
         return _drive_lifecycle_safely(
             run_dir,
             preflight_result,
@@ -135,6 +167,7 @@ class LifecycleController:
             report_publisher=self.report_publisher,
             exception_prefix=exception_prefix,
             clock=self.clock,
+            run_ownership=run_ownership,
         )
 
 
@@ -195,6 +228,11 @@ def _run_ticket_lifecycle_locked(
         resolved_policy=resolved_policy,
         clock=clock,
     )
+    try:
+        run_ownership = RunOwnership.acquire(runs_dir, snapshot.run_record.run_id)
+    except (RunOwnershipError, ValueError) as error:
+        raise RunError(str(error)) from error
+    run_dir = run_ownership.run_dir
     config = config_from_resolved_run_policy(snapshot.run_record.resolved_policy)
     _update_repository_lock(repository_lock, snapshot.run_record)
     handlers = build_active_stage_handlers(
@@ -211,10 +249,11 @@ def _run_ticket_lifecycle_locked(
         progress=progress,
         clock=clock,
     ).drive_safely(
-        snapshot.run_dir,
+        run_dir,
         snapshot.preflight_result,
         snapshot.run_record,
         exception_prefix="Internal TicketAutomation exception",
+        run_ownership=run_ownership,
     )
 
 
@@ -228,11 +267,13 @@ def resume_ticket_lifecycle(
     verification_runner: VerificationProcessRunner | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> LifecycleResult:
-    run_dir = Path(runs_dir) / run_id
-    if not run_dir.is_dir():
-        raise RunError(f"Run directory does not exist: {run_dir}")
+    try:
+        run_ownership = RunOwnership.acquire(runs_dir, run_id)
+        run_dir = run_ownership.run_dir
+        run_record = load_run_record_for_owner(run_ownership)
+    except (RunOwnershipError, ValueError) as error:
+        raise RunError(str(error)) from error
     preflight_result = PreflightResult(())
-    run_record = load_run_record(run_dir / RUN_RECORD_FILE)
     config = config_from_resolved_run_policy(run_record.resolved_policy)
     with acquire_repository_run_lock(
         run_record.target_repository_path,
@@ -251,6 +292,7 @@ def resume_ticket_lifecycle(
             report_publisher=report_publisher,
             verification_runner=verification_runner,
             clock=clock,
+            run_ownership=run_ownership,
         )
 
 
@@ -266,7 +308,18 @@ def _resume_ticket_lifecycle_locked(
     report_publisher: TerminalReportPublisher,
     verification_runner: VerificationProcessRunner | None,
     clock: Callable[[], datetime] | None,
+    run_ownership: RunOwnership,
 ) -> LifecycleResult:
+    try:
+        _require_owned_run(run_dir, run_ownership)
+    except RunOwnershipError as error:
+        return _ownership_failure_result(
+            run_dir,
+            run_record,
+            preflight_result,
+            LifecycleProgress(),
+            error,
+        )
     if run_record.state in TERMINAL_WORKFLOW_STATES:
         return _empty_result(run_dir, run_record, preflight_result)
 
@@ -283,9 +336,15 @@ def _resume_ticket_lifecycle_locked(
             run_dir,
             terminal_reason=problem,
             clock=clock,
+            run_ownership=run_ownership,
         )
         _update_repository_lock(repository_lock, run_record)
-        _publish_terminal_report(report_publisher, run_dir, run_record)
+        _publish_terminal_report(
+            report_publisher,
+            run_dir,
+            run_record,
+            run_ownership=run_ownership,
+        )
         return _empty_result(run_dir, run_record, preflight_result)
 
     progress = LifecycleProgress()
@@ -308,15 +367,22 @@ def _resume_ticket_lifecycle_locked(
             preflight_result,
             run_record,
             exception_prefix="Internal TicketAutomation exception during resume",
+            run_ownership=run_ownership,
         )
     except ConfigError as error:
         run_record = _mark_human_required(
             run_dir,
             terminal_reason=str(error),
             clock=clock,
+            run_ownership=run_ownership,
         )
         _update_repository_lock(repository_lock, run_record)
-        _publish_terminal_report(report_publisher, run_dir, run_record)
+        _publish_terminal_report(
+            report_publisher,
+            run_dir,
+            run_record,
+            run_ownership=run_ownership,
+        )
         return _empty_result(run_dir, run_record, preflight_result)
     except RunError as error:
         return _controller_failure_result(
@@ -327,6 +393,8 @@ def _resume_ticket_lifecycle_locked(
             report_publisher,
             controller_error=str(error),
             clock=clock,
+            run_record=run_record,
+            run_ownership=run_ownership,
         )
     except Exception as error:  # noqa: BLE001 - terminal evidence must be persisted.
         return _controller_failure_result(
@@ -340,6 +408,8 @@ def _resume_ticket_lifecycle_locked(
                 f"{type(error).__name__}: {error}"
             ),
             clock=clock,
+            run_record=run_record,
+            run_ownership=run_ownership,
         )
 
 
@@ -353,20 +423,30 @@ def _drive_lifecycle(
     repository_lock: RepositoryRunLock,
     report_publisher: TerminalReportPublisher,
     clock: Callable[[], datetime] | None,
+    run_ownership: RunOwnership,
 ) -> LifecycleResult:
     while run_record.state not in TERMINAL_WORKFLOW_STATES:
+        _require_owned_run(run_dir, run_ownership)
         _update_repository_lock(repository_lock, run_record)
-        attempt = _start_stage_attempt(run_dir, run_record, clock=clock)
+        attempt = _start_stage_attempt(
+            run_dir,
+            run_record,
+            clock=clock,
+            run_ownership=run_ownership,
+        )
         context = StageContext(
             run_dir,
             run_record,
             None if attempt is None else StageAttempt.from_record(attempt),
             clock,
             lambda active_attempt=attempt: _mark_attempt_process_started(
-                active_attempt
+                active_attempt,
+                run_ownership=run_ownership,
             ),
+            run_ownership,
         )
         decision = dispatch_stage(context, handlers)
+        _require_owned_run(run_dir, run_ownership)
         updated = _apply_stage_decision(run_record, decision, clock=clock)
         transition_persisted = False
         completion = decision.completion
@@ -377,8 +457,9 @@ def _drive_lifecycle(
                 )
             reporting_evidence = completion.reporting_evidence
             if reporting_evidence is not None:
-                save_run_record(updated, run_dir / RUN_RECORD_FILE)
+                _save_lifecycle_run(run_dir, updated, run_ownership)
                 transition_persisted = True
+                _require_owned_run(run_dir, run_ownership)
                 write_stage_message_result(
                     run_dir,
                     attempt,
@@ -393,14 +474,20 @@ def _drive_lifecycle(
                 process_started=completion.process_started,
                 metadata=AttemptMetadata(controller_message=completion.message),
                 clock=clock,
+                run_ownership=run_ownership,
             )
         if not transition_persisted:
-            save_run_record(updated, run_dir / RUN_RECORD_FILE)
+            _save_lifecycle_run(run_dir, updated, run_ownership)
         run_record = updated
         _update_repository_lock(repository_lock, run_record)
         progress.record(decision.result, run_record=run_record)
 
-    report_result = _publish_terminal_report(report_publisher, run_dir, run_record)
+    report_result = _publish_terminal_report(
+        report_publisher,
+        run_dir,
+        run_record,
+        run_ownership=run_ownership,
+    )
     _update_repository_lock(repository_lock, run_record)
     return LifecycleResult(
         run_dir=run_dir,
@@ -425,6 +512,7 @@ def _drive_lifecycle_safely(
     report_publisher: TerminalReportPublisher,
     exception_prefix: str,
     clock: Callable[[], datetime] | None,
+    run_ownership: RunOwnership,
 ) -> LifecycleResult:
     try:
         return _drive_lifecycle(
@@ -436,6 +524,15 @@ def _drive_lifecycle_safely(
             repository_lock=repository_lock,
             report_publisher=report_publisher,
             clock=clock,
+            run_ownership=run_ownership,
+        )
+    except RunOwnershipError as error:
+        return _ownership_failure_result(
+            run_dir,
+            run_record,
+            preflight_result,
+            progress,
+            error,
         )
     except RunError as error:
         controller_error = str(error)
@@ -449,6 +546,8 @@ def _drive_lifecycle_safely(
         report_publisher,
         controller_error=controller_error,
         clock=clock,
+        run_record=run_record,
+        run_ownership=run_ownership,
     )
 
 
@@ -481,6 +580,7 @@ def _start_stage_attempt(
     run_record: RunRecord,
     *,
     clock: Callable[[], datetime] | None,
+    run_ownership: RunOwnership | None,
 ) -> AttemptRecord | None:
     phase = phase_for_active_state(run_record.state)
     if phase is None:
@@ -503,13 +603,22 @@ def _start_stage_attempt(
         phase=phase,
         before_workspace_fingerprint=before_fingerprint,
         clock=clock,
+        run_ownership=run_ownership,
     )
 
 
-def _mark_attempt_process_started(attempt: AttemptRecord | None) -> None:
+def _mark_attempt_process_started(
+    attempt: AttemptRecord | None,
+    *,
+    run_ownership: RunOwnership | None,
+) -> None:
     if attempt is None:
         raise RunError("A state without an attempt cannot start a process.")
-    update_attempt(attempt, process_started=True)
+    update_attempt(
+        attempt,
+        process_started=True,
+        run_ownership=run_ownership,
+    )
 
 
 def _controller_failure_result(
@@ -521,14 +630,32 @@ def _controller_failure_result(
     *,
     controller_error: str,
     clock: Callable[[], datetime] | None,
+    run_record: RunRecord,
+    run_ownership: RunOwnership | None,
 ) -> LifecycleResult:
-    run_record = _mark_controller_exception(
-        run_dir,
-        controller_error=controller_error,
-        clock=clock,
-    )
+    try:
+        _require_owned_run(run_dir, run_ownership)
+        run_record = _mark_controller_exception(
+            run_dir,
+            controller_error=controller_error,
+            clock=clock,
+            run_ownership=run_ownership,
+        )
+    except RunOwnershipError as error:
+        return _ownership_failure_result(
+            run_dir,
+            run_record,
+            preflight_result,
+            progress,
+            error,
+        )
     _update_repository_lock(repository_lock, run_record)
-    _publish_terminal_report(report_publisher, run_dir, run_record)
+    _publish_terminal_report(
+        report_publisher,
+        run_dir,
+        run_record,
+        run_ownership=run_ownership,
+    )
     return LifecycleResult(
         run_dir=run_dir,
         run_record=run_record,
@@ -562,11 +689,20 @@ def _publish_terminal_report(
     publisher: TerminalReportPublisher,
     run_dir: Path,
     run_record: RunRecord,
+    *,
+    run_ownership: RunOwnership | None = None,
 ) -> ReportPublication | None:
     """Keep terminal report I/O best-effort and exactly once per controller exit."""
 
     try:
-        return publisher.publish(run_dir, run_record)
+        _require_owned_run(run_dir, run_ownership)
+        return publisher.publish(
+            run_dir,
+            run_record,
+            run_ownership=run_ownership,
+        )
+    except RunOwnershipError:
+        raise
     except Exception:  # noqa: BLE001 - presentation cannot mask terminal state.
         return None
 
@@ -576,8 +712,13 @@ def _mark_controller_exception(
     *,
     controller_error: str,
     clock: Callable[[], datetime] | None,
+    run_ownership: RunOwnership | None,
 ) -> RunRecord:
-    run_record = load_run_record(run_dir / RUN_RECORD_FILE)
+    run_record = (
+        load_run_record(run_dir / RUN_RECORD_FILE)
+        if run_ownership is None
+        else load_run_record_for_owner(run_ownership)
+    )
     if run_record.state in TERMINAL_WORKFLOW_STATES:
         return run_record
     stop = classify_unexpected_controller_failure(
@@ -585,7 +726,12 @@ def _mark_controller_exception(
         run_record,
         message=controller_error,
     )
-    return _mark_terminal_stop(run_dir, stop=stop, clock=clock)
+    return _mark_terminal_stop(
+        run_dir,
+        stop=stop,
+        clock=clock,
+        run_ownership=run_ownership,
+    )
 
 
 def _mark_terminal_stop(
@@ -593,16 +739,24 @@ def _mark_terminal_stop(
     *,
     stop: TerminalStop,
     clock: Callable[[], datetime] | None,
+    run_ownership: RunOwnership | None = None,
 ) -> RunRecord:
     record_path = run_dir / RUN_RECORD_FILE
-    run_record = load_run_record(record_path)
+    run_record = (
+        load_run_record(record_path)
+        if run_ownership is None
+        else load_run_record_for_owner(run_ownership)
+    )
     updated = run_record.transition_to(
         stop.state,
         updated_timestamp=timestamp_now(clock),
         terminal_reason=stop.reason.message,
         stop_reason=stop.reason,
     )
-    save_run_record(updated, record_path)
+    if run_ownership is None:
+        save_run_record(updated, record_path)
+    else:
+        save_owned_run_record(run_ownership, updated)
     return updated
 
 
@@ -612,6 +766,7 @@ def _mark_human_required(
     terminal_reason: str,
     clock: Callable[[], datetime] | None,
     category: StopCategory = StopCategory.HUMAN_JUDGMENT_REQUIRED,
+    run_ownership: RunOwnership | None = None,
 ) -> RunRecord:
     return _mark_terminal_stop(
         run_dir,
@@ -624,6 +779,74 @@ def _mark_human_required(
             ),
         ),
         clock=clock,
+        run_ownership=run_ownership,
+    )
+
+
+def _controller_run_ownership(
+    run_dir: Path,
+    run_record: RunRecord,
+    run_ownership: RunOwnership | None,
+) -> RunOwnership:
+    ownership = (
+        RunOwnership.acquire(run_dir.parent, run_record.run_id)
+        if run_ownership is None
+        else run_ownership
+    )
+    ownership.validate_run_path(run_dir)
+    return ownership
+
+
+def _require_owned_run(
+    run_dir: Path,
+    run_ownership: RunOwnership | None,
+) -> Path:
+    if run_ownership is None:
+        return run_dir
+    return run_ownership.validate_run_path(run_dir)
+
+
+def _save_lifecycle_run(
+    run_dir: Path,
+    run_record: RunRecord,
+    run_ownership: RunOwnership | None,
+) -> None:
+    if run_ownership is None:
+        save_run_record(run_record, run_dir / RUN_RECORD_FILE)
+        return
+    _require_owned_run(run_dir, run_ownership)
+    save_owned_run_record(run_ownership, run_record)
+
+
+def _ownership_failure_result(
+    run_dir: Path,
+    run_record: RunRecord,
+    preflight_result: PreflightResult,
+    progress: LifecycleProgress,
+    error: RunOwnershipError,
+) -> LifecycleResult:
+    message = (
+        "Run directory ownership was lost. Lifecycle persistence and reporting "
+        f"were stopped without writing through the untrusted path: {error}"
+    )
+    return LifecycleResult(
+        run_dir=run_dir,
+        run_record=run_record,
+        preflight_result=preflight_result,
+        implementation_result=progress.implementation_result,
+        verification_results=tuple(progress.verification_results),
+        review_results=tuple(progress.review_results),
+        correction_results=tuple(progress.correction_results),
+        report_result=None,
+        safety_violations=(
+            LifecycleSafetyViolation(
+                name="run-directory-ownership",
+                expected="the selected direct, non-linked child of the runs root",
+                actual=str(error),
+                message=message,
+            ),
+        ),
+        controller_error=message,
     )
 
 

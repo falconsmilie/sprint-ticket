@@ -64,6 +64,7 @@ FLAT_APPLICATION_MODULES = frozenset(
         f"{PACKAGE}.preflight",
         f"{PACKAGE}.resolved_config",
         f"{PACKAGE}.review",
+        f"{PACKAGE}.run_ownership",
         f"{PACKAGE}.runs",
         f"{PACKAGE}.task_result_codecs",
         f"{PACKAGE}.verification",

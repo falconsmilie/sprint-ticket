@@ -35,6 +35,7 @@ from ticket_automation.models import (
     StopCategory,
     WorkflowState,
 )
+from ticket_automation.run_ownership import RunOwnership
 from ticket_automation.runs import RUN_RECORD_FILE, load_run_record, save_run_record
 from ticket_automation.workflow import LifecycleController
 
@@ -131,6 +132,51 @@ def test_controller_loop_dispatches_stubs_updates_lock_and_persists_transitions(
     assert result.run_record.state is WorkflowState.HUMAN_REQUIRED
     assert load_run_record(snapshot.run_dir / "run.json") == result.run_record
     assert lock.states[-1] == WorkflowState.HUMAN_REQUIRED.value
+
+
+def test_direct_controller_construction_acquires_mandatory_run_ownership(tmp_path):
+    workspace = build_lifecycle_workspace(tmp_path)
+    snapshot = create_test_run_snapshot(
+        workspace.config,
+        workspace.ticket,
+        runs_dir=workspace.runs_dir,
+        clock=TickingClock(),
+    )
+    seen: list[RunOwnership] = []
+    result_value = StubResult(
+        WorkflowState.PREPARING,
+        StageOutcome.HUMAN_REQUIRED,
+        controller_message="stop after ownership check",
+        after_workspace_fingerprint=None,
+    )
+    decision = decision_for_stage_result(
+        snapshot.run_record,
+        result_value,
+        stop_category=StopCategory.BASELINE_FAILURE,
+    )
+
+    @dataclass
+    class OwnershipCheckingHandler:
+        def handle(self, context: StageContext) -> StageDecision:
+            seen.append(context.run_ownership)
+            context.run_ownership.validate_run_path(context.run_dir)
+            return decision
+
+    result = LifecycleController(
+        handlers={WorkflowState.PREPARING: OwnershipCheckingHandler()},
+        progress=LifecycleProgress(),
+        repository_lock=RecordingLock(),
+        report_publisher=make_report_publisher(),
+        clock=TickingClock(),
+    ).drive(
+        snapshot.run_dir,
+        snapshot.preflight_result,
+        snapshot.run_record,
+    )
+
+    assert result.run_record.state is WorkflowState.HUMAN_REQUIRED
+    assert len(seen) == 1
+    assert isinstance(seen[0], RunOwnership)
 
 
 @dataclass
@@ -383,8 +429,8 @@ def test_handler_exception_uses_conservative_controller_failure_outcome(tmp_path
 class RaisingPublisher:
     calls: int = 0
 
-    def publish(self, run_dir, run_record):
-        del run_dir, run_record
+    def publish(self, run_dir, run_record, *, run_ownership=None):
+        del run_dir, run_record, run_ownership
         self.calls += 1
         raise OSError("report storage unavailable")
 

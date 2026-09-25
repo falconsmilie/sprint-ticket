@@ -34,6 +34,7 @@ from ..git import GitRepository
 from ..git_safety import WorkspaceChange, WorkspaceSnapshot, workspace_safety_changes
 from ..models import AttemptPhase, AttemptStatus
 from ..persistence import timestamp_now
+from ..run_ownership import RunOwnership, RunOwnershipError
 from ..workspace_guard import (
     WorkspaceEnvironmentSnapshot,
     WorkspaceGuardInspection,
@@ -362,6 +363,7 @@ class _AttemptTracker:
     record: AttemptRecord | None
     before_snapshot: WorkspaceSnapshot | None
     before_error: str | None
+    run_ownership: RunOwnership | None = None
     process_started: bool = False
     evidence_errors: list[str] = field(default_factory=list)
 
@@ -406,7 +408,13 @@ class _AttemptTracker:
         if self.record is None:
             return
         try:
-            self.record = update_attempt(self.record, **changes)
+            self.record = update_attempt(
+                self.record,
+                run_ownership=self.run_ownership,
+                **changes,
+            )
+        except RunOwnershipError:
+            raise
         except BaseException as error:
             self.evidence_errors.append(
                 f"attempt-ledger: {type(error).__name__}: {error}"
@@ -423,14 +431,19 @@ class GuardedWritableOperation:
         executor: AgentExecutor,
         *,
         clock: Callable[[], datetime] | None = None,
+        run_ownership: RunOwnership | None = None,
     ) -> None:
         self._executor = executor
         self._clock = clock
+        if run_ownership is not None and not isinstance(run_ownership, RunOwnership):
+            raise TypeError("run_ownership must be a RunOwnership or None.")
+        self._run_ownership = run_ownership
 
     def execute(
         self,
         request: GuardedWritableRequest[ResultT],
     ) -> GuardedWritableOutcome[ResultT]:
+        self._validate_run_artifacts(request.execution_request.artifact_directory)
         repository = GitRepository(request.baseline.repository_path)
         tracker, environment_before = self._capture_before(
             repository,
@@ -498,6 +511,7 @@ class GuardedWritableOperation:
                 tracker.record_started(
                     execution.invocation_start is InvocationStart.STARTED
                 )
+            self._validate_run_artifacts(request.execution_request.artifact_directory)
             contract_problem = _execution_contract_problem(
                 execution, request.execution_request
             )
@@ -510,9 +524,12 @@ class GuardedWritableOperation:
                 evidence_from_execution(request.execution_request, execution),
             )
             tracker._update(execution_path=EXECUTION_EVIDENCE_FILE)
+        except RunOwnershipError:
+            raise
         except BaseException as error:  # noqa: BLE001 - interruption must fail closed.
             execution_error = error
         finally:
+            self._validate_run_artifacts(request.execution_request.artifact_directory)
             after_workspace, after_error = self._capture_workspace(repository)
             environment_after = self._capture_environment(repository)
             environment_after = _with_workspace_inspection_errors(
@@ -633,6 +650,7 @@ class GuardedWritableOperation:
     ) -> WritableRejectedBeforeStart[TaskResult] | WritableSafetyStopped[TaskResult]:
         """Persist safety evidence for a stage-owned pre-invocation rejection."""
 
+        self._validate_run_artifacts(request.artifact_directory)
         repository = GitRepository(request.baseline.repository_path)
         tracker, environment_before = self._capture_before(
             repository,
@@ -672,7 +690,12 @@ class GuardedWritableOperation:
         phase: AttemptPhase,
         artifact_directory: Path,
     ) -> tuple[_AttemptTracker, WorkspaceEnvironmentSnapshot]:
-        record, association_error = _associated_attempt(artifact_directory, phase)
+        self._validate_run_artifacts(artifact_directory)
+        record, association_error = _associated_attempt(
+            artifact_directory,
+            phase,
+            run_ownership=self._run_ownership,
+        )
         environment = self._capture_environment(repository)
         snapshot, error = self._capture_workspace(repository)
         environment = _with_workspace_inspection_errors(
@@ -684,7 +707,13 @@ class GuardedWritableOperation:
         metadata = AttemptMetadata() if record is None else record.metadata
         if error is not None and record is not None:
             metadata = replace(metadata, before_workspace_error=error)
-        tracker = _AttemptTracker(artifact_directory, record, snapshot, error)
+        tracker = _AttemptTracker(
+            artifact_directory,
+            record,
+            snapshot,
+            error,
+            self._run_ownership,
+        )
         if association_error is not None:
             tracker.evidence_errors.append(association_error)
         tracker._update(
@@ -706,6 +735,7 @@ class GuardedWritableOperation:
         failure_message: str,
         starting_violations: tuple[WritableSafetyViolation, ...],
     ) -> WritableAudit[TaskResult]:
+        self._validate_run_artifacts(tracker.artifact_directory)
         after_workspace, after_error = self._capture_workspace(repository)
         environment_after = self._capture_environment(repository)
         environment_after = _with_workspace_inspection_errors(
@@ -795,6 +825,7 @@ class GuardedWritableOperation:
         after: WorkspaceEnvironmentSnapshot,
         phase: AttemptPhase,
     ) -> WorkspaceGuardInspection:
+        self._validate_run_artifacts(tracker.artifact_directory)
         try:
             inspection = self._compare_environment(
                 before=before,
@@ -817,14 +848,15 @@ class GuardedWritableOperation:
             )
         return self._persist_guard_evidence(tracker, inspection)
 
-    @staticmethod
     def _persist_guard_evidence(
+        self,
         tracker: _AttemptTracker,
         inspection: WorkspaceGuardInspection,
     ) -> WorkspaceGuardInspection:
         if tracker.record is None:
             return _with_guard_evidence_errors(inspection, tracker.evidence_errors)
         path = tracker.artifact_directory / WORKSPACE_GUARD_FILE
+        self._validate_run_artifacts(path.parent)
         persisted = replace(inspection, artifact_path=path)
         persisted = _with_guard_evidence_errors(persisted, tracker.evidence_errors)
         try:
@@ -835,6 +867,11 @@ class GuardedWritableOperation:
             )
             return _with_guard_evidence_errors(inspection, tracker.evidence_errors)
         return persisted
+
+    def _validate_run_artifacts(self, artifact_directory: Path) -> None:
+        if self._run_ownership is None:
+            return
+        self._run_ownership.validate_descendant(artifact_directory)
 
     def _executor_capability_problem(
         self, request: AgentExecutionRequest[TaskResult]
@@ -953,15 +990,22 @@ def _validate_common_request(
 def _associated_attempt(
     artifact_directory: Path,
     phase: AttemptPhase,
+    *,
+    run_ownership: RunOwnership | None = None,
 ) -> tuple[AttemptRecord | None, str | None]:
     run_dir = artifact_directory.parent.parent
     expected = artifact_directory.resolve()
     try:
         matches = tuple(
             record
-            for record in load_attempt_records(run_dir)
+            for record in load_attempt_records(
+                run_dir,
+                run_ownership=run_ownership,
+            )
             if record.artifact_directory.resolve() == expected
         )
+    except RunOwnershipError:
+        raise
     except BaseException as error:  # noqa: BLE001 - association evidence fails closed.
         return None, f"attempt-association: {type(error).__name__}: {error}"
     if len(matches) != 1:

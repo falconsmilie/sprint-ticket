@@ -11,6 +11,7 @@ from typing import Protocol, TypeVar
 from ...attempts import StageAttempt
 from ...failure_classification import TerminalStop, classify_stage_stop
 from ...models import StageOutcome, StopCategory, WorkflowState
+from ...run_ownership import RunOwnership
 from ...runs import RunError, RunRecord
 
 
@@ -21,6 +22,12 @@ class StageContext:
     attempt: StageAttempt | None
     clock: Callable[[], datetime] | None
     mark_process_started: Callable[[], None]
+    run_ownership: RunOwnership
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.run_ownership, RunOwnership):
+            raise TypeError("StageContext requires a RunOwnership token.")
+        self.run_ownership.validate_run_path(self.run_dir)
 
     def require_attempt(self) -> StageAttempt:
         if self.attempt is None:

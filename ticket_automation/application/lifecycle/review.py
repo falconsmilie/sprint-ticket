@@ -28,6 +28,7 @@ class ReviewStageHandler:
             attempt_record=context.require_attempt(),
             mark_process_started=context.mark_process_started,
             clock=context.clock,
+            run_ownership=context.run_ownership,
         )
         return decision_for_stage_result(
             context.run_record,

@@ -12,9 +12,11 @@ import ticket_automation.persistence as persistence_module
 import ticket_automation.runs as runs_module
 from tests.helpers import (
     GIT,
+    create_directory_link,
     create_git_repo,
     create_test_run_snapshot,
     make_config,
+    remove_directory_link,
     run_git,
 )
 from ticket_automation.config import ConfigError, VerificationCommand
@@ -31,14 +33,50 @@ from ticket_automation.runs import (
     TicketInputError,
     list_run_records,
     load_baseline_record,
+    load_owned_run_record,
     load_run_record,
+    resolve_run_directory,
     sanitize_ticket_id,
     save_run_record,
 )
+from ticket_automation.workflow import resume_ticket_lifecycle
 
 
 def fixed_clock() -> datetime:
     return datetime(2026, 9, 11, 13, 5, 12, tzinfo=UTC)
+
+
+@pytest.mark.parametrize("run_id", ["../external", "..\\external", "C:\\external"])
+def test_run_directory_resolution_rejects_non_component_run_ids(
+    tmp_path: Path,
+    run_id: str,
+) -> None:
+    runs_dir = tmp_path / "runs"
+    runs_dir.mkdir()
+
+    with pytest.raises(RunError, match="Run ID"):
+        resolve_run_directory(runs_dir, run_id)
+
+
+def test_run_directory_resolution_and_listing_reject_a_linked_run(
+    tmp_path: Path,
+) -> None:
+    runs_dir = tmp_path / "runs"
+    external = tmp_path / "external-run"
+    runs_dir.mkdir()
+    external.mkdir()
+    external.joinpath("run.json").write_text("{}", encoding="utf-8")
+    linked = runs_dir / "linked-run"
+    link_kind = create_directory_link(linked, external)
+    if link_kind is None:
+        pytest.skip("directory links are unavailable on this platform")
+    try:
+        with pytest.raises(RunError, match="direct, non-linked child"):
+            resolve_run_directory(runs_dir, linked.name)
+        with pytest.raises(RunError, match="direct, non-linked child"):
+            list_run_records(runs_dir)
+    finally:
+        remove_directory_link(linked)
 
 
 _ACTIVE_STATES = (
@@ -90,6 +128,107 @@ def test_valid_run_directory_creation(tmp_path):
     assert result.run_record.state == WorkflowState.PREPARING
     assert "last_completed_state" not in json.loads(
         result.run_dir.joinpath("run.json").read_text(encoding="utf-8")
+    )
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
+def test_owned_run_loading_rejects_a_record_with_another_run_id(tmp_path: Path) -> None:
+    repo = create_git_repo(tmp_path / "repo")
+    ticket = tmp_path / "TA-REV-001.md"
+    ticket.write_text("# Ticket\n", encoding="utf-8")
+    runs_dir = tmp_path / "runs"
+    result = create_test_run_snapshot(
+        make_config(repo),
+        ticket,
+        runs_dir=runs_dir,
+        clock=fixed_clock,
+    )
+    save_run_record(
+        replace(result.run_record, run_id="different-run"),
+        result.run_dir / "run.json",
+    )
+
+    with pytest.raises(RunError, match="identity does not match"):
+        load_owned_run_record(runs_dir, result.run_dir.name)
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
+def test_owned_run_loading_accepts_the_canonical_ticket_copy(tmp_path: Path) -> None:
+    repo = create_git_repo(tmp_path / "repo")
+    ticket = tmp_path / "TA-REV-002.md"
+    ticket.write_text("# Ticket\n", encoding="utf-8")
+    runs_dir = tmp_path / "runs"
+    result = create_test_run_snapshot(
+        make_config(repo),
+        ticket,
+        runs_dir=runs_dir,
+        clock=fixed_clock,
+    )
+
+    run_dir, record = load_owned_run_record(runs_dir, result.run_dir.name)
+
+    assert run_dir == result.run_dir
+    assert record == result.run_record
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
+@pytest.mark.parametrize("ticket_path_location", ["outside", "different-in-run"])
+def test_resume_rejects_a_ticket_copy_outside_its_owned_location_without_mutation(
+    tmp_path: Path,
+    ticket_path_location: str,
+) -> None:
+    repo = create_git_repo(tmp_path / "repo")
+    ticket = tmp_path / "TA-REV-002.md"
+    ticket.write_text("# Ticket\n", encoding="utf-8")
+    runs_dir = tmp_path / "runs"
+    result = create_test_run_snapshot(
+        make_config(repo),
+        ticket,
+        runs_dir=runs_dir,
+        clock=fixed_clock,
+    )
+    external_artifact = tmp_path / "external-artifact.txt"
+    external_artifact.write_text("external evidence\n", encoding="utf-8")
+    wrong_ticket = (
+        external_artifact
+        if ticket_path_location == "outside"
+        else result.run_dir / "other-ticket.md"
+    )
+    if wrong_ticket != external_artifact:
+        wrong_ticket.write_text("other ticket\n", encoding="utf-8")
+    save_run_record(
+        replace(
+            result.run_record,
+            run_ticket_copy_path=str(wrong_ticket.resolve()),
+        ),
+        result.run_dir / "run.json",
+    )
+    before_files = {
+        path.relative_to(result.run_dir).as_posix(): path.read_bytes()
+        for path in result.run_dir.rglob("*")
+        if path.is_file()
+    }
+
+    with pytest.raises(RunError, match="ticket path does not match"):
+        resume_ticket_lifecycle(
+            result.run_record.run_id,
+            runs_dir=runs_dir,
+            agent_executor_factory=object(),
+            final_patch_capture=object(),
+            report_publisher=object(),
+            clock=fixed_clock,
+        )
+
+    after_files = {
+        path.relative_to(result.run_dir).as_posix(): path.read_bytes()
+        for path in result.run_dir.rglob("*")
+        if path.is_file()
+    }
+    assert after_files == before_files
+    assert external_artifact.read_text(encoding="utf-8") == "external evidence\n"
+    assert not (result.run_dir / "attempts").exists()
+    assert load_run_record(result.run_dir / "run.json").state is (
+        WorkflowState.PREPARING
     )
 
 

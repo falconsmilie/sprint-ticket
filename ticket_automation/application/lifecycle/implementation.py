@@ -32,6 +32,7 @@ class ImplementationStageHandler:
             agent_executor=self.agent_executor,
             attempt_record=context.require_attempt(),
             clock=context.clock,
+            run_ownership=context.run_ownership,
         )
         return decision_for_stage_result(
             context.run_record,

@@ -31,6 +31,11 @@ from .resolved_config import (
     ResolvedRunPolicy,
     ResolvedRunPolicyError,
 )
+from .run_ownership import (
+    RunOwnership,
+    RunOwnershipError,
+    validate_run_id,
+)
 from .verification_evidence import verification_commands_fingerprint
 
 RUN_SCHEMA_VERSION = 5
@@ -230,6 +235,7 @@ class RunRecord:
     def __post_init__(self) -> None:
         """Keep terminal stop evidence inseparable from terminal failure state."""
 
+        validate_run_id(self.run_id)
         if (
             not isinstance(self.schema_version, int)
             or isinstance(self.schema_version, bool)
@@ -476,8 +482,55 @@ def load_run_record(path: Path | str) -> RunRecord:
     return RunRecord.from_dict(data)
 
 
+def load_owned_run_record(
+    runs_dir: Path | str,
+    run_id: str,
+) -> tuple[Path, RunRecord]:
+    """Load one run only when its physical directory and identity are owned."""
+
+    try:
+        ownership = RunOwnership.acquire(runs_dir, run_id)
+    except (RunOwnershipError, ValueError) as error:
+        raise RunError(str(error)) from error
+    run_dir = ownership.run_dir
+    record = load_run_record_for_owner(ownership)
+    return run_dir, record
+
+
+def load_run_record_for_owner(ownership: RunOwnership) -> RunRecord:
+    """Load a run record after revalidating its stable physical owner."""
+
+    if not isinstance(ownership, RunOwnership):
+        raise TypeError("ownership must be a RunOwnership.")
+    run_dir = ownership.validate()
+    record = load_run_record(run_dir / RUN_RECORD_FILE)
+    if record.run_id != ownership.run_id:
+        raise RunError(
+            "Run record identity does not match its owning directory: "
+            f"expected {ownership.run_id!r}, found {record.run_id!r}."
+        )
+    expected_ticket = run_dir / RUN_TICKET_FILE
+    ticket_copy = Path(record.run_ticket_copy_path)
+    if not ticket_copy.is_absolute() or ticket_copy != expected_ticket:
+        raise RunError(
+            "Run record ticket path does not match its owning run directory."
+        )
+    return record
+
+
 def save_run_record(record: RunRecord, path: Path | str) -> None:
     atomic_write_json(Path(path), record.to_dict())
+
+
+def save_owned_run_record(ownership: RunOwnership, record: RunRecord) -> None:
+    """Persist a record only while its configured run owner remains authoritative."""
+
+    if not isinstance(ownership, RunOwnership):
+        raise TypeError("ownership must be a RunOwnership.")
+    if record.run_id != ownership.run_id:
+        raise RunError("Run record identity does not match its persistence owner.")
+    run_dir = ownership.validate()
+    atomic_write_json(run_dir / RUN_RECORD_FILE, record.to_dict())
 
 
 def load_baseline_record(path: Path | str) -> BaselineRecord:
@@ -490,15 +543,32 @@ def save_baseline_record(record: BaselineRecord, path: Path | str) -> None:
 
 
 def list_run_records(runs_dir: Path | str) -> tuple[RunRecord, ...]:
-    root = Path(runs_dir)
+    requested_root = Path(runs_dir)
+    if not requested_root.exists():
+        return ()
+    try:
+        root = requested_root.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise RunError(
+            f"Could not inspect the runs directory safely: {error}"
+        ) from error
     if not root.is_dir():
         return ()
 
     records: list[RunRecord] = []
-    for run_dir in sorted(root.iterdir()):
-        run_record_path = run_dir / RUN_RECORD_FILE
-        if run_dir.is_dir() and run_record_path.is_file():
-            records.append(load_run_record(run_record_path))
+    try:
+        entries = sorted(root.iterdir())
+    except OSError as error:
+        raise RunError(
+            f"Could not inspect the runs directory safely: {error}"
+        ) from error
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        if not (entry / RUN_RECORD_FILE).is_file():
+            continue
+        _, record = load_owned_run_record(root, entry.name)
+        records.append(record)
     return tuple(
         sorted(
             records,
@@ -577,6 +647,15 @@ def _reserve_run_directory(
             continue
         return run_id, run_dir
     raise RunError(f"Could not reserve a unique run directory for {base_run_id}.")
+
+
+def resolve_run_directory(runs_dir: Path | str, run_id: str) -> Path:
+    """Resolve one direct, non-linked child of the configured runs root."""
+
+    try:
+        return RunOwnership.acquire(runs_dir, run_id).run_dir
+    except (RunOwnershipError, ValueError) as error:
+        raise RunError(str(error)) from error
 
 
 def _capture_baseline(
@@ -782,6 +861,8 @@ __all__ = [
     "BaselineRecord",
     "RunCreationResult",
     "RunError",
+    "RunOwnership",
+    "RunOwnershipError",
     "RunPreflightError",
     "RunRecord",
     "TicketInputError",
@@ -789,8 +870,12 @@ __all__ = [
     "format_status",
     "list_run_records",
     "load_baseline_record",
+    "load_owned_run_record",
     "load_run_record",
+    "load_run_record_for_owner",
+    "resolve_run_directory",
     "sanitize_ticket_id",
     "save_baseline_record",
+    "save_owned_run_record",
     "save_run_record",
 ]

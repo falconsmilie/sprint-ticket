@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from ...run_ownership import RunOwnership
+
 FINAL_PATCH_FILE = "final.patch"
 _GIT_OBJECT_RE = re.compile(r"[0-9a-fA-F]{40,64}")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -17,6 +19,7 @@ class FinalPatchCaptureRequest:
     repository_path: Path
     baseline_sha: str
     destination: Path
+    run_ownership: RunOwnership | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.repository_path, Path):
@@ -27,6 +30,10 @@ class FinalPatchCaptureRequest:
             raise ValueError("baseline_sha must be a Git object ID.")
         if not isinstance(self.destination, Path):
             raise TypeError("destination must be a Path.")
+        if self.run_ownership is not None and not isinstance(
+            self.run_ownership, RunOwnership
+        ):
+            raise TypeError("run_ownership must be a RunOwnership or None.")
 
 
 @dataclass(frozen=True)

@@ -41,6 +41,7 @@ class PreparationStageHandler:
                 process_runner=self.process_runner,
                 attempt_record=attempt,
                 clock=context.clock,
+                run_ownership=context.run_ownership,
             )
         except (OSError, RunError) as error:
             message = (

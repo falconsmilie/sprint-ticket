@@ -8,7 +8,7 @@ import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TypeAlias
+from typing import TextIO, TypeAlias
 
 JsonScalar: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
@@ -27,7 +27,31 @@ class CodecError(ValueError):
 def atomic_write_json(path: Path | str, value: JsonMapping) -> None:
     """Write one JSON object using the repository-wide durability policy."""
 
-    destination = Path(path)
+    def write_payload(output: TextIO) -> None:
+        json.dump(value, output, indent=2, sort_keys=True, ensure_ascii=False)
+        output.write("\n")
+
+    _atomic_write_text_payload(Path(path), write_payload, description="JSON")
+
+
+def atomic_write_text(path: Path | str, value: str) -> None:
+    """Atomically replace one UTF-8 text artifact without following file links."""
+
+    if not isinstance(value, str):
+        raise TypeError("text artifact value must be a string.")
+
+    def write_payload(output: TextIO) -> None:
+        output.write(value)
+
+    _atomic_write_text_payload(Path(path), write_payload, description="text")
+
+
+def _atomic_write_text_payload(
+    destination: Path,
+    write_payload: Callable[[TextIO], None],
+    *,
+    description: str,
+) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
     descriptor = -1
@@ -41,8 +65,7 @@ def atomic_write_json(path: Path | str, value: JsonMapping) -> None:
         temporary = Path(temporary_name)
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as output:
             descriptor = -1
-            json.dump(value, output, indent=2, sort_keys=True, ensure_ascii=False)
-            output.write("\n")
+            write_payload(output)
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary, destination)
@@ -57,7 +80,7 @@ def atomic_write_json(path: Path | str, value: JsonMapping) -> None:
         if isinstance(error, PersistenceError):
             raise
         raise PersistenceError(
-            f"Could not atomically write JSON {destination}: {error}"
+            f"Could not atomically write {description} {destination}: {error}"
         ) from error
 
 
@@ -139,6 +162,7 @@ __all__ = [
     "JsonValue",
     "PersistenceError",
     "atomic_write_json",
+    "atomic_write_text",
     "format_timestamp",
     "parse_timestamp",
     "read_json",

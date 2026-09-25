@@ -52,6 +52,7 @@ from .persistence_codecs import (
     write_stage_message,
 )
 from .resolved_config import config_from_resolved_run_policy
+from .run_ownership import RunOwnership
 from .runs import (
     BASELINE_RECORD_FILE,
     RUN_RECORD_FILE,
@@ -60,6 +61,7 @@ from .runs import (
     RunRecord,
     load_baseline_record,
     load_run_record,
+    load_run_record_for_owner,
 )
 from .verification_evidence import baseline_verification_evidence_problem
 from .workspace_guard import WorkspaceGuardInspection
@@ -113,8 +115,11 @@ def run_implementation_stage(
     agent_executor: AgentExecutor,
     attempt_record: StageAttempt | None = None,
     clock: Callable[[], datetime] | None = None,
+    run_ownership: RunOwnership | None = None,
 ) -> ImplementationStageResult:
     run_path = Path(run_dir)
+    if run_ownership is not None:
+        run_path = run_ownership.validate_run_path(run_path)
     if attempt_record is not None:
         return _run_implementation_stage(
             config,
@@ -122,8 +127,13 @@ def run_implementation_stage(
             agent_executor=agent_executor,
             attempt_record=attempt_record,
             clock=clock,
+            run_ownership=run_ownership,
         )
-    run_record = load_run_record(run_path / RUN_RECORD_FILE)
+    run_record = (
+        load_run_record(run_path / RUN_RECORD_FILE)
+        if run_ownership is None
+        else load_run_record_for_owner(run_ownership)
+    )
     if run_record.state is not WorkflowState.IMPLEMENTING:
         raise ImplementationError(
             "Implementation requires run state IMPLEMENTING; "
@@ -134,6 +144,7 @@ def run_implementation_stage(
         phase=AttemptPhase.IMPLEMENTING,
         before_workspace_fingerprint=None,
         clock=clock,
+        run_ownership=run_ownership,
     )
     result = _run_implementation_stage(
         config,
@@ -141,6 +152,7 @@ def run_implementation_stage(
         agent_executor=agent_executor,
         attempt_record=StageAttempt.from_record(owned_attempt),
         clock=clock,
+        run_ownership=run_ownership,
     )
     complete_stage_attempt(
         run_path,
@@ -150,6 +162,7 @@ def run_implementation_stage(
         process_started=result.process_started,
         metadata=AttemptMetadata(controller_message=result.controller_message),
         clock=clock,
+        run_ownership=run_ownership,
     )
     return result
 
@@ -161,9 +174,16 @@ def _run_implementation_stage(
     agent_executor: AgentExecutor,
     attempt_record: StageAttempt,
     clock: Callable[[], datetime] | None = None,
+    run_ownership: RunOwnership | None = None,
 ) -> ImplementationStageResult:
     run_path = Path(run_dir)
-    run_record = load_run_record(run_path / RUN_RECORD_FILE)
+    if run_ownership is not None:
+        run_path = run_ownership.validate_run_path(run_path)
+    run_record = (
+        load_run_record(run_path / RUN_RECORD_FILE)
+        if run_ownership is None
+        else load_run_record_for_owner(run_ownership)
+    )
     # Existing runs execute exclusively from the policy captured in run.json.
     config = config_from_resolved_run_policy(run_record.resolved_policy)
     if run_record.state != WorkflowState.IMPLEMENTING:
@@ -175,6 +195,7 @@ def _run_implementation_stage(
         run_path,
         attempt_record,
         phase=AttemptPhase.IMPLEMENTING,
+        run_ownership=run_ownership,
     )
 
     baseline_record = load_baseline_record(run_path / BASELINE_RECORD_FILE)
@@ -194,7 +215,11 @@ def _run_implementation_stage(
         expected_workspace_fingerprint=baseline_record.workspace_fingerprint,
         require_clean_worktree=True,
     )
-    writable_operation = GuardedWritableOperation(agent_executor, clock=clock)
+    writable_operation = GuardedWritableOperation(
+        agent_executor,
+        clock=clock,
+        run_ownership=run_ownership,
+    )
     evidence_problem = baseline_verification_evidence_problem(
         run_path,
         run_record,
@@ -232,6 +257,7 @@ def _run_implementation_stage(
             controller_message=evidence_problem,
             after_workspace_fingerprint=audit.after_workspace_fingerprint,
             process_started=False,
+            run_ownership=run_ownership,
         )
 
     active_record = run_record
@@ -242,7 +268,11 @@ def _run_implementation_stage(
         prompt=prompt,
         result_contract=IMPLEMENTATION_RESULT_CONTRACT,
         artifact_directory=implementation_dir,
-        artifact_layout=AttemptArtifactLayout.for_attempt(run_path, implementation_dir),
+        artifact_layout=AttemptArtifactLayout.for_attempt(
+            run_path,
+            implementation_dir,
+            run_ownership=run_ownership,
+        ),
         policy=run_record.resolved_policy.task_policy(
             AgentTaskKind.IMPLEMENTATION
         ).execution_policy,
@@ -290,6 +320,7 @@ def _run_implementation_stage(
             controller_message=message,
             after_workspace_fingerprint=audit.after_workspace_fingerprint,
             process_started=audit.invocation_start is InvocationStart.STARTED,
+            run_ownership=run_ownership,
         )
 
     if isinstance(
@@ -328,6 +359,7 @@ def _run_implementation_stage(
             controller_message=message,
             after_workspace_fingerprint=audit.after_workspace_fingerprint,
             process_started=audit.invocation_start is InvocationStart.STARTED,
+            run_ownership=run_ownership,
         )
 
     if not isinstance(writable_outcome, WritableSucceeded):
@@ -350,6 +382,7 @@ def _run_implementation_stage(
             controller_message="Implementation agent returned BLOCKED.",
             after_workspace_fingerprint=audit.after_workspace_fingerprint,
             process_started=True,
+            run_ownership=run_ownership,
         )
 
     if not changed_files:
@@ -366,6 +399,7 @@ def _run_implementation_stage(
             controller_message="Implementation completed without repository changes.",
             after_workspace_fingerprint=audit.after_workspace_fingerprint,
             process_started=True,
+            run_ownership=run_ownership,
         )
 
     return _finish(
@@ -381,6 +415,7 @@ def _run_implementation_stage(
         controller_message="Implementation completed and Git safety checks passed.",
         after_workspace_fingerprint=audit.after_workspace_fingerprint,
         process_started=True,
+        run_ownership=run_ownership,
     )
 
 
@@ -407,7 +442,11 @@ def _finish(
     controller_message: str,
     after_workspace_fingerprint: str | None = None,
     process_started: bool | None = None,
+    run_ownership: RunOwnership | None = None,
 ) -> ImplementationStageResult:
+    if run_ownership is not None:
+        run_ownership.validate_run_path(run_dir)
+        run_ownership.validate_descendant(artifact_directory)
     _write_agent_result(
         artifact_directory,
         agent_result,

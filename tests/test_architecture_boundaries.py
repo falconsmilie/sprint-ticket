@@ -112,6 +112,7 @@ _AUTHORITATIVE_FLAT_CORE_MODULES = (
     "ticket_automation.models",
     "ticket_automation.resolved_config",
     "ticket_automation.execution_evidence",
+    "ticket_automation.run_ownership",
     "ticket_automation.runs",
     "ticket_automation.attempts",
     "ticket_automation.failure_classification",
@@ -148,6 +149,30 @@ def test_authoritative_flat_core_modules_reject_outward_imports(
         f"from ticket_automation.{outward_layer} import injected\n",
         module,
     )
+
+
+@pytest.mark.parametrize(
+    ("source", "rule"),
+    [
+        (
+            "from ticket_automation.providers import codex_cli\n",
+            "application_concrete_adapter_import",
+        ),
+        (
+            "from ticket_automation.presentation import reporting\n",
+            "inward_presentation_import",
+        ),
+        (
+            "from ticket_automation.composition import root\n",
+            "inward_presentation_import",
+        ),
+    ],
+)
+def test_run_ownership_rejects_outward_application_dependencies(
+    source: str,
+    rule: str,
+):
+    assert rule in _rules(source, "ticket_automation.run_ownership")
 
 
 @pytest.mark.parametrize(

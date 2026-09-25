@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from tests.helpers import GIT, create_git_repo, run_git
 from ticket_automation.application.handoff_acceptance import (
     HandoffAccepted,
     HandoffAttemptEvidence,
@@ -15,9 +17,13 @@ from ticket_automation.application.handoff_acceptance import (
     VerificationHandoffEvidence,
     evaluate_handoff_policy,
 )
-from ticket_automation.application.ports.handoff import FinalPatchReference
+from ticket_automation.application.ports.handoff import (
+    FinalPatchCaptureRequest,
+    FinalPatchReference,
+)
 from ticket_automation.domain.task_results import ReviewVerdict
 from ticket_automation.git_safety import WorkspaceSnapshot
+from ticket_automation.infrastructure.final_patch import FileSystemFinalPatchCapture
 from ticket_automation.models import (
     AttemptPhase,
     AttemptStatus,
@@ -631,3 +637,30 @@ def test_handoff_inputs_reject_untrusted_construction(construct):
 def test_patch_references_reject_invalid_evidence(reference):
     with pytest.raises(ValueError):
         reference()
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required")
+def test_final_patch_capture_replaces_a_hardlink_without_mutating_its_target(
+    tmp_path: Path,
+) -> None:
+    repository = create_git_repo(tmp_path / "repository")
+    baseline_sha = run_git(repository, "rev-parse", "HEAD")
+    repository.joinpath("file.txt").write_text("changed\n", encoding="utf-8")
+    external = tmp_path / "external.patch"
+    external.write_text("external evidence", encoding="utf-8")
+    destination = tmp_path / "run" / "final.patch"
+    destination.parent.mkdir()
+    os.link(external, destination)
+
+    reference = FileSystemFinalPatchCapture().capture(
+        FinalPatchCaptureRequest(
+            repository_path=repository,
+            baseline_sha=baseline_sha,
+            destination=destination,
+        )
+    )
+
+    assert external.read_text(encoding="utf-8") == "external evidence"
+    assert destination.read_text(encoding="utf-8").startswith("diff --git")
+    assert not os.path.samefile(external, destination)
+    assert reference.path == destination

@@ -44,6 +44,7 @@ class ReportingStageHandler:
                 run_dir=context.run_dir,
                 run_record=context.run_record,
                 attempt=attempt,
+                run_ownership=context.run_ownership,
             )
         )
         if isinstance(handoff, HandoffAccepted):

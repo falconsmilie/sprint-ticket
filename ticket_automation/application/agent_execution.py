@@ -15,6 +15,7 @@ from typing import Generic, Protocol, TypeAlias, TypeVar
 
 from ..domain.task_results import ImplementationResult, ReviewResult, TaskResult
 from ..models import ATTEMPT_RESULT_ARTIFACT_NAME, ATTEMPTS_DIR_NAME
+from ..run_ownership import RunOwnership
 
 
 class AgentContractError(ValueError):
@@ -158,6 +159,7 @@ class AttemptArtifactLayout:
 
     run_root: Path
     attempt_root: Path
+    run_ownership: RunOwnership | None = None
 
     @classmethod
     def attempts_root(cls, run_root: Path) -> Path:
@@ -179,12 +181,18 @@ class AttemptArtifactLayout:
         return attempts_root
 
     @classmethod
-    def for_attempt(cls, run_root: Path, attempt_root: Path) -> AttemptArtifactLayout:
+    def for_attempt(
+        cls,
+        run_root: Path,
+        attempt_root: Path,
+        *,
+        run_ownership: RunOwnership | None = None,
+    ) -> AttemptArtifactLayout:
         """Build the canonical layout for a direct child of ``run/attempts``."""
 
         resolved_run = _resolve_artifact_path(run_root, description="run root")
         attempts_root = cls.attempts_root(resolved_run)
-        layout = cls(resolved_run, attempt_root)
+        layout = cls(resolved_run, attempt_root, run_ownership)
         try:
             attempt_relative = layout.attempt_root.relative_to(attempts_root)
         except ValueError as error:
@@ -202,6 +210,13 @@ class AttemptArtifactLayout:
             self.attempt_root, Path
         ):
             raise AgentContractError("artifact layout roots must be Path values.")
+        if self.run_ownership is not None and not isinstance(
+            self.run_ownership, RunOwnership
+        ):
+            raise AgentContractError("run_ownership must be a RunOwnership or None.")
+        if self.run_ownership is not None:
+            self.run_ownership.validate_run_path(self.run_root)
+            self.run_ownership.validate_descendant(self.attempt_root)
         run_root = _resolve_artifact_path(self.run_root, description="run root")
         attempt_root = _resolve_artifact_path(
             self.attempt_root,
@@ -219,6 +234,19 @@ class AttemptArtifactLayout:
             )
         object.__setattr__(self, "run_root", run_root)
         object.__setattr__(self, "attempt_root", attempt_root)
+
+    def revalidate(self) -> None:
+        """Revalidate controller-owned roots after an external or long-running call."""
+
+        if self.run_ownership is None:
+            _resolve_artifact_path(self.run_root, description="run root")
+            _resolve_artifact_path(
+                self.attempt_root,
+                description="attempt artifact root",
+            )
+            return
+        self.run_ownership.validate_run_path(self.run_root)
+        self.run_ownership.validate_descendant(self.attempt_root)
 
     @property
     def attempt_id(self) -> str:
@@ -251,6 +279,7 @@ class AttemptArtifactLayout:
         return self.path_is_file(path, description="attempt artifact")
 
     def path(self, relative_path: str | PurePosixPath) -> Path:
+        self.revalidate()
         relative = _validated_artifact_path(relative_path)
         candidate = _resolve_artifact_path(
             self.attempt_root / Path(*relative.parts),
@@ -286,6 +315,7 @@ class AttemptArtifactLayout:
         *,
         require_exists: bool = False,
     ) -> ArtifactReference:
+        self.revalidate()
         if not isinstance(role, ArtifactRole):
             raise AgentContractError("artifact role must be an ArtifactRole value.")
         resolved = _resolve_artifact_path(path, description="artifact reference")
@@ -306,6 +336,7 @@ class AttemptArtifactLayout:
     def resolve(
         self, reference: ArtifactReference, *, require_exists: bool = False
     ) -> Path:
+        self.revalidate()
         if not isinstance(reference, ArtifactReference):
             raise AgentContractError("reference must be an ArtifactReference.")
         relative = _validated_artifact_path(reference.run_relative_path)

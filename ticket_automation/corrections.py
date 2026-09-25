@@ -62,6 +62,7 @@ from .persistence_codecs import (
     write_stage_message,
 )
 from .resolved_config import config_from_resolved_run_policy
+from .run_ownership import RunOwnership, RunOwnershipError
 from .runs import (
     BASELINE_RECORD_FILE,
     RUN_RECORD_FILE,
@@ -70,6 +71,7 @@ from .runs import (
     RunRecord,
     load_baseline_record,
     load_run_record,
+    load_run_record_for_owner,
 )
 from .verification_evidence import (
     baseline_verification_evidence_problem,
@@ -234,8 +236,11 @@ def run_correction_stage(
     agent_executor: AgentExecutor,
     attempt_record: StageAttempt | None = None,
     clock: Callable[[], datetime] | None = None,
+    run_ownership: RunOwnership | None = None,
 ) -> CorrectionStageResult:
     run_path = Path(run_dir)
+    if run_ownership is not None:
+        run_path = run_ownership.validate_run_path(run_path)
     if attempt_record is not None:
         return _run_correction_stage(
             config,
@@ -244,8 +249,13 @@ def run_correction_stage(
             agent_executor=agent_executor,
             attempt_record=attempt_record,
             clock=clock,
+            run_ownership=run_ownership,
         )
-    run_record = load_run_record(run_path / RUN_RECORD_FILE)
+    run_record = (
+        load_run_record(run_path / RUN_RECORD_FILE)
+        if run_ownership is None
+        else load_run_record_for_owner(run_ownership)
+    )
     if run_record.state is not WorkflowState.CORRECTING:
         raise CorrectionError(
             f"Correction requires run state CORRECTING; found {run_record.state.value}."
@@ -255,6 +265,7 @@ def run_correction_stage(
         phase=AttemptPhase.CORRECTING,
         before_workspace_fingerprint=None,
         clock=clock,
+        run_ownership=run_ownership,
     )
     result = _run_correction_stage(
         config,
@@ -263,6 +274,7 @@ def run_correction_stage(
         agent_executor=agent_executor,
         attempt_record=StageAttempt.from_record(owned_attempt),
         clock=clock,
+        run_ownership=run_ownership,
     )
     complete_stage_attempt(
         run_path,
@@ -272,6 +284,7 @@ def run_correction_stage(
         process_started=result.process_started,
         metadata=AttemptMetadata(controller_message=result.controller_message),
         clock=clock,
+        run_ownership=run_ownership,
     )
     return result
 
@@ -284,9 +297,16 @@ def _run_correction_stage(
     agent_executor: AgentExecutor,
     attempt_record: StageAttempt,
     clock: Callable[[], datetime] | None = None,
+    run_ownership: RunOwnership | None = None,
 ) -> CorrectionStageResult:
     run_path = Path(run_dir)
-    run_record = load_run_record(run_path / RUN_RECORD_FILE)
+    if run_ownership is not None:
+        run_path = run_ownership.validate_run_path(run_path)
+    run_record = (
+        load_run_record(run_path / RUN_RECORD_FILE)
+        if run_ownership is None
+        else load_run_record_for_owner(run_ownership)
+    )
     # Corrective writes use the same frozen policy as the initial implementation.
     config = config_from_resolved_run_policy(run_record.resolved_policy)
     if run_record.state != WorkflowState.CORRECTING:
@@ -297,6 +317,7 @@ def _run_correction_stage(
         run_path,
         attempt_record,
         phase=AttemptPhase.CORRECTING,
+        run_ownership=run_ownership,
     )
 
     baseline_record = load_baseline_record(run_path / BASELINE_RECORD_FILE)
@@ -313,7 +334,11 @@ def _run_correction_stage(
         branch=run_record.starting_branch,
         head_sha=run_record.baseline_sha,
     )
-    writable_operation = GuardedWritableOperation(agent_executor, clock=clock)
+    writable_operation = GuardedWritableOperation(
+        agent_executor,
+        clock=clock,
+        run_ownership=run_ownership,
+    )
     if run_record.current_correction_round >= run_record.max_correction_rounds:
         message = "Maximum corrective rounds exhausted; human intervention is required."
         rejected = writable_operation.reject_before_start(
@@ -341,6 +366,7 @@ def _run_correction_stage(
             advance_correction_round=False,
             after_workspace_fingerprint=audit.after_workspace_fingerprint,
             process_started=False,
+            run_ownership=run_ownership,
         )
 
     evidence_problem = baseline_verification_evidence_problem(
@@ -383,6 +409,7 @@ def _run_correction_stage(
             advance_correction_round=False,
             after_workspace_fingerprint=audit.after_workspace_fingerprint,
             process_started=False,
+            run_ownership=run_ownership,
         )
 
     expected_source_fingerprint, starting_violations = _correction_source_fingerprint(
@@ -429,6 +456,7 @@ def _run_correction_stage(
             advance_correction_round=False,
             after_workspace_fingerprint=audit.after_workspace_fingerprint,
             process_started=False,
+            run_ownership=run_ownership,
         )
 
     selected_causes = cause_set.causes
@@ -446,6 +474,7 @@ def _run_correction_stage(
             ticket_id=active_record.ticket_id,
             round_number=correction_round,
             markdown=ticket_markdown,
+            run_ownership=run_ownership,
         )
         prompt = render_correction_prompt(
             original_ticket=_read_snapshotted_ticket(run_path / RUN_TICKET_FILE),
@@ -456,6 +485,8 @@ def _run_correction_stage(
                 correction_round=correction_round,
             ),
         )
+    except RunOwnershipError:
+        raise
     except Exception as error:  # noqa: BLE001 - preserve writable safety evidence.
         message = (
             f"Could not prepare correction invocation: {type(error).__name__}: {error}"
@@ -490,6 +521,7 @@ def _run_correction_stage(
             advance_correction_round=False,
             after_workspace_fingerprint=audit.after_workspace_fingerprint,
             process_started=False,
+            run_ownership=run_ownership,
         )
     request = AgentExecutionRequest(
         task_kind=AgentTaskKind.CORRECTION,
@@ -498,7 +530,11 @@ def _run_correction_stage(
         prompt=prompt,
         result_contract=CORRECTION_RESULT_CONTRACT,
         artifact_directory=artifact_directory,
-        artifact_layout=AttemptArtifactLayout.for_attempt(run_path, artifact_directory),
+        artifact_layout=AttemptArtifactLayout.for_attempt(
+            run_path,
+            artifact_directory,
+            run_ownership=run_ownership,
+        ),
         policy=run_record.resolved_policy.task_policy(
             AgentTaskKind.CORRECTION
         ).execution_policy,
@@ -554,6 +590,7 @@ def _run_correction_stage(
             advance_correction_round=False,
             after_workspace_fingerprint=audit.after_workspace_fingerprint,
             process_started=audit.invocation_start is InvocationStart.STARTED,
+            run_ownership=run_ownership,
         )
 
     if isinstance(
@@ -595,6 +632,7 @@ def _run_correction_stage(
             advance_correction_round=False,
             after_workspace_fingerprint=audit.after_workspace_fingerprint,
             process_started=audit.invocation_start is InvocationStart.STARTED,
+            run_ownership=run_ownership,
         )
 
     if not isinstance(writable_outcome, WritableSucceeded):
@@ -619,6 +657,7 @@ def _run_correction_stage(
             controller_message="Correction agent returned BLOCKED.",
             after_workspace_fingerprint=audit.after_workspace_fingerprint,
             process_started=True,
+            run_ownership=run_ownership,
         )
 
     return _finish(
@@ -638,6 +677,7 @@ def _run_correction_stage(
         ),
         after_workspace_fingerprint=audit.after_workspace_fingerprint,
         process_started=True,
+        run_ownership=run_ownership,
     )
 
 
@@ -716,7 +756,11 @@ def _finish(
     advance_correction_round: bool = True,
     after_workspace_fingerprint: str | None = None,
     process_started: bool | None = None,
+    run_ownership: RunOwnership | None = None,
 ) -> CorrectionStageResult:
+    if run_ownership is not None:
+        run_ownership.validate_run_path(run_dir)
+        run_ownership.validate_descendant(artifact_directory)
     _write_agent_result(
         artifact_directory,
         agent_result,
@@ -769,8 +813,11 @@ def _write_correction_ticket(
     ticket_id: str,
     round_number: int,
     markdown: str,
+    run_ownership: RunOwnership | None = None,
 ) -> Path:
     path = artifact_directory / CORRECTION_TICKET_FILE
+    if run_ownership is not None:
+        run_ownership.validate_descendant(path)
     if path.exists():
         raise CorrectionError(f"Correction ticket already exists: {path}")
     path.write_text(markdown, encoding="utf-8", newline="\n")

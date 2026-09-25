@@ -47,7 +47,9 @@ class CorrectionStageHandler:
                 WorkflowState.CORRECTION_PENDING, WorkflowState.CORRECTING
             )
 
+        context.run_ownership.validate_run_path(context.run_dir)
         cause_set = plan_pending_correction(context.run_dir)
+        context.run_ownership.validate_run_path(context.run_dir)
         result = run_correction_stage(
             self.config,
             context.run_dir,
@@ -55,6 +57,7 @@ class CorrectionStageHandler:
             agent_executor=self.agent_executor,
             attempt_record=context.require_attempt(),
             clock=context.clock,
+            run_ownership=context.run_ownership,
         )
         return decision_for_stage_result(
             record,

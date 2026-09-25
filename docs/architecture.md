@@ -59,6 +59,15 @@ executor. Composition retains the provider registry and supplies application
 workflows with a provider-neutral factory port that accepts the persisted
 policy; application code never receives the registry itself.
 
+Run and attempt paths are ownership boundaries as well as naming conventions.
+Resume accepts only a direct, non-linked run directory whose persisted identity
+matches its directory. Attempt creation, loading, and mutation resolve through
+the same physically confined layout. Lifecycle execution carries the configured
+runs root and run ID as an ownership token and revalidates it before authoritative
+reads and writes; ownership loss stops without terminal persistence or reporting.
+Fixed text artifacts such as `final.patch` and `report.md` are atomically replaced
+so pre-existing file links cannot redirect an authoritative write.
+
 ## Enforced rules
 
 The AST fitness checks in `tests/architecture_fitness.py` inspect source without

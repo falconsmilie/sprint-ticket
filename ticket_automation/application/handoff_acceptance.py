@@ -34,6 +34,7 @@ from ..persistence_codecs import (
     read_implementation_result,
     read_review_result,
 )
+from ..run_ownership import RunOwnership, RunOwnershipError
 from ..runs import RunRecord
 from ..verification_evidence import read_verification_source_fingerprint
 from .agent_execution import (
@@ -64,6 +65,7 @@ class HandoffAcceptanceRequest:
     run_dir: Path
     run_record: RunRecord
     attempt: StageAttempt | None = None
+    run_ownership: RunOwnership | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.run_dir, Path):
@@ -72,6 +74,10 @@ class HandoffAcceptanceRequest:
             raise TypeError("run_record must be a RunRecord.")
         if self.attempt is not None and not isinstance(self.attempt, StageAttempt):
             raise TypeError("attempt must be a StageAttempt or None.")
+        if self.run_ownership is not None and not isinstance(
+            self.run_ownership, RunOwnership
+        ):
+            raise TypeError("run_ownership must be a RunOwnership or None.")
 
 
 @dataclass(frozen=True)
@@ -261,6 +267,14 @@ class HandoffAcceptanceService:
 
     def accept(self, request: HandoffAcceptanceRequest) -> HandoffAcceptanceResult:
         run_record = request.run_record
+        try:
+            _require_owned_handoff_run(request)
+        except RunOwnershipError as error:
+            return HandoffRejected(
+                stop_category=StopCategory.SAFETY_VIOLATION,
+                reason=str(error),
+                _seal=_HANDOFF_OUTCOME_SEAL,
+            )
         request_problem = _acceptance_request_problem(request)
         if request_problem is not None:
             return HandoffRejected(
@@ -332,11 +346,13 @@ class HandoffAcceptanceService:
         assert policy_request.verification is not None
         assert policy_request.review is not None
         try:
+            _require_owned_handoff_run(request)
             patch = self._patch_capture.capture(
                 FinalPatchCaptureRequest(
                     repository_path=repository.path,
                     baseline_sha=run_record.baseline_sha,
                     destination=request.run_dir / FINAL_PATCH_FILE,
+                    run_ownership=request.run_ownership,
                 )
             )
             _validate_captured_patch(
@@ -740,6 +756,16 @@ def _acceptance_request_problem(request: HandoffAcceptanceRequest) -> str | None
     if request.run_dir.name != request.run_record.run_id:
         return "Final handoff run directory does not belong to the run record."
     return None
+
+
+def _require_owned_handoff_run(request: HandoffAcceptanceRequest) -> None:
+    if request.run_ownership is None:
+        return
+    owned_path = request.run_ownership.validate()
+    if request.run_dir.absolute() != owned_path:
+        raise RunOwnershipError(
+            "Final handoff run path does not match its configured owner."
+        )
 
 
 def _load_current_reporting_attempt(run_dir: Path) -> AttemptRecord:

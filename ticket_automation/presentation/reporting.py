@@ -40,10 +40,16 @@ from ..models import (
     StageOutcome,
     WorkflowState,
 )
+from ..persistence import PersistenceError, atomic_write_text
 from ..persistence_codecs import (
     PersistenceCodecError,
     read_implementation_result,
     read_review_result,
+)
+from ..run_ownership import (
+    RunOwnership,
+    RunOwnershipError,
+    validate_unlinked_run_directory,
 )
 from ..runs import RUN_RECORD_FILE, RunError, RunRecord, load_run_record
 from ..verification_evidence import VerificationEvidence, read_verification_evidence
@@ -153,18 +159,51 @@ class FilesystemTerminalReportPublisher:
         self,
         run_dir: Path,
         run_record: RunRecord,
+        *,
+        run_ownership: RunOwnership | None = None,
     ) -> ReportStageResult | None:
+        controller_ownership = run_ownership
+        try:
+            run_ownership = (
+                RunOwnership.acquire(run_dir.parent, run_record.run_id)
+                if run_ownership is None
+                else run_ownership
+            )
+            run_ownership.validate_run_path(run_dir)
+        except RunOwnershipError:
+            if controller_ownership is not None:
+                raise
+            return None
+        except ValueError:
+            return None
         if run_record.state is WorkflowState.READY_FOR_HUMAN:
             try:
-                return run_report_stage(run_dir)
-            except (OSError, ReportError, ValueError):
+                return run_report_stage(
+                    run_dir,
+                    run_ownership=run_ownership,
+                )
+            except (OSError, PersistenceError, ReportError, ValueError):
                 return None
-        generate_terminal_report_best_effort(run_dir)
+        generate_terminal_report_best_effort(
+            run_dir,
+            run_ownership=run_ownership,
+        )
         return None
 
 
-def run_report_stage(run_dir: Path | str) -> ReportStageResult:
-    run_path = Path(run_dir)
+def run_report_stage(
+    run_dir: Path | str,
+    *,
+    run_ownership: RunOwnership | None = None,
+) -> ReportStageResult:
+    try:
+        run_path = (
+            validate_unlinked_run_directory(run_dir)
+            if run_ownership is None
+            else run_ownership.validate_run_path(run_dir)
+        )
+    except RunOwnershipError as error:
+        raise ReportError(str(error)) from error
     run_record = load_run_record(run_path / RUN_RECORD_FILE)
     if run_record.state != WorkflowState.READY_FOR_HUMAN:
         raise ReportError(
@@ -179,6 +218,8 @@ def run_report_stage(run_dir: Path | str) -> ReportStageResult:
         ) from error
     context = collect_report_context(run_path, run_record, patch_text=patch_text)
     final_report_path = run_path / FINAL_REPORT_FILE
+    if run_ownership is not None:
+        run_ownership.validate_descendant(final_report_path)
     _write_text(final_report_path, render_final_report(context))
     controller = context.controller
     return ReportStageResult(
@@ -195,9 +236,17 @@ def run_report_stage(run_dir: Path | str) -> ReportStageResult:
     )
 
 
-def generate_terminal_report_best_effort(run_dir: Path | str) -> Path | None:
-    run_path = Path(run_dir)
+def generate_terminal_report_best_effort(
+    run_dir: Path | str,
+    *,
+    run_ownership: RunOwnership | None = None,
+) -> Path | None:
     try:
+        run_path = (
+            validate_unlinked_run_directory(run_dir)
+            if run_ownership is None
+            else run_ownership.validate_run_path(run_dir)
+        )
         record = load_run_record(run_path / RUN_RECORD_FILE)
         try:
             patch_text = (run_path / FINAL_PATCH_FILE).read_text(encoding="utf-8")
@@ -205,6 +254,8 @@ def generate_terminal_report_best_effort(run_dir: Path | str) -> Path | None:
             patch_text = ""
         context = collect_report_context(run_path, record, patch_text=patch_text)
         path = run_path / FINAL_REPORT_FILE
+        if run_ownership is not None:
+            run_ownership.validate_descendant(path)
         _write_text(path, render_final_report(context))
         return path
     except Exception:  # noqa: BLE001 - never mask the terminal state.
@@ -525,8 +576,7 @@ def _yes_no(value: bool) -> str:
 
 
 def _write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8", newline="\n")
+    atomic_write_text(path, text)
 
 
 __all__ = [

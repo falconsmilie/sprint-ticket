@@ -23,10 +23,12 @@ from ...domain.task_results import ResultValidationError, TaskResult
 from ...persistence import JsonObject, format_timestamp
 from .command import build_command, sandbox_for
 from .evidence import (
+    RESULT_ARTIFACT,
     CodexArtifactPaths,
     prepare,
     write_execution,
     write_process_output,
+    write_result,
 )
 from .executable import resolve_executable
 from .failures import (
@@ -177,17 +179,21 @@ class CodexCliAgentExecutor:
                 exit_code=None,
             )
 
-        command = build_command(
-            executable=str(resolved),
-            repository_path=request.repository_path,
-            repository_access=request.repository_access,
-            network_access=request.policy.network_access,
-            settings=self.settings,
-            output_schema=schema,
-            output_result=paths.result,
-        )
+        raw_result: str | None = None
+        result_read_error: OSError | UnicodeError | None = None
+        command = configured_command
         try:
             with external_scratch_environment(request.repository_path) as environment:
+                scratch_result = Path(environment["TEMP"]) / RESULT_ARTIFACT
+                command = build_command(
+                    executable=str(resolved),
+                    repository_path=request.repository_path,
+                    repository_access=request.repository_access,
+                    network_access=request.policy.network_access,
+                    settings=self.settings,
+                    output_schema=schema,
+                    output_result=scratch_result,
+                )
                 command = with_environment(command, environment)
                 process_start_observer = _process_start_observer(on_invocation_start)
                 try:
@@ -241,6 +247,10 @@ class CodexCliAgentExecutor:
                         command=command,
                         exit_code=None,
                     )
+                try:
+                    raw_result = scratch_result.read_text(encoding="utf-8")
+                except (OSError, UnicodeError) as error:
+                    result_read_error = error
         except CodexScratchDirectoryError as error:
             write_process_output(paths, stdout="", stderr=f"{error}\n")
             return self._failure(
@@ -252,6 +262,8 @@ class CodexCliAgentExecutor:
                 command=command,
                 exit_code=None,
             )
+        if raw_result is not None:
+            write_result(paths, raw_result)
         write_process_output(paths, stdout=process.stdout, stderr=process.stderr)
         if process.returncode != 0:
             reason = (
@@ -269,9 +281,8 @@ class CodexCliAgentExecutor:
                 exit_code=process.returncode,
             )
 
-        try:
-            raw_result = paths.result.read_text(encoding="utf-8")
-        except (FileNotFoundError, OSError) as error:
+        if raw_result is None:
+            error = result_read_error or FileNotFoundError(paths.result)
             detail = (
                 "did not write the required typed result"
                 if isinstance(error, FileNotFoundError)

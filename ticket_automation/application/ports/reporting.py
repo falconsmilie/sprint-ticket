@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Protocol
 
 from ...models import StageOutcome
+from ...run_ownership import RunOwnership
 from ...runs import RunRecord
 
 
@@ -42,6 +43,8 @@ class TerminalReportPublisher(Protocol):
         self,
         run_dir: Path,
         run_record: RunRecord,
+        *,
+        run_ownership: RunOwnership | None = None,
     ) -> ReportPublication | None: ...
 
 

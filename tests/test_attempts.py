@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -49,6 +50,7 @@ from ticket_automation.attempts import (
     latest_attempt,
     load_attempt_records,
     start_attempt,
+    update_attempt,
 )
 from ticket_automation.corrections import (
     CorrectionCauseSet,
@@ -74,13 +76,146 @@ from ticket_automation.persistence_codecs import (
     read_stage_message_result,
     write_stage_message_result,
 )
-from ticket_automation.runs import save_run_record
+from ticket_automation.run_ownership import RunOwnership, RunOwnershipError
+from ticket_automation.runs import RunError, save_run_record
 from ticket_automation.verification_evidence import read_verification_evidence
 from ticket_automation.workflow import resume_ticket_lifecycle
 
 
 def fixed_clock() -> datetime:
     return datetime(2026, 9, 14, 10, 15, tzinfo=UTC)
+
+
+def test_start_attempt_rejects_a_linked_attempts_root(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    external = tmp_path / "external-attempts"
+    run_dir.mkdir()
+    external.mkdir()
+    attempts_root = run_dir / "attempts"
+    link_kind = create_directory_link(attempts_root, external)
+    if link_kind is None:
+        pytest.skip("directory links are unavailable on this platform")
+    try:
+        with pytest.raises(AttemptError, match="owning run|safely"):
+            start_attempt(
+                run_dir,
+                phase=AttemptPhase.VERIFYING,
+                before_workspace_fingerprint=None,
+                clock=fixed_clock,
+            )
+        assert tuple(external.iterdir()) == ()
+    finally:
+        remove_directory_link(attempts_root)
+
+
+def test_attempt_update_rejects_a_retargeted_attempts_root(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    record = start_attempt(
+        run_dir,
+        phase=AttemptPhase.REVIEWING,
+        before_workspace_fingerprint="before",
+        clock=fixed_clock,
+    )
+    attempts_root = record.artifact_directory.parent
+    external = tmp_path / "external-attempts"
+    attempts_root.rename(external)
+    external_record = external / record.artifact_directory.name / "attempt.json"
+    original = external_record.read_bytes()
+    link_kind = create_directory_link(attempts_root, external)
+    if link_kind is None:
+        pytest.skip("directory links are unavailable on this platform")
+    try:
+        with pytest.raises(AttemptError, match="owning run|confinement"):
+            update_attempt(record, process_started=True)
+        assert external_record.read_bytes() == original
+    finally:
+        remove_directory_link(attempts_root)
+
+
+def test_attempt_creation_and_update_reject_a_retargeted_owned_run(
+    tmp_path: Path,
+) -> None:
+    runs_dir = tmp_path / "runs"
+    run_dir = runs_dir / "owned-run"
+    run_dir.mkdir(parents=True)
+    ownership = RunOwnership.acquire(runs_dir, run_dir.name)
+    record = start_attempt(
+        run_dir,
+        phase=AttemptPhase.REVIEWING,
+        before_workspace_fingerprint="before",
+        clock=fixed_clock,
+        run_ownership=ownership,
+    )
+    moved_run = tmp_path / "moved-run"
+    run_dir.rename(moved_run)
+    moved_record = (
+        moved_run / "attempts" / record.artifact_directory.name / "attempt.json"
+    )
+    original = moved_record.read_bytes()
+    link_kind = create_directory_link(run_dir, moved_run)
+    if link_kind is None:
+        moved_run.rename(run_dir)
+        pytest.skip("directory links are unavailable on this platform")
+    try:
+        with pytest.raises(RunOwnershipError, match="ownership was lost"):
+            start_attempt(
+                run_dir,
+                phase=AttemptPhase.VERIFYING,
+                before_workspace_fingerprint="before",
+                clock=fixed_clock,
+                run_ownership=ownership,
+            )
+        with pytest.raises(RunOwnershipError, match="ownership was lost"):
+            update_attempt(
+                record,
+                process_started=True,
+                run_ownership=ownership,
+            )
+        assert moved_record.read_bytes() == original
+        assert [item.name for item in (moved_run / "attempts").iterdir()] == [
+            record.artifact_directory.name
+        ]
+    finally:
+        remove_directory_link(run_dir)
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required")
+@pytest.mark.parametrize("run_id_shape", ["absolute", "traversal"])
+def test_resume_rejects_a_run_outside_the_configured_runs_root(
+    tmp_path: Path,
+    run_id_shape: str,
+) -> None:
+    repository = create_git_repo(tmp_path / "target")
+    config = make_config(repository)
+    ticket = tmp_path / "TA-REV-001.md"
+    ticket.write_text("# Ticket\n", encoding="utf-8")
+    external_runs = tmp_path / "external-runs"
+    snapshot = create_trusted_prepared_run(
+        config,
+        ticket,
+        runs_dir=external_runs,
+        clock=fixed_clock,
+    )
+    configured_runs = tmp_path / "configured-runs"
+    configured_runs.mkdir()
+    run_id = (
+        str(snapshot.run_dir)
+        if run_id_shape == "absolute"
+        else os.path.relpath(snapshot.run_dir, configured_runs)
+    )
+    attempts_before = tuple((snapshot.run_dir / "attempts").iterdir())
+
+    with pytest.raises(RunError, match="Run ID"):
+        resume_ticket_lifecycle(
+            run_id,
+            runs_dir=configured_runs,
+            agent_executor_factory=object(),  # type: ignore[arg-type]
+            final_patch_capture=make_final_patch_capture(),
+            report_publisher=make_report_publisher(),
+            clock=fixed_clock,
+        )
+
+    assert tuple((snapshot.run_dir / "attempts").iterdir()) == attempts_before
 
 
 def test_complete_stage_attempt_rejects_wrong_run_and_recompletion(

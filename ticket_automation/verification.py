@@ -31,6 +31,7 @@ from .models import (
 from .persistence import atomic_write_json, format_timestamp
 from .process_output import decode_human_output
 from .resolved_config import config_from_resolved_run_policy
+from .run_ownership import RunOwnership
 from .runs import (
     BASELINE_RECORD_FILE,
     RUN_RECORD_FILE,
@@ -40,6 +41,7 @@ from .runs import (
     RunRecord,
     load_baseline_record,
     load_run_record,
+    load_run_record_for_owner,
 )
 from .verification_evidence import (
     VERIFICATION_ROUND_FORMAT,
@@ -369,9 +371,16 @@ def run_baseline_verification_stage(
     process_runner: VerificationProcessRunner | None = None,
     attempt_record: StageAttempt,
     clock: Callable[[], datetime] | None = None,
+    run_ownership: RunOwnership | None = None,
 ) -> VerificationStageResult:
     run_path = Path(run_dir)
-    run_record = load_run_record(run_path / RUN_RECORD_FILE)
+    if run_ownership is not None:
+        run_path = run_ownership.validate_run_path(run_path)
+    run_record = (
+        load_run_record(run_path / RUN_RECORD_FILE)
+        if run_ownership is None
+        else load_run_record_for_owner(run_ownership)
+    )
     # The baseline is part of the same immutable run contract as later
     # verification. The caller's current configuration cannot alter it.
     del config
@@ -382,6 +391,7 @@ def run_baseline_verification_stage(
         run_path,
         attempt_record,
         phase=AttemptPhase.PREPARING,
+        run_ownership=run_ownership,
     )
     baseline = load_baseline_record(run_path / BASELINE_RECORD_FILE)
     repository = GitRepository(Path(run_record.target_repository_path))
@@ -409,9 +419,19 @@ def run_baseline_verification_stage(
                 "Workspace changed after the controller started preparation.",
             ),
         )
-    result_path = attempt_result_path(run_path, attempt)
+    result_path = attempt_result_path(
+        run_path,
+        attempt,
+        run_ownership=run_ownership,
+    )
     if violations:
-        round_result = _controller_error_round(result_path, 0, violations, clock=clock)
+        round_result = _controller_error_round(
+            result_path,
+            0,
+            violations,
+            clock=clock,
+            run_ownership=run_ownership,
+        )
     else:
         assert snapshot is not None
         round_result = _run_round(
@@ -424,6 +444,7 @@ def run_baseline_verification_stage(
             include_failures=False,
             process_runner=process_runner,
             clock=clock,
+            run_ownership=run_ownership,
         )
     return _finish_stage(
         run_path,
@@ -432,6 +453,7 @@ def run_baseline_verification_stage(
         artifact_directory=attempt.artifact_directory,
         round_result=round_result,
         baseline=True,
+        run_ownership=run_ownership,
     )
 
 
@@ -443,8 +465,11 @@ def run_verification_stage(
     round_index: int | None = None,
     attempt_record: StageAttempt | None = None,
     clock: Callable[[], datetime] | None = None,
+    run_ownership: RunOwnership | None = None,
 ) -> VerificationStageResult:
     run_path = Path(run_dir)
+    if run_ownership is not None:
+        run_path = run_ownership.validate_run_path(run_path)
     if attempt_record is not None:
         return _run_verification_stage(
             config,
@@ -453,8 +478,13 @@ def run_verification_stage(
             round_index=round_index,
             attempt_record=attempt_record,
             clock=clock,
+            run_ownership=run_ownership,
         )
-    run_record = load_run_record(run_path / RUN_RECORD_FILE)
+    run_record = (
+        load_run_record(run_path / RUN_RECORD_FILE)
+        if run_ownership is None
+        else load_run_record_for_owner(run_ownership)
+    )
     if run_record.state is not WorkflowState.VERIFYING:
         raise VerificationError("Verification requires VERIFYING state.")
     try:
@@ -468,6 +498,7 @@ def run_verification_stage(
         phase=AttemptPhase.VERIFYING,
         before_workspace_fingerprint=before,
         clock=clock,
+        run_ownership=run_ownership,
     )
     result = _run_verification_stage(
         config,
@@ -476,6 +507,7 @@ def run_verification_stage(
         round_index=round_index,
         attempt_record=StageAttempt.from_record(owned_attempt),
         clock=clock,
+        run_ownership=run_ownership,
     )
     complete_stage_attempt(
         run_path,
@@ -485,6 +517,7 @@ def run_verification_stage(
         process_started=result.process_started,
         metadata=AttemptMetadata(controller_message=result.controller_message),
         clock=clock,
+        run_ownership=run_ownership,
     )
     return result
 
@@ -497,9 +530,16 @@ def _run_verification_stage(
     round_index: int | None = None,
     attempt_record: StageAttempt,
     clock: Callable[[], datetime] | None = None,
+    run_ownership: RunOwnership | None = None,
 ) -> VerificationStageResult:
     run_path = Path(run_dir)
-    run_record = load_run_record(run_path / RUN_RECORD_FILE)
+    if run_ownership is not None:
+        run_path = run_ownership.validate_run_path(run_path)
+    run_record = (
+        load_run_record(run_path / RUN_RECORD_FILE)
+        if run_ownership is None
+        else load_run_record_for_owner(run_ownership)
+    )
     config = config_from_resolved_run_policy(run_record.resolved_policy)
     if run_record.state != WorkflowState.VERIFYING:
         raise VerificationError("Verification requires VERIFYING state.")
@@ -507,6 +547,7 @@ def _run_verification_stage(
         run_path,
         attempt_record,
         phase=AttemptPhase.VERIFYING,
+        run_ownership=run_ownership,
     )
     repository = GitRepository(Path(run_record.target_repository_path))
     selected_round = (
@@ -536,10 +577,18 @@ def _run_verification_stage(
                 "Workspace changed after the controller started verification.",
             ),
         )
-    result_path = attempt_result_path(run_path, attempt)
+    result_path = attempt_result_path(
+        run_path,
+        attempt,
+        run_ownership=run_ownership,
+    )
     if violations:
         round_result = _controller_error_round(
-            result_path, selected_round, violations, clock=clock
+            result_path,
+            selected_round,
+            violations,
+            clock=clock,
+            run_ownership=run_ownership,
         )
     else:
         assert snapshot is not None
@@ -553,6 +602,7 @@ def _run_verification_stage(
             include_failures=True,
             process_runner=process_runner,
             clock=clock,
+            run_ownership=run_ownership,
         )
     return _finish_stage(
         run_path,
@@ -561,6 +611,7 @@ def _run_verification_stage(
         artifact_directory=attempt.artifact_directory,
         round_result=round_result,
         baseline=False,
+        run_ownership=run_ownership,
     )
 
 
@@ -575,11 +626,19 @@ def _run_round(
     include_failures: bool,
     process_runner: VerificationProcessRunner | None,
     clock: Callable[[], datetime] | None,
+    run_ownership: RunOwnership | None,
 ) -> VerificationRound:
     started = _utcnow(clock)
     runner = process_runner or SubprocessVerificationRunner()
     commands_result = tuple(
-        _run_command(command, cwd, runner, clock) for command in commands
+        _run_command(
+            command,
+            cwd,
+            runner,
+            clock,
+            run_ownership=run_ownership,
+        )
+        for command in commands
     )
     violations = _after_violations(repository, before_snapshot)
     ended = _utcnow(clock)
@@ -598,6 +657,8 @@ def _run_round(
         ),
         result_path=result_path,
     )
+    if run_ownership is not None:
+        run_ownership.validate_descendant(result_path)
     atomic_write_json(result_path, result.to_dict())
     return result
 
@@ -610,7 +671,11 @@ def _finish_stage(
     artifact_directory: Path,
     round_result: VerificationRound,
     baseline: bool,
+    run_ownership: RunOwnership | None,
 ) -> VerificationStageResult:
+    if run_ownership is not None:
+        run_ownership.validate_run_path(run_path)
+        run_ownership.validate_descendant(artifact_directory)
     if round_result.safety_violations or round_result.errored_commands:
         outcome = StageOutcome.HUMAN_REQUIRED
         message = (
@@ -655,6 +720,7 @@ def _controller_error_round(
     violations: tuple[VerificationSafetyViolation, ...],
     *,
     clock: Callable[[], datetime] | None,
+    run_ownership: RunOwnership | None,
 ) -> VerificationRound:
     now = _utcnow(clock)
     result = VerificationRound(
@@ -668,6 +734,8 @@ def _controller_error_round(
         failures=(),
         result_path=result_path,
     )
+    if run_ownership is not None:
+        run_ownership.validate_descendant(result_path)
     atomic_write_json(result_path, result.to_dict())
     return result
 
@@ -687,6 +755,8 @@ def _run_command(
     cwd: Path,
     runner: VerificationProcessRunner,
     clock: Callable[[], datetime] | None,
+    *,
+    run_ownership: RunOwnership | None,
 ) -> VerificationCommandResult:
     started = _utcnow(clock)
     try:
@@ -695,6 +765,8 @@ def _run_command(
             timeout_seconds=command.timeout_seconds,
         )
     except FileNotFoundError as error:
+        if run_ownership is not None:
+            run_ownership.validate()
         return _command_error(
             command,
             cwd,
@@ -704,6 +776,8 @@ def _run_command(
             clock,
         )
     except VerificationProcessTimedOut as error:
+        if run_ownership is not None:
+            run_ownership.validate()
         return _command_error(
             command,
             cwd,
@@ -715,6 +789,8 @@ def _run_command(
             stderr=error.result.stderr,
         )
     except OSError as error:
+        if run_ownership is not None:
+            run_ownership.validate()
         return _command_error(
             command,
             cwd,
@@ -723,6 +799,8 @@ def _run_command(
             str(error),
             clock,
         )
+    if run_ownership is not None:
+        run_ownership.validate()
     ended = _utcnow(clock)
     return VerificationCommandResult(
         command.name,

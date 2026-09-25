@@ -147,7 +147,16 @@ a person can inspect the target workspace before deciding what to do.
 
 Attempt records are trusted only when their sequence, phase, status, paths, and
 directory agree. Invalid attempt evidence stops resume for human inspection;
-the controller never follows an artifact path outside its own attempt.
+the controller never follows an artifact path outside its own attempt. A resume
+identifier must name one direct, non-linked child of the configured `runs`
+directory, and the persisted run ID and ticket-copy path must agree with that
+directory before provider policy is restored or a repository lock is acquired.
+
+Attempt creation and update revalidate physical path ownership before writing.
+Lifecycle operations retain the configured runs root and run ID and fail closed
+without terminal persistence or reporting if that ownership is lost.
+The final patch and report use atomic replacement, so an existing file link is
+replaced rather than followed to another file.
 
 ## Persistence contract
 

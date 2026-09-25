@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -36,6 +37,7 @@ from ticket_automation.persistence import (
     CodecError,
     PersistenceError,
     atomic_write_json,
+    atomic_write_text,
 )
 from ticket_automation.verification_evidence import (
     VERIFICATION_ROUND_FORMAT,
@@ -409,6 +411,22 @@ def test_atomic_json_write_uses_utf8_and_one_terminal_newline(tmp_path: Path) ->
     assert payload.endswith(b"\n")
     assert not payload.endswith(b"\n\n")
     assert json.loads(payload.decode("utf-8"))["message"] == "Grüße"
+
+
+def test_atomic_text_write_replaces_a_hardlink_without_mutating_its_target(
+    tmp_path: Path,
+) -> None:
+    external = tmp_path / "external.txt"
+    external.write_text("external evidence", encoding="utf-8")
+    destination = tmp_path / "run" / "final.patch"
+    destination.parent.mkdir()
+    os.link(external, destination)
+
+    atomic_write_text(destination, "captured patch")
+
+    assert external.read_text(encoding="utf-8") == "external evidence"
+    assert destination.read_text(encoding="utf-8") == "captured patch"
+    assert not os.path.samefile(external, destination)
 
 
 @pytest.mark.parametrize("status", list(VerificationStatus))
