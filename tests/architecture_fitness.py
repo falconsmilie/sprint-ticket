@@ -47,6 +47,30 @@ FILESYSTEM_MODULES = frozenset(
 FLAT_GIT_MODULES = frozenset(
     {f"{PACKAGE}.git", f"{PACKAGE}.git_safety", f"{PACKAGE}.workspace_guard"}
 )
+FLAT_DOMAIN_MODULES = frozenset(
+    {
+        f"{PACKAGE}.models",
+    }
+)
+FLAT_APPLICATION_MODULES = frozenset(
+    {
+        f"{PACKAGE}.attempts",
+        f"{PACKAGE}.correction_planner",
+        f"{PACKAGE}.corrections",
+        f"{PACKAGE}.execution_evidence",
+        f"{PACKAGE}.failure_classification",
+        f"{PACKAGE}.implementation",
+        f"{PACKAGE}.persistence_codecs",
+        f"{PACKAGE}.preflight",
+        f"{PACKAGE}.resolved_config",
+        f"{PACKAGE}.review",
+        f"{PACKAGE}.runs",
+        f"{PACKAGE}.task_result_codecs",
+        f"{PACKAGE}.verification",
+        f"{PACKAGE}.verification_evidence",
+        f"{PACKAGE}.workflow",
+    }
+)
 LIFECYCLE_APPLICATION_MODULES = frozenset(
     {
         f"{PACKAGE}.correction_planner",
@@ -156,6 +180,10 @@ def _targets_any_module(edge: ImportEdge, modules: frozenset[str] | set[str]) ->
 
 
 def _source_layer(module: str) -> str | None:
+    if module in FLAT_DOMAIN_MODULES:
+        return "domain"
+    if module in FLAT_APPLICATION_MODULES:
+        return "application"
     parts = module.split(".")
     if len(parts) > 1 and parts[0] == PACKAGE and parts[1] in LAYERS:
         return parts[1]

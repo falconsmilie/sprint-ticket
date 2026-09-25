@@ -48,8 +48,9 @@ A provider-neutral evidence envelope may reference native provider artifacts,
 but those artifacts and their codecs remain with the provider.
 
 Run persistence stores a provider-neutral resolved policy. Its core records the
-repository, verification, task assignments, task requirements, package source,
-and provider-neutral prompt and result-contract hashes. Each referenced provider
+repository, verification, task assignments, access/capability/timeout/network
+task requirements, package source, and provider-neutral prompt and
+result-contract hashes. Each referenced provider
 has a typed ID, adapter policy version, declared capabilities, and an opaque JSON
 payload. Only the matching registered adapter encodes, decodes, validates, and
 interprets that payload. Resume rejects unknown providers, adapter policy version

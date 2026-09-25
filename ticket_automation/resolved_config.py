@@ -14,7 +14,9 @@ from typing import Any, Protocol
 
 from .application.agent_execution import (
     AgentCapability,
+    AgentExecutionPolicy,
     AgentTaskKind,
+    NetworkAccess,
     ProviderId,
     RepositoryAccess,
     required_execution_capabilities,
@@ -28,7 +30,8 @@ from .config import (
     VerificationSettings,
 )
 
-RESOLVED_RUN_POLICY_SCHEMA_VERSION = 2
+RESOLVED_RUN_POLICY_SCHEMA_VERSION = 3
+_DEFAULT_AGENT_TIMEOUT_SECONDS = 60 * 60
 _APPLICATION_VERSION = distribution_version("ticket-automation")
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _PACKAGE_ROOT = Path(__file__).resolve().parent
@@ -67,6 +70,7 @@ class ResolvedTaskPolicy:
     provider_id: ProviderId
     repository_access: RepositoryAccess
     required_capabilities: frozenset[AgentCapability]
+    execution_policy: AgentExecutionPolicy
 
     def __post_init__(self) -> None:
         if not isinstance(self.task_kind, AgentTaskKind):
@@ -78,11 +82,17 @@ class ResolvedTaskPolicy:
                 "resolved task repository access must be typed."
             )
         _validate_capabilities(self.required_capabilities, provider_id=self.provider_id)
+        if not isinstance(self.execution_policy, AgentExecutionPolicy):
+            raise ResolvedRunPolicyError(
+                "resolved task execution policy must be typed."
+            )
         expected_access = _task_repository_access(self.task_kind)
         expected_capabilities = required_execution_capabilities(expected_access)
+        expected_execution_policy = _task_execution_policy(self.task_kind)
         if (
             self.repository_access is not expected_access
             or self.required_capabilities != expected_capabilities
+            or self.execution_policy != expected_execution_policy
         ):
             raise ResolvedRunPolicyError(
                 f"resolved_policy task requirements are incompatible: {self.task_kind.value}."
@@ -95,6 +105,10 @@ class ResolvedTaskPolicy:
             "required_capabilities": sorted(
                 c.value for c in self.required_capabilities
             ),
+            "execution_policy": {
+                "timeout_seconds": self.execution_policy.timeout_seconds,
+                "network_access": self.execution_policy.network_access.value,
+            },
         }
 
 
@@ -229,6 +243,13 @@ class ResolvedRunPolicy:
     @property
     def assignments(self) -> Mapping[AgentTaskKind, ProviderId]:
         return {task.task_kind: task.provider_id for task in self.task_policies}
+
+    def task_policy(self, task_kind: AgentTaskKind) -> ResolvedTaskPolicy:
+        if not isinstance(task_kind, AgentTaskKind):
+            raise ResolvedRunPolicyError(
+                "task policy lookup requires a typed task kind."
+            )
+        return self.task_policies[tuple(AgentTaskKind).index(task_kind)]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -547,6 +568,7 @@ def _resolved_task_policy(
         provider_id=provider_id,
         repository_access=access,
         required_capabilities=required_execution_capabilities(access),
+        execution_policy=_task_execution_policy(task_kind),
     )
 
 
@@ -560,7 +582,12 @@ def _parse_task_policies(data: dict[str, Any]) -> tuple[ResolvedTaskPolicy, ...]
         task = _require_table(data, task_kind.value)
         _require_exact_keys(
             task,
-            {"provider_id", "repository_access", "required_capabilities"},
+            {
+                "provider_id",
+                "repository_access",
+                "required_capabilities",
+                "execution_policy",
+            },
             context=f"resolved_policy task {task_kind.value}",
         )
         expected = _resolved_task_policy(
@@ -573,9 +600,13 @@ def _parse_task_policies(data: dict[str, Any]) -> tuple[ResolvedTaskPolicy, ...]
                 f"resolved_policy task access is unsupported: {task_kind.value}."
             ) from error
         capabilities = _parse_capabilities(task, "required_capabilities")
+        execution_policy = _parse_execution_policy(
+            _require_table(task, "execution_policy")
+        )
         if (
             access is not expected.repository_access
             or capabilities != expected.required_capabilities
+            or execution_policy != expected.execution_policy
         ):
             raise ResolvedRunPolicyError(
                 f"resolved_policy task requirements are incompatible: {task_kind.value}."
@@ -654,6 +685,36 @@ def _task_repository_access(task_kind: AgentTaskKind) -> RepositoryAccess:
         if task_kind is AgentTaskKind.REVIEW
         else RepositoryAccess.WORKSPACE_WRITE
     )
+
+
+def _task_execution_policy(task_kind: AgentTaskKind) -> AgentExecutionPolicy:
+    return AgentExecutionPolicy(
+        timeout_seconds=_DEFAULT_AGENT_TIMEOUT_SECONDS,
+        network_access=(
+            NetworkAccess.DENIED
+            if task_kind is AgentTaskKind.REVIEW
+            else NetworkAccess.ALLOWED
+        ),
+    )
+
+
+def _parse_execution_policy(data: dict[str, Any]) -> AgentExecutionPolicy:
+    _require_exact_keys(
+        data,
+        {"timeout_seconds", "network_access"},
+        context="resolved_policy task execution_policy",
+    )
+    timeout = data.get("timeout_seconds")
+    try:
+        network_access = NetworkAccess(_require_string(data, "network_access"))
+        return AgentExecutionPolicy(
+            timeout_seconds=timeout,
+            network_access=network_access,
+        )
+    except (TypeError, ValueError) as error:
+        raise ResolvedRunPolicyError(
+            f"resolved_policy task execution_policy is invalid: {error}"
+        ) from error
 
 
 def _validate_non_empty_strings(values: tuple[str, ...], *, field: str) -> None:

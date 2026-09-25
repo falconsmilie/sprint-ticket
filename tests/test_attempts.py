@@ -40,12 +40,12 @@ from ticket_automation.application.guarded_writable_operation import (
 )
 from ticket_automation.application.lifecycle.resume import resume_preflight_problem
 from ticket_automation.attempts import (
+    ATTEMPT_RECORD_SCHEMA_VERSION,
     AttemptError,
     StageAttempt,
     attempt_result_path,
     complete_attempt,
     complete_stage_attempt,
-    finish_phase_attempt,
     latest_attempt,
     load_attempt_records,
     start_attempt,
@@ -714,22 +714,6 @@ def test_attempt_commands_reject_raw_phase_and_status_values(tmp_path: Path) -> 
     assert load_attempt_records(tmp_path / "valid") == (record,)
 
 
-def test_finish_phase_attempt_rejects_raw_stage_outcome(tmp_path: Path) -> None:
-    start_attempt(
-        tmp_path,
-        phase=AttemptPhase.VERIFYING,
-        before_workspace_fingerprint="before",
-        clock=fixed_clock,
-    )
-
-    with pytest.raises(AttemptError, match="StageOutcome"):
-        finish_phase_attempt(
-            tmp_path,
-            phase=AttemptPhase.VERIFYING,
-            stage_outcome=StageOutcome.COMPLETED.value,  # type: ignore[arg-type]
-        )
-
-
 def test_guarded_writable_operation_rejects_a_non_writable_phase(
     tmp_path: Path,
 ) -> None:
@@ -823,7 +807,11 @@ def test_guarded_writable_operation_does_not_modify_provider_native_artifacts(
             return replace(
                 execution,
                 artifacts=(
-                    *execution.artifacts,
+                    *(
+                        item
+                        for item in execution.artifacts
+                        if item.role is not ArtifactRole.PROVIDER_EXECUTION_DETAILS
+                    ),
                     ArtifactReference(
                         ArtifactRole.PROVIDER_EXECUTION_DETAILS,
                         provider_artifact.relative_to(run_dir).as_posix(),
@@ -889,6 +877,77 @@ def test_resume_requires_human_inspection_for_invalid_attempt_evidence(
 
     assert result.run_record.state == WorkflowState.HUMAN_REQUIRED
     assert "Attempt evidence is invalid" in result.run_record.terminal_reason
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda data: data.pop("execution_path"), "missing execution_path"),
+        (
+            lambda data: data.update({"legacy_result_path": "result.json"}),
+            "unexpected legacy_result_path",
+        ),
+    ],
+    ids=["missing-field", "unknown-field"],
+)
+def test_attempt_codec_requires_the_exact_current_schema(
+    tmp_path: Path,
+    mutation,
+    message: str,
+) -> None:
+    record = start_attempt(
+        tmp_path,
+        phase=AttemptPhase.VERIFYING,
+        before_workspace_fingerprint="before",
+        clock=fixed_clock,
+    )
+    data = json.loads(record.path.read_text(encoding="utf-8"))
+    mutation(data)
+    record.path.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(AttemptError, match=message):
+        load_attempt_records(tmp_path)
+
+
+@pytest.mark.parametrize("schema_version", [True, 1.0])
+def test_attempt_codec_rejects_non_integer_schema_versions_without_rewriting(
+    tmp_path: Path,
+    schema_version: object,
+) -> None:
+    record = start_attempt(
+        tmp_path,
+        phase=AttemptPhase.VERIFYING,
+        before_workspace_fingerprint="before",
+        clock=fixed_clock,
+    )
+    data = json.loads(record.path.read_text(encoding="utf-8"))
+    data["schema_version"] = schema_version
+    record.path.write_text(json.dumps(data), encoding="utf-8")
+    rejected_contents = record.path.read_bytes()
+
+    with pytest.raises(AttemptError, match="unsupported schema version"):
+        load_attempt_records(tmp_path)
+
+    assert record.path.read_bytes() == rejected_contents
+
+
+@pytest.mark.parametrize(
+    "schema_version",
+    [True, float(ATTEMPT_RECORD_SCHEMA_VERSION)],
+)
+def test_attempt_record_construction_rejects_non_integer_schema_versions(
+    tmp_path: Path,
+    schema_version: object,
+) -> None:
+    record = start_attempt(
+        tmp_path,
+        phase=AttemptPhase.VERIFYING,
+        before_workspace_fingerprint="before",
+        clock=fixed_clock,
+    )
+
+    with pytest.raises(AttemptError, match="unsupported schema version"):
+        replace(record, schema_version=schema_version)
 
 
 def test_resume_rejects_started_writable_attempt_after_persisted_transition(

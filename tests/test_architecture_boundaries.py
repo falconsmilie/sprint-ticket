@@ -6,6 +6,8 @@ import pytest
 
 from tests.architecture_fitness import (
     ARCHITECTURE_DEBT,
+    FLAT_APPLICATION_MODULES,
+    FLAT_DOMAIN_MODULES,
     module_name_for_path,
     scan_package,
     violations_for_source,
@@ -104,6 +106,67 @@ def test_provider_transport_vocabulary_fails_in_application_port(source: str):
 )
 def test_domain_outward_imports_fail(source: str, rule: str):
     assert rule in _rules(source, "ticket_automation.domain.ticket")
+
+
+_AUTHORITATIVE_FLAT_CORE_MODULES = (
+    "ticket_automation.models",
+    "ticket_automation.resolved_config",
+    "ticket_automation.execution_evidence",
+    "ticket_automation.runs",
+    "ticket_automation.attempts",
+    "ticket_automation.failure_classification",
+)
+
+
+def test_authoritative_flat_core_modules_have_explicit_layer_ownership():
+    assert set(_AUTHORITATIVE_FLAT_CORE_MODULES) <= (
+        FLAT_DOMAIN_MODULES | FLAT_APPLICATION_MODULES
+    )
+
+
+@pytest.mark.parametrize("module", _AUTHORITATIVE_FLAT_CORE_MODULES)
+def test_authoritative_flat_core_modules_reject_concrete_provider_imports(
+    module: str,
+):
+    rules = _rules("from ticket_automation.providers import codex_cli\n", module)
+
+    expected = (
+        "domain_outward_import"
+        if module in FLAT_DOMAIN_MODULES
+        else "application_concrete_adapter_import"
+    )
+    assert expected in rules
+
+
+@pytest.mark.parametrize("module", _AUTHORITATIVE_FLAT_CORE_MODULES)
+@pytest.mark.parametrize("outward_layer", ["composition", "presentation"])
+def test_authoritative_flat_core_modules_reject_outward_imports(
+    module: str,
+    outward_layer: str,
+):
+    assert "inward_presentation_import" in _rules(
+        f"from ticket_automation.{outward_layer} import injected\n",
+        module,
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "rule"),
+    [
+        (
+            "from ticket_automation.application import service\n",
+            "domain_outward_import",
+        ),
+        ("from pathlib import Path\n", "domain_runtime_boundary_import"),
+        ("import subprocess\n", "domain_runtime_boundary_import"),
+        ("from ticket_automation import git\n", "domain_runtime_boundary_import"),
+    ],
+)
+def test_flat_domain_owner_rejects_outward_runtime_dependencies(
+    source: str,
+    rule: str,
+):
+    assert rule in _rules(source, "ticket_automation.models")
 
 
 def test_fake_provider_import_in_application_fixture_fails(tmp_path: Path):

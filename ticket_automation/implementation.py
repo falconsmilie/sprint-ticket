@@ -9,13 +9,11 @@ from typing import Any
 from .application.agent_execution import (
     IMPLEMENTATION_RESULT_CONTRACT,
     AgentExecution,
-    AgentExecutionPolicy,
     AgentExecutionRequest,
     AgentExecutor,
     AgentTaskKind,
     AttemptArtifactLayout,
     InvocationStart,
-    NetworkAccess,
     RepositoryAccess,
     required_execution_capabilities,
 )
@@ -70,7 +68,6 @@ _TICKET_PLACEHOLDER = "{{SNAPSHOTTED_TICKET}}"
 _IMPLEMENTATION_PROMPT_TEMPLATE = (
     Path(__file__).resolve().parent / "application" / "prompts" / "implement.md"
 )
-_AGENT_TIMEOUT_SECONDS = 60 * 60
 
 
 class ImplementationError(RunError):
@@ -246,10 +243,9 @@ def _run_implementation_stage(
         result_contract=IMPLEMENTATION_RESULT_CONTRACT,
         artifact_directory=implementation_dir,
         artifact_layout=AttemptArtifactLayout.for_attempt(run_path, implementation_dir),
-        policy=AgentExecutionPolicy(
-            timeout_seconds=_AGENT_TIMEOUT_SECONDS,
-            network_access=NetworkAccess.ALLOWED,
-        ),
+        policy=run_record.resolved_policy.task_policy(
+            AgentTaskKind.IMPLEMENTATION
+        ).execution_policy,
         required_capabilities=required_execution_capabilities(
             RepositoryAccess.WORKSPACE_WRITE
         ),

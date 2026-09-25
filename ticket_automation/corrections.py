@@ -11,13 +11,11 @@ from .application.agent_execution import (
     CORRECTION_RESULT_CONTRACT,
     CORRECTION_TICKET_FILE,
     AgentExecution,
-    AgentExecutionPolicy,
     AgentExecutionRequest,
     AgentExecutor,
     AgentTaskKind,
     AttemptArtifactLayout,
     InvocationStart,
-    NetworkAccess,
     RepositoryAccess,
     required_execution_capabilities,
 )
@@ -83,7 +81,6 @@ CORRECTION_TICKET_EXCERPT_CHARS = 1200
 _CORRECTION_PROMPT_TEMPLATE = (
     Path(__file__).resolve().parent / "application" / "prompts" / "correct.md"
 )
-_AGENT_TIMEOUT_SECONDS = 60 * 60
 
 
 class CorrectionError(RunError):
@@ -502,10 +499,9 @@ def _run_correction_stage(
         result_contract=CORRECTION_RESULT_CONTRACT,
         artifact_directory=artifact_directory,
         artifact_layout=AttemptArtifactLayout.for_attempt(run_path, artifact_directory),
-        policy=AgentExecutionPolicy(
-            timeout_seconds=_AGENT_TIMEOUT_SECONDS,
-            network_access=NetworkAccess.ALLOWED,
-        ),
+        policy=run_record.resolved_policy.task_policy(
+            AgentTaskKind.CORRECTION
+        ).execution_policy,
         required_capabilities=required_execution_capabilities(
             RepositoryAccess.WORKSPACE_WRITE
         ),

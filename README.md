@@ -48,9 +48,9 @@ dependency group.
 See [architecture boundaries](docs/architecture.md), [provider contract testing](docs/provider-contract-testing.md), and [release notes](docs/release-notes.md).
 
 `runner.max_correction_rounds` defaults to `1`. A versioned resolved run policy
-is persisted in `run.json`. It records all three task assignments, their access
-and capability requirements, and an adapter-owned payload for every assigned
-provider. Resume reconstructs executors only from that policy and the matching
+is persisted in `run.json`. It records all three task assignments, their access,
+capability, timeout, and network requirements, and an adapter-owned payload for
+every assigned provider. Resume reconstructs executors only from that policy and the matching
 registered adapter, so changing `config.local.toml` cannot change a run that
 already exists. Sandboxes are fixed by phase: implementation and
 correction use `workspace-write`; verification, review, and reporting are
@@ -151,5 +151,5 @@ the controller never follows an artifact path outside its own attempt.
 
 ## Persistence contract
 
-Runs use resolved-policy schema 2 and run-record schema 5. Records with other
+Runs use resolved-policy schema 3 and run-record schema 5. Records with other
 schema versions are unsupported and remain untouched on disk.

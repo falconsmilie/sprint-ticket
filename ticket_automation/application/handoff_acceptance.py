@@ -12,11 +12,13 @@ from ..attempts import (
     AttemptError,
     AttemptRecord,
     StageAttempt,
+    attempt_artifact_layout,
     load_attempt_records,
     require_stage_attempt,
     update_attempt,
 )
 from ..domain.task_results import ResultValidationError, ReviewVerdict
+from ..execution_evidence import read_execution_evidence
 from ..git import GitCommandError, GitRepository
 from ..git_safety import WorkspaceSnapshot
 from ..models import (
@@ -27,9 +29,19 @@ from ..models import (
     VerificationStatus,
     WorkflowState,
 )
-from ..persistence_codecs import PersistenceCodecError, read_review_result
+from ..persistence_codecs import (
+    PersistenceCodecError,
+    read_implementation_result,
+    read_review_result,
+)
 from ..runs import RunRecord
 from ..verification_evidence import read_verification_source_fingerprint
+from .agent_execution import (
+    EXECUTION_EVIDENCE_FILE,
+    AgentExecutionStatus,
+    AgentTaskKind,
+    InvocationStart,
+)
 from .ports.handoff import (
     FINAL_PATCH_FILE,
     FinalPatchCapture,
@@ -40,6 +52,11 @@ from .ports.handoff import (
 _PASSING_HANDOFF_MESSAGE = "Final workspace and evidence consistency checks passed."
 _HANDOFF_OUTCOME_SEAL = object()
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_AGENT_TASK_BY_PHASE = {
+    AttemptPhase.IMPLEMENTING: AgentTaskKind.IMPLEMENTATION,
+    AttemptPhase.REVIEWING: AgentTaskKind.REVIEW,
+    AttemptPhase.CORRECTING: AgentTaskKind.CORRECTION,
+}
 
 
 @dataclass(frozen=True)
@@ -542,6 +559,11 @@ def _read_policy_request(
     try:
         attempt_records = load_attempt_records(request.run_dir)
         attempts = tuple(_handoff_attempt_evidence(item) for item in attempt_records)
+        attempt_problem = _agent_execution_evidence_problem(
+            request.run_dir,
+            run_record,
+            attempt_records,
+        )
     except (AttemptError, OSError, TypeError, ValueError) as error:
         attempt_records = ()
         attempts = ()
@@ -638,6 +660,58 @@ def _read_policy_request(
         verification_problem=verification_problem,
         review_problem=review_problem,
     )
+
+
+def _agent_execution_evidence_problem(
+    run_dir: Path,
+    run_record: RunRecord,
+    attempts: tuple[AttemptRecord, ...],
+) -> str | None:
+    """Require neutral, policy-bound evidence for every completed agent task."""
+
+    for attempt in attempts:
+        task_kind = _AGENT_TASK_BY_PHASE.get(attempt.phase)
+        if task_kind is None or attempt.status is not AttemptStatus.COMPLETED:
+            continue
+        try:
+            if attempt.execution_path != EXECUTION_EVIDENCE_FILE:
+                raise ValueError(
+                    "attempt does not reference neutral execution evidence"
+                )
+            layout = attempt_artifact_layout(run_dir, attempt)
+            evidence = read_execution_evidence(layout)
+            expected = run_record.resolved_policy.task_policy(task_kind)
+            if evidence.provider_id != expected.provider_id:
+                raise ValueError("provider identity does not match resolved policy")
+            if evidence.task_kind is not task_kind:
+                raise ValueError("task kind does not match the attempt phase")
+            if evidence.repository_access is not expected.repository_access:
+                raise ValueError("repository access does not match resolved policy")
+            if evidence.required_capabilities != expected.required_capabilities:
+                raise ValueError("capabilities do not match resolved policy")
+            if (
+                evidence.status is not AgentExecutionStatus.SUCCESS
+                or evidence.invocation_start is not InvocationStart.STARTED
+                or not attempt.process_started
+            ):
+                raise ValueError("completed agent attempt is not a started success")
+            if evidence.typed_result_artifact is None:
+                raise ValueError("typed result artifact reference is missing")
+            layout.resolve(evidence.typed_result_artifact, require_exists=True)
+            if task_kind is AgentTaskKind.REVIEW:
+                stage_result = read_review_result(run_dir, attempt)
+            else:
+                stage_result = read_implementation_result(run_dir, attempt)
+            if stage_result is None or stage_result != evidence.typed_result:
+                raise ValueError(
+                    "typed stage result does not match neutral execution evidence"
+                )
+        except (AttemptError, OSError, RuntimeError, TypeError, ValueError) as error:
+            return (
+                f"Agent execution evidence is invalid for attempt "
+                f"{attempt.sequence}: {error}"
+            )
+    return None
 
 
 def _latest_attempt(

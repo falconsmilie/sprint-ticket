@@ -212,6 +212,11 @@ def test_mixed_codex_write_and_scripted_review_assignments_survive_resume(
     assert [request.task_kind for request in scripted.observation.requests] == [
         AgentTaskKind.REVIEW
     ]
+    review_request = scripted.observation.requests[0]
+    stored_review_policy = persisted.task_policy(AgentTaskKind.REVIEW).execution_policy
+    assert review_request.policy == stored_review_policy
+    assert review_request.policy.timeout_seconds == stored_review_policy.timeout_seconds
+    assert review_request.policy.network_access is stored_review_policy.network_access
     report = (result.run_dir / "report.md").read_text(encoding="utf-8")
     assert "Provider codex-cli: success" in report
     assert f"Provider {SCRIPTED_PROVIDER_ID}: success" in report
@@ -278,6 +283,16 @@ def test_scripted_provider_can_own_both_writable_tasks_and_generic_reporting(
         AgentTaskKind.IMPLEMENTATION,
         AgentTaskKind.CORRECTION,
     ]
+    persisted = load_run_record(result.run_dir / "run.json").resolved_policy
+    observed_requests = {
+        request.task_kind: request for request in scripted.observation.requests
+    }
+    for task_kind in (AgentTaskKind.IMPLEMENTATION, AgentTaskKind.CORRECTION):
+        observed_policy = observed_requests[task_kind].policy
+        stored_policy = persisted.task_policy(task_kind).execution_policy
+        assert observed_policy == stored_policy
+        assert observed_policy.timeout_seconds == stored_policy.timeout_seconds
+        assert observed_policy.network_access is stored_policy.network_access
     diagnostics = tuple(result.run_dir.rglob("scripted-provider-diagnostic.json"))
     assert bool(diagnostics) is emit_native_diagnostic
     report = (result.run_dir / "report.md").read_text(encoding="utf-8")

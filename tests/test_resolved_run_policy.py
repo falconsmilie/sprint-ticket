@@ -9,7 +9,9 @@ import pytest
 from tests.helpers import create_git_repo
 from ticket_automation.application.agent_execution import (
     AgentCapability,
+    AgentExecutionPolicy,
     AgentTaskKind,
+    NetworkAccess,
     ProviderId,
     RepositoryAccess,
 )
@@ -115,6 +117,12 @@ def test_round_trip_with_one_provider_assigned_to_every_task(tmp_path):
     assert loaded == resolved
     assert loaded.assignments == {kind: provider_id for kind in AgentTaskKind}
     assert [item.provider_id for item in loaded.provider_policies] == [provider_id]
+    assert loaded.task_policy(AgentTaskKind.REVIEW).execution_policy == (
+        AgentExecutionPolicy(3600, NetworkAccess.DENIED)
+    )
+    assert loaded.task_policy(AgentTaskKind.IMPLEMENTATION).execution_policy == (
+        AgentExecutionPolicy(3600, NetworkAccess.ALLOWED)
+    )
 
 
 def test_round_trip_and_executor_selection_with_distinct_task_providers(tmp_path):
@@ -198,6 +206,58 @@ def test_missing_capability_fails_during_core_policy_decode(tmp_path):
     capabilities.remove(AgentCapability.WORKSPACE_WRITE_EXECUTION.value)
 
     with pytest.raises(ResolvedRunPolicyError, match="lacks capabilities required"):
+        ResolvedRunPolicy.from_dict(data)
+
+
+@pytest.mark.parametrize(
+    ("task_kind", "field", "value"),
+    [
+        ("implementation", "timeout_seconds", 0),
+        ("implementation", "network_access", "denied"),
+        ("review", "network_access", "allowed"),
+    ],
+)
+def test_tampered_agent_execution_policy_fails_during_core_decode(
+    tmp_path,
+    task_kind,
+    field,
+    value,
+):
+    resolved, _ = _shared_policy(tmp_path)
+    data = resolved.to_dict()
+    data["tasks"][task_kind]["execution_policy"][field] = value
+
+    with pytest.raises(ResolvedRunPolicyError, match="execution_policy|incompatible"):
+        ResolvedRunPolicy.from_dict(data)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda execution_policy: execution_policy.pop("timeout_seconds"),
+            "missing timeout_seconds",
+        ),
+        (
+            lambda execution_policy: execution_policy.update(
+                {"sandbox": "workspace-write"}
+            ),
+            "unexpected sandbox",
+        ),
+    ],
+    ids=["missing-field", "unexpected-field"],
+)
+def test_execution_policy_codec_requires_exact_nested_fields(
+    tmp_path,
+    mutate,
+    message,
+):
+    resolved, _ = _shared_policy(tmp_path)
+    data = resolved.to_dict()
+    execution_policy = data["tasks"]["implementation"]["execution_policy"]
+    mutate(execution_policy)
+
+    with pytest.raises(ResolvedRunPolicyError, match=message):
         ResolvedRunPolicy.from_dict(data)
 
 
@@ -348,6 +408,7 @@ def test_trusted_task_policy_construction_rejects_incompatible_requirements():
             provider_id=ProviderId("shared"),
             repository_access=RepositoryAccess.WORKSPACE_WRITE,
             required_capabilities=ALL_CAPABILITIES,
+            execution_policy=AgentExecutionPolicy(3600, NetworkAccess.DENIED),
         )
 
 

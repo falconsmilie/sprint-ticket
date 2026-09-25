@@ -506,6 +506,7 @@ class ProviderContractTests:
         assert decoded.task_kind is task_kind
         assert decoded.status is AgentExecutionStatus.SUCCESS
         assert decoded.invocation_start is InvocationStart.STARTED
+        assert decoded.typed_result == execution.result
         assert decoded.typed_result_artifact is not None
 
         assert request.artifact_layout is not None

@@ -494,13 +494,6 @@ class GuardedWritableOperation:
                 request.execution_request,
                 on_invocation_start=tracker.mark_started,
             )
-            layout = request.execution_request.artifact_layout
-            assert layout is not None
-            write_execution_evidence(
-                layout,
-                evidence_from_execution(request.execution_request, execution),
-            )
-            tracker._update(execution_path=EXECUTION_EVIDENCE_FILE)
             if execution.invocation_start is not InvocationStart.UNKNOWN:
                 tracker.record_started(
                     execution.invocation_start is InvocationStart.STARTED
@@ -509,7 +502,14 @@ class GuardedWritableOperation:
                 execution, request.execution_request
             )
             if contract_problem is not None:
-                execution_error = ValueError(contract_problem)
+                raise ValueError(contract_problem)
+            layout = request.execution_request.artifact_layout
+            assert layout is not None
+            write_execution_evidence(
+                layout,
+                evidence_from_execution(request.execution_request, execution),
+            )
+            tracker._update(execution_path=EXECUTION_EVIDENCE_FILE)
         except BaseException as error:  # noqa: BLE001 - interruption must fail closed.
             execution_error = error
         finally:

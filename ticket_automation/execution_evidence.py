@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
+from math import isclose, isfinite
 from types import MappingProxyType
 
 from .application.agent_execution import (
@@ -23,7 +24,12 @@ from .application.agent_execution import (
     RepositoryAccess,
     validate_execution_semantics,
 )
-from .domain.task_results import TaskResult
+from .domain.task_results import (
+    ImplementationResult,
+    ResultValidationError,
+    ReviewResult,
+    TaskResult,
+)
 from .persistence import (
     CodecError,
     JsonObject,
@@ -33,8 +39,14 @@ from .persistence import (
     parse_timestamp,
     read_json_object,
 )
+from .task_result_codecs import (
+    decode_implementation_result,
+    decode_review_result,
+    encode_implementation_result,
+    encode_review_result,
+)
 
-EXECUTION_EVIDENCE_SCHEMA_VERSION = 1
+EXECUTION_EVIDENCE_SCHEMA_VERSION = 2
 EXECUTION_EVIDENCE_FORMAT = "ticket_automation.execution_evidence"
 
 
@@ -51,6 +63,7 @@ class ExecutionEvidence:
     duration_seconds: float
     status: AgentExecutionStatus
     invocation_start: InvocationStart
+    typed_result: TaskResult | None = None
     failure_category: AgentFailureCategory | None = None
     failure_message: str | None = None
     typed_result_artifact: ArtifactReference | None = None
@@ -60,7 +73,10 @@ class ExecutionEvidence:
     format: str = EXECUTION_EVIDENCE_FORMAT
 
     def __post_init__(self) -> None:
-        if self.schema_version != EXECUTION_EVIDENCE_SCHEMA_VERSION:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != EXECUTION_EVIDENCE_SCHEMA_VERSION
+        ):
             raise CodecError("Execution evidence has an unsupported schema version.")
         if self.format != EXECUTION_EVIDENCE_FORMAT:
             raise CodecError("Execution evidence has an unsupported format.")
@@ -84,16 +100,38 @@ class ExecutionEvidence:
             raise CodecError("status must be an AgentExecutionStatus.")
         if not isinstance(self.invocation_start, InvocationStart):
             raise CodecError("invocation_start must be an InvocationStart.")
+        expected_execution_id = f"{self.attempt_id}:{self.task_kind.value}"
+        if self.execution_id != expected_execution_id:
+            raise CodecError(
+                "execution_id must identify the owning attempt and task kind."
+            )
+        for field_name, timestamp in (
+            ("started_at", self.started_at),
+            ("ended_at", self.ended_at),
+        ):
+            if (
+                not isinstance(timestamp, datetime)
+                or timestamp.tzinfo is None
+                or timestamp.utcoffset() is None
+            ):
+                raise CodecError(f"{field_name} must be a timezone-aware datetime.")
         if self.ended_at < self.started_at:
             raise CodecError("ended_at must not precede started_at.")
-        if (
-            abs(
-                (self.ended_at - self.started_at).total_seconds()
-                - self.duration_seconds
-            )
-            > 1e-6
+        if isinstance(self.duration_seconds, bool) or not isinstance(
+            self.duration_seconds, (int, float)
+        ):
+            raise CodecError("duration_seconds must be a number.")
+        if not isfinite(self.duration_seconds) or self.duration_seconds < 0:
+            raise CodecError("duration_seconds must be finite and not negative.")
+        elapsed_seconds = (self.ended_at - self.started_at).total_seconds()
+        if not isclose(
+            float(self.duration_seconds),
+            elapsed_seconds,
+            rel_tol=0,
+            abs_tol=1e-6,
         ):
             raise CodecError("duration_seconds must match the execution timestamps.")
+        object.__setattr__(self, "duration_seconds", float(self.duration_seconds))
         if self.typed_result_artifact is not None and (
             not isinstance(self.typed_result_artifact, ArtifactReference)
             or self.typed_result_artifact.role is not ArtifactRole.TYPED_RESULT
@@ -103,6 +141,24 @@ class ExecutionEvidence:
             isinstance(item, ArtifactReference) for item in self.artifacts
         ):
             raise CodecError("artifacts must be ArtifactReference values.")
+        roles = tuple(item.role for item in self.artifacts)
+        if len(roles) != len(set(roles)):
+            raise CodecError("artifacts must not contain duplicate roles.")
+        if ArtifactRole.TYPED_RESULT in roles:
+            raise CodecError(
+                "typed-result must use the dedicated typed_result_artifact field."
+            )
+        if self.status is AgentExecutionStatus.SUCCESS:
+            if not _task_result_matches(self.task_kind, self.typed_result):
+                raise CodecError(
+                    "successful evidence must contain the typed result for its task."
+                )
+            if self.typed_result_artifact is None:
+                raise CodecError(
+                    "successful evidence must reference its typed result artifact."
+                )
+        elif self.typed_result is not None:
+            raise CodecError("failed evidence must not contain a typed result.")
         try:
             validate_execution_semantics(
                 status=self.status,
@@ -145,6 +201,7 @@ def evidence_from_execution(
         duration_seconds=execution.duration_seconds,
         status=execution.status,
         invocation_start=execution.invocation_start,
+        typed_result=execution.result,
         failure_category=execution.failure_category,
         failure_message=execution.failure_message,
         typed_result_artifact=typed,
@@ -193,6 +250,7 @@ def encode_execution_evidence(evidence: ExecutionEvidence) -> JsonObject:
         "duration_seconds": evidence.duration_seconds,
         "status": evidence.status.value,
         "invocation_start": evidence.invocation_start.value,
+        "typed_result": _encode_task_result(evidence.typed_result),
         "failure": None
         if evidence.failure_category is None
         else {
@@ -226,6 +284,7 @@ def decode_execution_evidence(
             "duration_seconds",
             "status",
             "invocation_start",
+            "typed_result",
             "failure",
             "typed_result_artifact",
             "artifacts",
@@ -268,13 +327,14 @@ def decode_execution_evidence(
         provider_id = ProviderId(_string(data["provider_id"], "provider_id"))
     except ValueError as error:
         raise CodecError(str(error)) from error
+    task_kind = _enum(AgentTaskKind, data["task_kind"], "task_kind")
     evidence = ExecutionEvidence(
         schema_version=data["schema_version"],
         format=data["format"],
         execution_id=_string(data["execution_id"], "execution_id"),
         attempt_id=_string(data["attempt_id"], "attempt_id"),
         provider_id=provider_id,
-        task_kind=_enum(AgentTaskKind, data["task_kind"], "task_kind"),
+        task_kind=task_kind,
         repository_access=_enum(
             RepositoryAccess,
             data["requested_repository_access"],
@@ -288,6 +348,7 @@ def decode_execution_evidence(
         invocation_start=_enum(
             InvocationStart, data["invocation_start"], "invocation_start"
         ),
+        typed_result=_decode_task_result(data["typed_result"], task_kind),
         failure_category=failure_category,
         failure_message=failure_message,
         typed_result_artifact=typed,
@@ -310,6 +371,40 @@ def decode_execution_evidence(
             except ValueError as error:
                 raise CodecError(str(error)) from error
     return evidence
+
+
+def _task_result_matches(task_kind: AgentTaskKind, value: object) -> bool:
+    if task_kind is AgentTaskKind.REVIEW:
+        return type(value) is ReviewResult
+    if task_kind in {AgentTaskKind.IMPLEMENTATION, AgentTaskKind.CORRECTION}:
+        return type(value) is ImplementationResult
+    return False
+
+
+def _encode_task_result(result: TaskResult | None) -> JsonObject | None:
+    if result is None:
+        return None
+    if isinstance(result, ImplementationResult):
+        return encode_implementation_result(result)
+    if isinstance(result, ReviewResult):
+        return encode_review_result(result)
+    raise CodecError("execution evidence contains an unsupported typed result.")
+
+
+def _decode_task_result(
+    value: object,
+    task_kind: AgentTaskKind,
+) -> TaskResult | None:
+    if value is None:
+        return None
+    try:
+        if task_kind is AgentTaskKind.REVIEW:
+            return decode_review_result(value)
+        return decode_implementation_result(value)
+    except ResultValidationError as error:
+        raise CodecError(
+            f"execution evidence typed_result is invalid: {error}"
+        ) from error
 
 
 def _encode_artifact(reference: ArtifactReference | None) -> JsonObject | None:

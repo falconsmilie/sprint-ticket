@@ -9,14 +9,12 @@ from typing import Any
 from .application.agent_execution import (
     REVIEW_RESULT_CONTRACT,
     AgentExecution,
-    AgentExecutionPolicy,
     AgentExecutionRequest,
     AgentExecutor,
     AgentFailureCategory,
     AgentTaskKind,
     AttemptArtifactLayout,
     InvocationStart,
-    NetworkAccess,
     RepositoryAccess,
     required_execution_capabilities,
 )
@@ -69,7 +67,6 @@ from .runs import (
     load_baseline_record,
     load_run_record,
 )
-from .task_result_codecs import decode_review_result
 from .verification_evidence import (
     read_verification_result_text,
     read_verification_source_fingerprint,
@@ -78,7 +75,6 @@ from .verification_evidence import (
 _REVIEW_PROMPT_TEMPLATE = (
     Path(__file__).resolve().parent / "application" / "prompts" / "review.md"
 )
-_AGENT_TIMEOUT_SECONDS = 60 * 60
 
 
 class ReviewError(RunError):
@@ -330,10 +326,9 @@ def _run_review_stage(
         result_contract=REVIEW_RESULT_CONTRACT,
         artifact_directory=artifact_directory,
         artifact_layout=AttemptArtifactLayout.for_attempt(run_path, artifact_directory),
-        policy=AgentExecutionPolicy(
-            timeout_seconds=_AGENT_TIMEOUT_SECONDS,
-            network_access=NetworkAccess.DENIED,
-        ),
+        policy=run_record.resolved_policy.task_policy(
+            AgentTaskKind.REVIEW
+        ).execution_policy,
         required_capabilities=required_execution_capabilities(
             RepositoryAccess.READ_ONLY
         ),
@@ -405,12 +400,6 @@ def _run_review_stage(
         execution=execution,
         review_result=review_result,
     )
-
-
-def _validate_review_result_artifact(value: Any) -> ReviewResult:
-    """Validate persisted review evidence before it influences final handoff."""
-
-    return decode_review_result(value)
 
 
 def _finish_valid_review_result(

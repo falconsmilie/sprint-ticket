@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -21,7 +22,9 @@ from ticket_automation.application.agent_execution import (
     RepositoryAccess,
 )
 from ticket_automation.attempts import attempt_result_path, start_attempt
+from ticket_automation.domain.task_results import ReviewResult, ReviewVerdict
 from ticket_automation.execution_evidence import (
+    EXECUTION_EVIDENCE_SCHEMA_VERSION,
     ExecutionEvidence,
     decode_execution_evidence,
     encode_execution_evidence,
@@ -87,6 +90,15 @@ def _evidence(
             AgentExecutionStatus.SUCCESS if successful else AgentExecutionStatus.FAILED
         ),
         invocation_start=InvocationStart.STARTED,
+        typed_result=(
+            ReviewResult(
+                verdict=ReviewVerdict.PASS,
+                summary="Review passed.",
+                findings=(),
+            )
+            if successful
+            else None
+        ),
         failure_category=(
             None if successful else AgentFailureCategory.NON_SUCCESSFUL_EXECUTION
         ),
@@ -124,9 +136,58 @@ def test_execution_evidence_round_trips_for_multiple_providers(
     assert reference.role is ArtifactRole.EXECUTION_EVIDENCE
     assert actual.provider_id == expected.provider_id
     assert actual.status is expected.status
+    assert actual.typed_result == expected.typed_result
     assert actual.typed_result_artifact == expected.typed_result_artifact
     assert actual.artifacts == expected.artifacts
     assert actual.provider_metadata == expected.provider_metadata
+    assert actual == expected
+    assert type(actual.duration_seconds) is float
+
+
+@pytest.mark.parametrize(
+    "schema_version",
+    [True, float(EXECUTION_EVIDENCE_SCHEMA_VERSION)],
+)
+def test_execution_evidence_construction_requires_an_exact_integer_schema(
+    tmp_path: Path,
+    schema_version: object,
+) -> None:
+    evidence = _evidence(_layout(tmp_path), provider="provider-alpha", successful=True)
+
+    with pytest.raises(CodecError, match="unsupported schema version"):
+        replace(evidence, schema_version=schema_version)
+
+
+@pytest.mark.parametrize("field", ["started_at", "ended_at"])
+def test_execution_evidence_construction_rejects_naive_timestamps(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    evidence = _evidence(_layout(tmp_path), provider="provider-alpha", successful=True)
+    naive = evidence.started_at.replace(tzinfo=None)
+
+    with pytest.raises(CodecError, match=rf"{field} must be a timezone-aware"):
+        replace(evidence, **{field: naive})
+
+
+@pytest.mark.parametrize(
+    ("duration", "message"),
+    [
+        (True, "must be a number"),
+        (float("nan"), "must be finite"),
+        (float("inf"), "must be finite"),
+        (-1.0, "must be finite and not negative"),
+    ],
+)
+def test_execution_evidence_construction_rejects_invalid_durations(
+    tmp_path: Path,
+    duration: object,
+    message: str,
+) -> None:
+    evidence = _evidence(_layout(tmp_path), provider="provider-alpha", successful=True)
+
+    with pytest.raises(CodecError, match=message):
+        replace(evidence, duration_seconds=duration)
 
 
 @pytest.mark.parametrize(
@@ -188,6 +249,68 @@ def test_execution_codec_rejects_wrong_typed_result_role(tmp_path: Path) -> None
 
     with pytest.raises(CodecError, match="typed-result"):
         decode_execution_evidence(payload, layout=layout)
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (lambda payload: payload.update({"typed_result": None}), "typed result"),
+        (
+            lambda payload: payload.update(
+                {"execution_id": f"{payload['attempt_id']}:implementation"}
+            ),
+            "execution_id",
+        ),
+        (
+            lambda payload: payload.update({"typed_result_artifact": None}),
+            "typed result artifact",
+        ),
+    ],
+    ids=["missing-result", "wrong-execution-id", "missing-result-artifact"],
+)
+def test_successful_execution_evidence_rejects_internal_drift(
+    tmp_path: Path,
+    change,
+    message: str,
+) -> None:
+    layout = _layout(tmp_path)
+    payload = encode_execution_evidence(
+        _evidence(layout, provider="provider-alpha", successful=True)
+    )
+    change(payload)
+
+    with pytest.raises(CodecError, match=message):
+        decode_execution_evidence(payload, layout=layout)
+
+
+def test_execution_codec_rejects_a_result_for_the_wrong_task_kind(
+    tmp_path: Path,
+) -> None:
+    layout = _layout(tmp_path)
+    payload = encode_execution_evidence(
+        _evidence(layout, provider="provider-alpha", successful=True)
+    )
+    payload["task_kind"] = AgentTaskKind.IMPLEMENTATION.value
+    payload["execution_id"] = f"{layout.attempt_id}:implementation"
+
+    with pytest.raises(CodecError, match="typed_result is invalid"):
+        decode_execution_evidence(payload, layout=layout)
+
+
+def test_execution_codec_rejects_failed_evidence_carrying_a_result(
+    tmp_path: Path,
+) -> None:
+    layout = _layout(tmp_path)
+    successful = encode_execution_evidence(
+        _evidence(layout, provider="provider-alpha", successful=True)
+    )
+    failed = encode_execution_evidence(
+        _evidence(layout, provider="provider-alpha", successful=False)
+    )
+    failed["typed_result"] = successful["typed_result"]
+
+    with pytest.raises(CodecError, match="failed evidence must not contain"):
+        decode_execution_evidence(failed, layout=layout)
 
 
 def test_execution_codec_rejects_unknown_artifact_role(tmp_path: Path) -> None:

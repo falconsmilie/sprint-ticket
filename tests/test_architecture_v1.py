@@ -24,6 +24,7 @@ from tests.helpers import (
 )
 from ticket_automation.application.agent_execution import (
     AgentTaskKind,
+    ProviderId,
     RepositoryAccess,
     required_execution_capabilities,
 )
@@ -813,6 +814,7 @@ def test_one_correction_round_preserves_the_ordinary_lifecycle(tmp_path):
                 ),
             },
             capabilities=capabilities,
+            provider_id=ProviderId("codex-cli"),
         )
     )
 

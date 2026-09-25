@@ -21,6 +21,7 @@ from ticket_automation.application.agent_execution import (
     AgentExecutionStatus,
     AgentFailureCategory,
     AgentTaskKind,
+    ArtifactRole,
     InvocationStart,
     NetworkAccess,
     ProviderId,
@@ -41,7 +42,7 @@ from ticket_automation.application.guarded_writable_operation import (
     WritableSucceeded,
 )
 from ticket_automation.attempts import (
-    finish_phase_attempt,
+    complete_stage_attempt,
     load_attempt_records,
     start_attempt,
 )
@@ -52,6 +53,7 @@ from ticket_automation.domain.task_results import (
 from ticket_automation.git import GitRepository
 from ticket_automation.git_safety import WorkspaceSnapshot
 from ticket_automation.models import AttemptPhase, StageOutcome
+from ticket_automation.task_result_codecs import encode_implementation_result
 
 _PROVIDER_ID = ProviderId("guard-matrix")
 _NOW = datetime(2026, 9, 22, 10, 0, tzinfo=UTC)
@@ -112,6 +114,20 @@ class MatrixExecutor:
                 InvocationStart.STARTED,
                 AgentFailureCategory.NON_SUCCESSFUL_EXECUTION,
             )
+        result = ImplementationResult(
+            ImplementationStatus.COMPLETED,
+            "completed",
+            (),
+            (),
+            (),
+        )
+        layout = request.artifact_layout
+        assert layout is not None
+        typed_result_path = layout.named_path(ArtifactRole.TYPED_RESULT)
+        typed_result_path.write_text(
+            json.dumps(encode_implementation_result(result)),
+            encoding="utf-8",
+        )
         return AgentExecution(
             provider_id=_PROVIDER_ID,
             task_kind=request.task_kind,
@@ -120,13 +136,8 @@ class MatrixExecutor:
             started_at=_NOW,
             ended_at=_NOW,
             duration_seconds=0,
-            result=ImplementationResult(
-                ImplementationStatus.COMPLETED,
-                "completed",
-                (),
-                (),
-                (),
-            ),
+            result=result,
+            artifacts=(layout.reference(ArtifactRole.TYPED_RESULT, typed_result_path),),
         )
 
 
@@ -814,10 +825,14 @@ def test_service_returns_typed_safety_stop_when_attempt_is_no_longer_started(
         AgentTaskKind.IMPLEMENTATION,
         AttemptPhase.IMPLEMENTING,
     )
-    finish_phase_attempt(
-        request.execution_request.artifact_directory.parent.parent,
-        phase=AttemptPhase.IMPLEMENTING,
+    run_dir = request.execution_request.artifact_directory.parent.parent
+    active_attempt = load_attempt_records(run_dir)[-1]
+    complete_stage_attempt(
+        run_dir,
+        active_attempt,
         stage_outcome=StageOutcome.FAILED,
+        after_workspace_fingerprint=None,
+        process_started=False,
     )
     historical_guard = request.execution_request.artifact_directory / (
         "workspace-guard.json"

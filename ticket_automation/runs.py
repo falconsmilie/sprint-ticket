@@ -41,6 +41,42 @@ RUNS_DIR_NAME = "runs"
 RUN_RECORD_FILE = "run.json"
 BASELINE_RECORD_FILE = "baseline.json"
 RUN_TICKET_FILE = "ticket.md"
+_BASELINE_RECORD_FIELDS = frozenset(
+    {
+        "schema_version",
+        "format",
+        "repository_path",
+        "branch",
+        "head_sha",
+        "clean_worktree",
+        "has_staged_files",
+        "staging_status",
+        "ticket_sha256",
+        "verification_commands_fingerprint",
+        "workspace_fingerprint",
+        "snapshot_timestamp",
+    }
+)
+_RUN_RECORD_FIELDS = frozenset(
+    {
+        "schema_version",
+        "format",
+        "run_id",
+        "ticket_id",
+        "original_ticket_path",
+        "run_ticket_copy_path",
+        "state",
+        "starting_branch",
+        "baseline_sha",
+        "current_correction_round",
+        "current_review_round",
+        "resolved_policy",
+        "terminal_reason",
+        "stop_reason",
+        "created_timestamp",
+        "updated_timestamp",
+    }
+)
 
 
 class RunError(RuntimeError):
@@ -139,6 +175,11 @@ class BaselineRecord:
             data,
             "format",
             expected=BASELINE_RECORD_FORMAT,
+        )
+        _require_exact_fields(
+            data,
+            _BASELINE_RECORD_FIELDS,
+            record_name="Baseline record",
         )
         return cls(
             schema_version=schema_version,
@@ -289,6 +330,7 @@ class RunRecord:
             "format",
             expected=RUN_RECORD_FORMAT,
         )
+        _require_exact_fields(data, _RUN_RECORD_FIELDS, record_name="Run record")
         try:
             return cls(
                 schema_version=schema_version,
@@ -304,16 +346,13 @@ class RunRecord:
                     data,
                     "current_correction_round",
                 ),
-                current_review_round=_optional_non_negative_int(
+                current_review_round=_require_non_negative_int(
                     data,
                     "current_review_round",
-                    default=0,
                 ),
-                resolved_policy=ResolvedRunPolicy.from_dict(
-                    data.get("resolved_policy")
-                ),
-                terminal_reason=_optional_nullable_string(data, "terminal_reason"),
-                stop_reason=_optional_stop_reason(data),
+                resolved_policy=ResolvedRunPolicy.from_dict(data["resolved_policy"]),
+                terminal_reason=_require_nullable_string(data, "terminal_reason"),
+                stop_reason=_require_stop_reason(data),
                 created_timestamp=_require_string(data, "created_timestamp"),
                 updated_timestamp=_require_string(data, "updated_timestamp"),
             )
@@ -620,24 +659,8 @@ def _require_non_negative_int(data: dict[str, Any], key: str) -> int:
     return value
 
 
-def _optional_int(data: dict[str, Any], key: str, *, default: int) -> int:
-    if key not in data:
-        return default
+def _require_nullable_string(data: dict[str, Any], key: str) -> str | None:
     value = data[key]
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise RunError(f"Run record field must be an integer: {key}")
-    return value
-
-
-def _optional_non_negative_int(data: dict[str, Any], key: str, *, default: int) -> int:
-    value = _optional_int(data, key, default=default)
-    if value < 0:
-        raise RunError(f"Run record field must be a non-negative integer: {key}")
-    return value
-
-
-def _optional_nullable_string(data: dict[str, Any], key: str) -> str | None:
-    value = data.get(key)
     if value is None:
         return None
     if not isinstance(value, str) or not value:
@@ -645,12 +668,17 @@ def _optional_nullable_string(data: dict[str, Any], key: str) -> str | None:
     return value
 
 
-def _optional_stop_reason(data: dict[str, Any]) -> StopReason | None:
-    value = data.get("stop_reason")
+def _require_stop_reason(data: dict[str, Any]) -> StopReason | None:
+    value = data["stop_reason"]
     if value is None:
         return None
     if not isinstance(value, dict):
         raise RunError("Run record field must be an object or null: stop_reason")
+    _require_exact_fields(
+        value,
+        frozenset({"category", "message", "retryable"}),
+        record_name="Run record stop_reason",
+    )
     category_value = _require_nested_string(value, "stop_reason", "category")
     try:
         category = StopCategory(category_value)
@@ -721,6 +749,25 @@ def _require_sha256(data: dict[str, Any], key: str) -> str:
     if re.fullmatch(r"[0-9a-f]{64}", value) is None:
         raise RunError(f"Run record field must be a lowercase SHA-256 digest: {key}")
     return value
+
+
+def _require_exact_fields(
+    data: dict[str, Any],
+    expected: frozenset[str],
+    *,
+    record_name: str,
+) -> None:
+    actual = set(data)
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - expected)
+    if not missing and not unexpected:
+        return
+    details: list[str] = []
+    if missing:
+        details.append("missing " + ", ".join(missing))
+    if unexpected:
+        details.append("unexpected " + ", ".join(unexpected))
+    raise RunError(f"{record_name} fields are invalid: {'; '.join(details)}.")
 
 
 __all__ = [

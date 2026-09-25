@@ -357,6 +357,47 @@ def test_baseline_record_rejects_unsupported_schema_metadata(
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
 @pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda data: data.pop("workspace_fingerprint"),
+            "missing workspace_fingerprint",
+        ),
+        (
+            lambda data: data.update({"legacy_repository": "repository"}),
+            "unexpected legacy_repository",
+        ),
+    ],
+    ids=["missing-field", "unknown-legacy-field"],
+)
+def test_baseline_record_requires_exact_fields_without_rewriting(
+    tmp_path,
+    mutate,
+    message,
+):
+    repo = create_git_repo(tmp_path / "repo")
+    ticket = tmp_path / "QDEB-003.md"
+    ticket.write_text("# Ticket\n", encoding="utf-8")
+    result = create_test_run_snapshot(
+        make_config(repo),
+        ticket,
+        runs_dir=tmp_path / "runs",
+        clock=fixed_clock,
+    )
+    record_path = result.run_dir / "baseline.json"
+    data = json.loads(record_path.read_text(encoding="utf-8"))
+    mutate(data)
+    record_path.write_text(json.dumps(data), encoding="utf-8")
+    rejected_contents = record_path.read_bytes()
+
+    with pytest.raises(RunError, match=message):
+        load_baseline_record(record_path)
+
+    assert record_path.read_bytes() == rejected_contents
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
+@pytest.mark.parametrize(
     "field",
     [
         "ticket_sha256",
@@ -496,6 +537,14 @@ def test_run_record_persists_one_complete_resolved_execution_snapshot(tmp_path):
     assert resolved["target_repository"]["protected_branches"] == ["main", "release"]
     assert set(resolved["tasks"]) == {"implementation", "review", "correction"}
     assert {task["provider_id"] for task in resolved["tasks"].values()} == {"codex-cli"}
+    assert resolved["tasks"]["implementation"]["execution_policy"] == {
+        "timeout_seconds": 3600.0,
+        "network_access": "allowed",
+    }
+    assert resolved["tasks"]["review"]["execution_policy"] == {
+        "timeout_seconds": 3600.0,
+        "network_access": "denied",
+    }
     provider = resolved["providers"]["codex-cli"]
     assert provider["provider_id"] == "codex-cli"
     assert provider["adapter_policy_version"] == "1"
@@ -541,7 +590,7 @@ def test_composition_rejects_executable_without_ephemeral_support(tmp_path):
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
-        (lambda data: data.pop("resolved_policy"), "resolved_policy must be an object"),
+        (lambda data: data.pop("resolved_policy"), "missing resolved_policy"),
         (
             lambda data: data["resolved_policy"]["tasks"]["review"].update(
                 {"repository_access": "workspace-write"}
@@ -590,7 +639,11 @@ def test_run_record_rejects_missing_or_incompatible_resolved_policy(
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
-def test_run_record_loads_optional_lifecycle_fields(tmp_path):
+@pytest.mark.parametrize(
+    "field",
+    ["current_review_round", "terminal_reason", "stop_reason"],
+)
+def test_run_record_rejects_missing_lifecycle_fields(tmp_path, field):
     repo = create_git_repo(tmp_path / "repo")
     ticket = tmp_path / "QDEB-003.md"
     ticket.write_text("# Ticket\n", encoding="utf-8")
@@ -602,15 +655,64 @@ def test_run_record_loads_optional_lifecycle_fields(tmp_path):
     )
     record_path = result.run_dir / "run.json"
     data = json.loads(record_path.read_text(encoding="utf-8"))
-    del data["current_review_round"]
-    del data["terminal_reason"]
+    del data[field]
     record_path.write_text(json.dumps(data), encoding="utf-8")
 
-    record = load_run_record(record_path)
+    with pytest.raises(RunError, match=f"missing {field}"):
+        load_run_record(record_path)
 
-    assert not hasattr(record, "last_completed_state")
-    assert record.current_review_round == 0
-    assert record.terminal_reason is None
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
+def test_run_record_rejects_unknown_fields(tmp_path):
+    repo = create_git_repo(tmp_path / "repo")
+    ticket = tmp_path / "QDEB-003.md"
+    ticket.write_text("# Ticket\n", encoding="utf-8")
+    result = create_test_run_snapshot(
+        make_config(repo),
+        ticket,
+        runs_dir=tmp_path / "runs",
+        clock=fixed_clock,
+    )
+    record_path = result.run_dir / "run.json"
+    data = json.loads(record_path.read_text(encoding="utf-8"))
+    data["legacy_state"] = "PREPARED"
+    record_path.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(RunError, match="unexpected legacy_state"):
+        load_run_record(record_path)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda reason: reason.pop("retryable"),
+            "missing retryable",
+        ),
+        (
+            lambda reason: reason.update({"legacy_code": "STOP"}),
+            "unexpected legacy_code",
+        ),
+    ],
+    ids=["missing-field", "unknown-field"],
+)
+def test_run_record_stop_reason_requires_exact_fields_without_rewriting(
+    tmp_path,
+    mutate,
+    message,
+):
+    record_path = tmp_path / "run.json"
+    data = trusted_run_record(WorkflowState.FAILED).to_dict()
+    stop_reason = data["stop_reason"]
+    assert isinstance(stop_reason, dict)
+    mutate(stop_reason)
+    record_path.write_text(json.dumps(data), encoding="utf-8")
+    rejected_contents = record_path.read_bytes()
+
+    with pytest.raises(RunError, match=message):
+        load_run_record(record_path)
+
+    assert record_path.read_bytes() == rejected_contents
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required for run tests")
@@ -881,16 +983,28 @@ def trusted_resolved_policy() -> dict[str, object]:
                 "provider_id": "codex-cli",
                 "repository_access": "workspace-write",
                 "required_capabilities": sorted([*shared, "workspace-write-execution"]),
+                "execution_policy": {
+                    "timeout_seconds": 3600.0,
+                    "network_access": "allowed",
+                },
             },
             "review": {
                 "provider_id": "codex-cli",
                 "repository_access": "read-only",
                 "required_capabilities": sorted([*shared, "read-only-execution"]),
+                "execution_policy": {
+                    "timeout_seconds": 3600.0,
+                    "network_access": "denied",
+                },
             },
             "correction": {
                 "provider_id": "codex-cli",
                 "repository_access": "workspace-write",
                 "required_capabilities": sorted([*shared, "workspace-write-execution"]),
+                "execution_policy": {
+                    "timeout_seconds": 3600.0,
+                    "network_access": "allowed",
+                },
             },
         },
         "providers": {

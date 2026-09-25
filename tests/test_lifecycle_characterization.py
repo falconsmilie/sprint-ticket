@@ -26,6 +26,7 @@ from tests.lifecycle_characterization_fixtures import (
     build_lifecycle_workspace,
     configure_fake_codex_actions,
 )
+from ticket_automation.application.agent_execution import AgentExecutor, AgentTaskKind
 from ticket_automation.application.handoff_acceptance import (
     HandoffAcceptanceRequest,
     HandoffAcceptanceService,
@@ -55,6 +56,46 @@ from ticket_automation.verification import run_verification_stage
 from ticket_automation.workflow import resume_ticket_lifecycle, run_ticket_lifecycle
 
 pytestmark = pytest.mark.skipif(GIT is None, reason="git executable is required")
+
+
+@dataclass
+class HandoffEvidenceTamperingExecutor:
+    inner: AgentExecutor
+    target_phase: AttemptPhase
+    evidence_change: str
+    review_calls: int = 0
+
+    @property
+    def capabilities(self):
+        return self.inner.capabilities
+
+    def execute(self, request, *, on_invocation_start=None):
+        execution = self.inner.execute(
+            request,
+            on_invocation_start=on_invocation_start,
+        )
+        if request.task_kind is not AgentTaskKind.REVIEW:
+            return execution
+
+        self.review_calls += 1
+        trigger_review = 2 if self.target_phase is AttemptPhase.CORRECTING else 1
+        if self.review_calls != trigger_review:
+            return execution
+
+        assert request.artifact_layout is not None
+        target = next(
+            item
+            for item in reversed(load_attempt_records(request.artifact_layout.run_root))
+            if item.phase is self.target_phase and item.completed
+        )
+        evidence_path = target.artifact_directory / "execution.json"
+        if self.evidence_change == "missing":
+            evidence_path.unlink()
+        else:
+            data = json.loads(evidence_path.read_text(encoding="utf-8"))
+            data["typed_result"]["summary"] = "tampered summary"
+            evidence_path.write_text(json.dumps(data), encoding="utf-8")
+        return execution
 
 
 @dataclass(frozen=True)
@@ -385,6 +426,7 @@ def test_required_review_finding_creates_correction_work(
     assert result.run_record.state == WorkflowState.READY_FOR_HUMAN
     assert result.run_record.stop_reason is None
     assert result.run_record.current_correction_round == 1
+    assert (result.run_dir / "final.patch").is_file()
     attempts = assert_attempt_ledger(
         result.run_dir.resolve(),
         [
@@ -662,6 +704,10 @@ def test_final_handoff_rejects_repository_drift(tmp_path, monkeypatch, drift):
         ("stale-review", "review did not pass for the verified final source"),
         ("malformed-review", "lowercase SHA-256 digest"),
         ("missing-review", "review evidence is missing"),
+        ("missing-neutral-execution", "Agent execution evidence is invalid"),
+        ("drifted-neutral-result", "does not match neutral execution evidence"),
+        ("missing-typed-result-artifact", "does not exist"),
+        ("wrong-neutral-provider", "provider identity does not match"),
     ],
 )
 def test_final_handoff_rejects_stale_or_missing_evidence(
@@ -727,6 +773,26 @@ def test_final_handoff_rejects_stale_or_missing_evidence(
             else:
                 data["commands"][0]["cwd"] = str(tmp_path / "other")
             result_path.write_text(json.dumps(data), encoding="utf-8")
+    elif evidence_change in {
+        "missing-neutral-execution",
+        "drifted-neutral-result",
+        "missing-typed-result-artifact",
+        "wrong-neutral-provider",
+    }:
+        attempt = next(item for item in attempts if item.phase == "REVIEWING")
+        execution_path = attempt.artifact_directory / "execution.json"
+        if evidence_change == "missing-neutral-execution":
+            execution_path.unlink()
+        else:
+            data = json.loads(execution_path.read_text(encoding="utf-8"))
+            if evidence_change == "drifted-neutral-result":
+                data["typed_result"]["summary"] = "tampered summary"
+            elif evidence_change == "wrong-neutral-provider":
+                data["provider_id"] = "different-provider"
+            else:
+                typed_reference = data["typed_result_artifact"]
+                (reporting.run_dir / typed_reference["path"]).unlink()
+            execution_path.write_text(json.dumps(data), encoding="utf-8")
     else:
         attempt = next(item for item in attempts if item.phase == "REVIEWING")
         if evidence_change == "missing-review":
@@ -758,6 +824,73 @@ def test_final_handoff_rejects_stale_or_missing_evidence(
     assert result.run_record.stop_reason is not None
     assert result.run_record.stop_reason.category is StopCategory.SAFETY_VIOLATION
     assert reason in result.run_record.terminal_reason
+    assert not (result.run_dir / "final.patch").exists()
+
+
+@pytest.mark.parametrize(
+    ("target_phase", "evidence_change", "actions", "verification_results"),
+    [
+        pytest.param(
+            AttemptPhase.IMPLEMENTING,
+            "missing",
+            ("modify", "review-pass"),
+            [0, 0],
+            id="implementation-missing",
+        ),
+        pytest.param(
+            AttemptPhase.IMPLEMENTING,
+            "inconsistent",
+            ("modify", "review-pass"),
+            [0, 0],
+            id="implementation-typed-result-inconsistent",
+        ),
+        pytest.param(
+            AttemptPhase.CORRECTING,
+            "missing",
+            ("modify", "review-corrections", "modify-correction", "review-pass"),
+            [0, 0, 0],
+            id="correction-missing",
+        ),
+        pytest.param(
+            AttemptPhase.CORRECTING,
+            "inconsistent",
+            ("modify", "review-corrections", "modify-correction", "review-pass"),
+            [0, 0, 0],
+            id="correction-typed-result-inconsistent",
+        ),
+    ],
+)
+def test_final_handoff_rejects_non_review_agent_evidence_tampering(
+    tmp_path,
+    monkeypatch,
+    target_phase,
+    evidence_change,
+    actions,
+    verification_results,
+):
+    workspace = build_lifecycle_workspace(tmp_path)
+    codex_runner = configure_fake_codex_actions(monkeypatch, tmp_path, *actions)
+    executor = HandoffEvidenceTamperingExecutor(
+        make_agent_executor(workspace.config, process_runner=codex_runner),
+        target_phase=target_phase,
+        evidence_change=evidence_change,
+    )
+
+    result = run_ticket_lifecycle(
+        workspace.config,
+        workspace.ticket,
+        runs_dir=workspace.runs_dir,
+        **make_run_dependencies(workspace.config, agent_executor=executor),
+        verification_runner=ScriptedVerificationRunner(verification_results),
+        clock=TickingClock(),
+    )
+
+    assert result.run_record.state is WorkflowState.HUMAN_REQUIRED
+    assert result.run_record.stop_reason is not None
+    assert result.run_record.stop_reason.category is StopCategory.SAFETY_VIOLATION
+    assert "Agent execution evidence is invalid" in result.run_record.terminal_reason
+    if evidence_change == "inconsistent":
+        assert "typed stage result does not match" in result.run_record.terminal_reason
     assert not (result.run_dir / "final.patch").exists()
 
 

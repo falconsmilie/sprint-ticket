@@ -39,6 +39,23 @@ from .persistence import (
 ATTEMPT_RECORD_FILE = "attempt.json"
 ATTEMPT_RECORD_FORMAT = "ticket_automation.attempt"
 ATTEMPT_RECORD_SCHEMA_VERSION = 1
+_ATTEMPT_RECORD_FIELDS = frozenset(
+    {
+        "schema_version",
+        "format",
+        "sequence",
+        "phase",
+        "status",
+        "before_workspace_fingerprint",
+        "after_workspace_fingerprint",
+        "process_started",
+        "started_at",
+        "ended_at",
+        "result_path",
+        "execution_path",
+        "metadata",
+    }
+)
 
 _ATTEMPT_DIRECTORY_PATTERN = re.compile(r"^(0*[1-9][0-9]*)-(.+)$")
 
@@ -381,51 +398,6 @@ def latest_writable_attempt(run_dir: Path | str) -> AttemptRecord | None:
     )
 
 
-def finish_phase_attempt(
-    run_dir: Path | str,
-    *,
-    phase: AttemptPhase,
-    stage_outcome: StageOutcome,
-    after_workspace_fingerprint: str | None = None,
-    process_started: bool | None = None,
-    execution_path: Path | None = None,
-    metadata: AttemptMetadata | None = None,
-    clock: Callable[[], datetime] | None = None,
-) -> AttemptRecord | None:
-    """Close the current phase record without giving it controller authority."""
-
-    _validate_phase_value(phase, field="phase")
-    if not isinstance(stage_outcome, StageOutcome):
-        raise AttemptError("stage_outcome must be a StageOutcome value.")
-    record = latest_attempt(
-        run_dir,
-        phases=(phase,),
-        statuses=(AttemptStatus.STARTED,),
-    )
-    if record is None:
-        return None
-    status = ATTEMPT_STATUS_BY_STAGE_OUTCOME[stage_outcome]
-    relative_execution_path = None
-    if execution_path is not None:
-        try:
-            relative_execution_path = execution_path.relative_to(
-                record.artifact_directory
-            ).as_posix()
-        except ValueError as error:
-            raise AttemptError(
-                "Execution metadata must remain inside its attempt directory."
-            ) from error
-    return complete_attempt(
-        record,
-        status=status,
-        after_workspace_fingerprint=after_workspace_fingerprint,
-        process_started=process_started,
-        execution_path=relative_execution_path,
-        metadata=record.metadata if metadata is None else metadata,
-        clock=clock,
-    )
-
-
 def complete_stage_attempt(
     run_dir: Path | str,
     attempt: AttemptRecord,
@@ -548,27 +520,35 @@ def _load_attempt(path: Path) -> AttemptRecord:
     if not isinstance(data, dict):
         raise AttemptError(f"Attempt record {path} must be a JSON object.")
     try:
+        if (
+            type(data.get("schema_version")) is not int
+            or data["schema_version"] != ATTEMPT_RECORD_SCHEMA_VERSION
+        ):
+            raise AttemptError("Attempt record has an unsupported schema version.")
+        if data.get("format") != ATTEMPT_RECORD_FORMAT:
+            raise AttemptError("Attempt record has an unsupported format.")
+        _require_exact_record_fields(data)
         record = AttemptRecord(
             sequence=_required_positive_int(data, "sequence"),
             phase=_required_phase(data),
             status=_required_status(data),
             before_workspace_fingerprint=_nullable_string(
-                data.get("before_workspace_fingerprint")
+                data["before_workspace_fingerprint"]
             ),
             after_workspace_fingerprint=_nullable_string(
-                data.get("after_workspace_fingerprint")
+                data["after_workspace_fingerprint"]
             ),
             process_started=_required_bool(data, "process_started"),
             started_at=_required_timestamp(data, "started_at"),
-            ended_at=_nullable_timestamp(data.get("ended_at")),
+            ended_at=_nullable_timestamp(data["ended_at"]),
             result_path=_required_relative_artifact_path(data, "result_path"),
             execution_path=_nullable_relative_artifact_path(
-                data.get("execution_path"), "execution_path"
+                data["execution_path"], "execution_path"
             ),
             metadata=_required_metadata(data),
             artifact_directory=path.parent,
-            schema_version=data.get("schema_version"),
-            format=data.get("format"),
+            schema_version=data["schema_version"],
+            format=data["format"],
         )
         return record
     except (KeyError, TypeError, ValueError, AttemptError) as error:
@@ -595,7 +575,10 @@ def _next_sequence(root: Path) -> int:
 
 
 def _validate_record(record: AttemptRecord) -> None:
-    if record.schema_version != ATTEMPT_RECORD_SCHEMA_VERSION:
+    if (
+        type(record.schema_version) is not int
+        or record.schema_version != ATTEMPT_RECORD_SCHEMA_VERSION
+    ):
         raise AttemptError("Attempt record has an unsupported schema version.")
     if record.format != ATTEMPT_RECORD_FORMAT:
         raise AttemptError("Attempt record has an unsupported format.")
@@ -690,6 +673,20 @@ def _required_positive_int(data: dict[str, Any], key: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise ValueError(f"{key} must be a positive integer")
     return value
+
+
+def _require_exact_record_fields(data: dict[str, Any]) -> None:
+    actual = set(data)
+    missing = sorted(_ATTEMPT_RECORD_FIELDS - actual)
+    unexpected = sorted(actual - _ATTEMPT_RECORD_FIELDS)
+    if not missing and not unexpected:
+        return
+    details: list[str] = []
+    if missing:
+        details.append("missing " + ", ".join(missing))
+    if unexpected:
+        details.append("unexpected " + ", ".join(unexpected))
+    raise AttemptError("Attempt record fields are invalid: " + "; ".join(details))
 
 
 def _required_phase(data: dict[str, Any]) -> AttemptPhase:
@@ -832,7 +829,6 @@ __all__ = [
     "attempt_result_path",
     "complete_attempt",
     "complete_stage_attempt",
-    "finish_phase_attempt",
     "latest_attempt",
     "latest_writable_attempt",
     "load_attempt_records",

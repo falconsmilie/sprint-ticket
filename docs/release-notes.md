@@ -10,7 +10,7 @@ transport, diagnostics, and native artifacts are owned by
 
 The prior application-facing Codex facade, settings aliases, execution bridges,
 presentation compatibility exports, and architecture debt allowlist have been
-removed. Runs use resolved-policy schema 2 and run-record schema 5; records with
+removed. Runs use resolved-policy schema 3 and run-record schema 5; records with
 other schema versions are unsupported and are not modified or deleted.
 
 Prompts and result schemas ship inside the `ticket_automation` package. The
