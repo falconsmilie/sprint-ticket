@@ -23,7 +23,6 @@ from ...process_output import decode_human_output
 FINALIZATION_SECONDS = 5.0
 CLEANUP_SECONDS = 10.0
 _READ_SIZE = 64 * 1024
-_MAX_OBSERVED_RECORD_CHARS = 8 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -113,7 +112,6 @@ class _CodexEventObserver:
         self.clock = clock
         self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self.pending = ""
-        self.discarding_oversized_record = False
         self.lock = threading.Lock()
         self.terminal_event_type: str | None = None
         self.terminal_event_elapsed_seconds: float | None = None
@@ -124,21 +122,10 @@ class _CodexEventObserver:
     def feed(self, chunk: bytes, *, final: bool = False) -> None:
         text = self.decoder.decode(chunk, final=final)
         with self.lock:
-            if self.discarding_oversized_record:
-                newline = text.find("\n")
-                if newline < 0:
-                    return
-                text = text[newline + 1 :]
-                self.discarding_oversized_record = False
             self.pending += text
             while "\n" in self.pending:
                 line, self.pending = self.pending.split("\n", 1)
                 self._observe_line(line.rstrip("\r"))
-            if len(self.pending) > _MAX_OBSERVED_RECORD_CHARS:
-                # The raw record remains in the capture file. Stop retaining it in
-                # memory and ignore it for protocol decisions until its newline.
-                self.pending = ""
-                self.discarding_oversized_record = True
             if final and self.pending:
                 # A partial record is diagnostic only. It is deliberately not parsed.
                 self.pending = ""
@@ -230,34 +217,24 @@ class _StreamWorker:
                     self.observer.feed(chunk)
             if self.observer is not None:
                 self.observer.feed(b"", final=True)
-        except (BufferError, OSError, RuntimeError, TypeError, ValueError) as error:
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
             self.error = error
         finally:
-            try:
-                if output is not None:
+            if output is not None:
+                try:
                     output.close()
-            except (OSError, RuntimeError, ValueError) as error:
-                if self.error is None:
-                    self.error = error
-            finally:
-                self.done.set()
+                except (OSError, ValueError):
+                    pass
+            self.done.set()
 
     def text(self) -> str:
         return decode_human_output(bytes(self.buffer))
 
 
 class _InputWorker:
-    def __init__(
-        self,
-        stream: BinaryIO,
-        value: str,
-        *,
-        clock: Callable[[], float],
-    ) -> None:
+    def __init__(self, stream: BinaryIO, value: str) -> None:
         self.stream = stream
         self.value = value.encode("utf-8")
-        self.clock = clock
-        self.completed_at: float | None = None
         self.done = threading.Event()
         self.error: BaseException | None = None
         self.thread = threading.Thread(target=self._run)
@@ -272,21 +249,16 @@ class _InputWorker:
                 written = self.stream.write(view[:_READ_SIZE])
                 if written is None:
                     written = min(len(view), _READ_SIZE)
-                if written <= 0:
-                    raise OSError("Codex stdin write made no progress")
                 view = view[written:]
             self.stream.flush()
-        except (BufferError, OSError, RuntimeError, TypeError, ValueError) as error:
+        except (BrokenPipeError, OSError, ValueError) as error:
             self.error = error
         finally:
             try:
                 self.stream.close()
-            except (OSError, RuntimeError, ValueError) as error:
-                if self.error is None:
-                    self.error = error
-            finally:
-                self.completed_at = self.clock()
-                self.done.set()
+            except OSError:
+                pass
+            self.done.set()
 
 
 class _InvocationContainment:
@@ -325,7 +297,6 @@ class _PosixProcessGroup(_InvocationContainment):
 
 
 if os.name == "nt":
-
     class _BasicLimitInformation(ctypes.Structure):
         _fields_ = [
             ("PerProcessUserTimeLimit", ctypes.c_longlong),
@@ -338,6 +309,7 @@ if os.name == "nt":
             ("PriorityClass", ctypes.c_uint32),
             ("SchedulingClass", ctypes.c_uint32),
         ]
+
 
     class _IoCounters(ctypes.Structure):
         _fields_ = [
@@ -352,6 +324,7 @@ if os.name == "nt":
             )
         ]
 
+
     class _ExtendedLimitInformation(ctypes.Structure):
         _fields_ = [
             ("BasicLimitInformation", _BasicLimitInformation),
@@ -361,6 +334,7 @@ if os.name == "nt":
             ("PeakProcessMemoryUsed", ctypes.c_size_t),
             ("PeakJobMemoryUsed", ctypes.c_size_t),
         ]
+
 
     class _BasicAccountingInformation(ctypes.Structure):
         _fields_ = [
@@ -385,30 +359,23 @@ class _WindowsJob(_InvocationContainment):
         self.handle = kernel32.CreateJobObjectW(None, None)
         if not self.handle:
             raise ctypes.WinError(ctypes.get_last_error())
-        try:
-            info = _ExtendedLimitInformation()
-            info.BasicLimitInformation.LimitFlags = (
-                self._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-            )
-            if not kernel32.SetInformationJobObject(
-                self.handle,
-                self._JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
-                ctypes.byref(info),
-                ctypes.sizeof(info),
-            ):
-                raise ctypes.WinError(ctypes.get_last_error())
-            if not kernel32.AssignProcessToJobObject(
-                self.handle,
-                ctypes.c_void_p(int(process._handle)),  # type: ignore[attr-defined]
-            ):
-                raise ctypes.WinError(ctypes.get_last_error())
-            _resume_windows_process(process.pid)
-        except BaseException:
-            # KILL_ON_JOB_CLOSE also covers a process that was assigned before a
-            # later setup failure, while an unassigned suspended process is killed
-            # by the launcher's containment-failure path.
+        info = _ExtendedLimitInformation()
+        info.BasicLimitInformation.LimitFlags = self._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(
+            self.handle,
+            self._JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        ):
             self.close()
-            raise
+            raise ctypes.WinError(ctypes.get_last_error())
+        if not kernel32.AssignProcessToJobObject(
+            self.handle,
+            ctypes.c_void_p(int(process._handle)),  # type: ignore[attr-defined]
+        ):
+            self.close()
+            raise ctypes.WinError(ctypes.get_last_error())
+        _resume_windows_process(process.pid)
 
     def terminate(self) -> str:
         if self.handle and not self.kernel32.TerminateJobObject(self.handle, 1):
@@ -478,9 +445,7 @@ class SubprocessCodexRunner:
             "shell": False,
         }
         if os.name == "nt":
-            popen_options["creationflags"] = getattr(
-                subprocess, "CREATE_SUSPENDED", 0x4
-            )
+            popen_options["creationflags"] = getattr(subprocess, "CREATE_SUSPENDED", 0x4)
         else:
             popen_options["start_new_session"] = True
         launched_at = self._monotonic()
@@ -494,24 +459,16 @@ class SubprocessCodexRunner:
         try:
             containment = _contain_process(process)
         except BaseException as error:
-            try:
-                process.kill()
-            except OSError as cleanup_error:
-                error.add_note(
-                    f"Suspended process termination also failed: {cleanup_error}"
-                )
+            process.kill()
             try:
                 process.wait(timeout=CLEANUP_SECONDS)
             except (OSError, subprocess.TimeoutExpired, TypeError) as cleanup_error:
-                error.add_note(
-                    f"Suspended process cleanup also failed: {cleanup_error}"
-                )
-            _close_process_streams(process)
+                error.add_note(f"Suspended process cleanup also failed: {cleanup_error}")
             _close_captures(capture_streams)
             raise
-        workers_for_cleanup: (
-            tuple[_StreamWorker, _StreamWorker, _InputWorker] | None
-        ) = None
+        workers_for_cleanup: tuple[
+            _StreamWorker, _StreamWorker, _InputWorker
+        ] | None = None
         try:
             if on_process_start is not None:
                 on_process_start()
@@ -545,11 +502,7 @@ class SubprocessCodexRunner:
                 command.stderr_capture,
                 output=stderr_capture,
             )
-            input_worker = _InputWorker(
-                process.stdin,
-                stdin,
-                clock=self._monotonic,
-            )
+            input_worker = _InputWorker(process.stdin, stdin)
             workers = (stdout_worker, stderr_worker, input_worker)
             workers_for_cleanup = workers
             for worker in workers:
@@ -569,12 +522,10 @@ class SubprocessCodexRunner:
         except BaseException as original:
             if isinstance(original, CodexProcessTimedOut):
                 raise
-            cleanup_deadline = self._monotonic() + CLEANUP_SECONDS
-            if deadline is not None:
-                cleanup_deadline = min(
-                    cleanup_deadline,
-                    deadline + CLEANUP_SECONDS,
-                )
+            cleanup_deadline = min(
+                launched_at + (timeout_seconds or CLEANUP_SECONDS) + CLEANUP_SECONDS,
+                self._monotonic() + CLEANUP_SECONDS,
+            )
             if workers_for_cleanup is None:
                 _emergency_cleanup(
                     process, containment, cleanup_deadline, self._monotonic
@@ -625,11 +576,6 @@ class SubprocessCodexRunner:
                 and message_elapsed is not None
                 and (timeout_seconds is None or message_elapsed < timeout_seconds)
             )
-            timely_input = (
-                input_worker.done.is_set()
-                and input_worker.completed_at is not None
-                and (deadline is None or input_worker.completed_at < deadline)
-            )
             if problem is not None:
                 deadline_outcome = "event-conflict"
                 finalization_outcome = "failed"
@@ -640,21 +586,7 @@ class SubprocessCodexRunner:
                 finalization_outcome = "failed"
                 transport_failure = f"Codex emitted {terminal_type}."
                 break
-            for label, worker in (
-                ("stdout", stdout_worker),
-                ("stderr", stderr_worker),
-                ("stdin", input_worker),
-            ):
-                if worker.error is not None:
-                    transport_failure = (
-                        f"Codex {label} streaming failed: {worker.error}"
-                    )
-                    deadline_outcome = "stream-failure"
-                    finalization_outcome = "failed"
-                    break
-            if transport_failure is not None:
-                break
-            if timely_terminal and timely_message and timely_input:
+            if timely_terminal and timely_message:
                 deadline_outcome = "completed-before-deadline"
                 if finalization_deadline is None:
                     assert terminal_elapsed is not None
@@ -696,21 +628,21 @@ class SubprocessCodexRunner:
                 and not containment.active()
                 and stdout_worker.done.is_set()
                 and stderr_worker.done.is_set()
-                and input_worker.done.is_set()
             ):
                 deadline_outcome = "process-exited-without-timely-completion"
                 finalization_outcome = "not-eligible"
                 break
+            for worker in (stdout_worker, stderr_worker):
+                if worker.error is not None:
+                    transport_failure = f"Codex output streaming failed: {worker.error}"
+                    deadline_outcome = "stream-failure"
+                    finalization_outcome = "failed"
+                    break
+            if transport_failure is not None:
+                break
             threading.Event().wait(0.005)
 
-        cleanup_required = (
-            transport_failure is not None
-            or containment.active()
-            or not all(
-                worker.done.is_set()
-                for worker in (stdout_worker, stderr_worker, input_worker)
-            )
-        )
+        cleanup_required = transport_failure is not None or containment.active()
         cleanup = _CleanupResult.not_required()
         if cleanup_required:
             overall_deadline = (
@@ -899,11 +831,15 @@ def _cleanup(
             method = containment.terminate()
         except (OSError, RuntimeError):
             method = "termination-failed"
-    _close_process_streams(process)
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
     for worker in workers:
         remaining = max(0.0, deadline - clock())
-        if worker.thread.ident is not None:
-            worker.thread.join(remaining)
+        worker.thread.join(remaining)
         if worker.thread.is_alive():
             _cancel_blocked_windows_thread(worker.thread)
             worker.thread.join(max(0.0, deadline - clock()))
@@ -935,52 +871,17 @@ def _emergency_cleanup(
     deadline: float,
     clock: Callable[[], float],
 ) -> None:
-    """Stop a contained invocation before stream workers have all started."""
-
     try:
         containment.terminate()
     except (OSError, RuntimeError):
         try:
             process.kill()  # type: ignore[attr-defined]
         except (OSError, RuntimeError):
-            pass
-    _close_process_streams(process)
-    if isinstance(containment, _SingleProcessContainment):
-        try:
-            process.wait(  # type: ignore[attr-defined]
-                timeout=max(0.0, deadline - clock())
-            )
-        except (OSError, RuntimeError, TypeError, subprocess.TimeoutExpired):
-            pass
-        return
-    graceful_until = min(deadline, clock() + 1.0)
-    while clock() < graceful_until:
-        try:
-            if not containment.active():
-                break
-        except (OSError, RuntimeError):
-            break
-        threading.Event().wait(min(0.01, max(0.0, graceful_until - clock())))
-    if clock() < deadline:
-        try:
-            if containment.active():
-                containment.terminate()
-        except (OSError, RuntimeError):
-            pass
+            return
     try:
         process.wait(timeout=max(0.0, deadline - clock()))  # type: ignore[attr-defined]
     except (OSError, RuntimeError, TypeError, subprocess.TimeoutExpired):
         return
-
-
-def _close_process_streams(process: object) -> None:
-    for name in ("stdin", "stdout", "stderr"):
-        stream = getattr(process, name, None)
-        if stream is not None:
-            try:
-                stream.close()
-            except (OSError, RuntimeError, ValueError):
-                pass
 
 
 def _evidence(

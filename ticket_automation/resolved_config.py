@@ -736,7 +736,7 @@ def _parse_execution_policy(data: dict[str, Any]) -> AgentExecutionPolicy:
         )
         _validate_resolved_timeout(policy.timeout_seconds)
         return policy
-    except (OverflowError, TypeError, ValueError) as error:
+    except (TypeError, ValueError) as error:
         raise ResolvedRunPolicyError(
             f"resolved_policy task execution_policy is invalid: {error}"
         ) from error

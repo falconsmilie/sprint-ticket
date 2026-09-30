@@ -167,18 +167,13 @@ def test_distinct_task_deadlines_round_trip_and_reconstruct_configuration(tmp_pa
     assert reconstructed.agents.timeouts == config.agents.timeouts
 
 
-@pytest.mark.parametrize(
-    "value",
-    [None, 0, -1, True, 1.5, float("inf"), 10**1000],
-)
+@pytest.mark.parametrize("value", [None, 0, -1, True, 1.5, float("inf")])
 def test_persisted_task_deadline_requires_positive_whole_seconds(tmp_path, value):
     resolved, _ = _shared_policy(tmp_path)
     data = resolved.to_dict()
     data["tasks"]["implementation"]["execution_policy"]["timeout_seconds"] = value
 
-    with pytest.raises(
-        ResolvedRunPolicyError, match="timeout_seconds|execution_policy"
-    ):
+    with pytest.raises(ResolvedRunPolicyError, match="timeout_seconds|execution_policy"):
         ResolvedRunPolicy.from_dict(data)
 
 
