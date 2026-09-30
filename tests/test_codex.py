@@ -103,7 +103,10 @@ class FakeRunner:
             output = Path(command.argv[command.argv.index("--output-last-message") + 1])
             output.write_text(self.typed_result, encoding="utf-8")
         assert self.result is not None
-        if self.result.returncode == 0 and self.result.evidence == CodexProcessEvidence():
+        if (
+            self.result.returncode == 0
+            and self.result.evidence == CodexProcessEvidence()
+        ):
             fallback = (
                 review_payload()
                 if "review-result.schema.json" in " ".join(command.argv)
@@ -778,6 +781,40 @@ def test_timeout_preserves_raw_result_only_as_native_diagnostic(tmp_path: Path) 
     assert execution.provider_metadata["structured_result_accepted"] is False
 
 
+def test_timeout_diagnostic_result_atomically_replaces_invocation_hardlink(
+    tmp_path: Path,
+) -> None:
+    payload = json.dumps(implementation_payload())
+    external = tmp_path / "external-diagnostic.json"
+    external.write_text("external\n", encoding="utf-8")
+
+    class LinkedDiagnosticThenTimeoutRunner:
+        def run(self, command, *, stdin, timeout_seconds, on_process_start=None):
+            del stdin
+            if on_process_start is not None:
+                on_process_start()
+            output = Path(command.argv[command.argv.index("--output-last-message") + 1])
+            output.write_text(payload, encoding="utf-8")
+            os.link(
+                external,
+                tmp_path / "artifacts" / "codex-diagnostic-result.json",
+            )
+            raise CodexProcessTimedOut(
+                CodexProcessTimeout("partial\n", "late\n", timeout_seconds or 0)
+            )
+
+    execution = CodexCliAgentExecutor(
+        SETTINGS,
+        runner=LinkedDiagnosticThenTimeoutRunner(),
+    ).execute(request(tmp_path))
+
+    diagnostic = tmp_path / "artifacts" / "codex-diagnostic-result.json"
+    assert execution.failure_category is AgentFailureCategory.TIMEOUT
+    assert external.read_text(encoding="utf-8") == "external\n"
+    assert diagnostic.read_text(encoding="utf-8") == payload
+    assert not os.path.samefile(external, diagnostic)
+
+
 def test_subprocess_runner_uses_argv_and_disables_shell(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -958,20 +995,23 @@ def test_subprocess_spawn_failure_does_not_report_process_start(
 
 def test_real_runner_observes_chunked_jsonl_and_split_utf8(tmp_path: Path) -> None:
     payload = json.dumps(implementation_payload(summary="café"), ensure_ascii=False)
-    event = json.dumps(
-        {
-            "type": "item.completed",
-            "item": {"type": "agent_message", "text": payload},
-        },
-        ensure_ascii=False,
-    ).encode("utf-8") + b"\n"
+    event = (
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": payload},
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
     marker = event.index("é".encode()) + 1
     script = (
         "import os,sys,time; "
         f"data={event!r}; marker={marker}; "
         "os.write(sys.stdout.fileno(),data[:marker]); time.sleep(.02); "
         "os.write(sys.stdout.fileno(),data[marker:]); "
-        "os.write(sys.stdout.fileno(),b'{\"type\":\"turn.completed\"}\\n')"
+        'os.write(sys.stdout.fileno(),b\'{"type":"turn.completed"}\\n\')'
     )
     stdout = tmp_path / "captured-events.jsonl"
     stderr = tmp_path / "captured-stderr.log"
@@ -994,6 +1034,318 @@ def test_real_runner_observes_chunked_jsonl_and_split_utf8(tmp_path: Path) -> No
     assert stdout.read_bytes() == event + b'{"type":"turn.completed"}\n'
 
 
+@pytest.mark.parametrize(
+    ("terminal_elapsed", "completion_before_deadline"),
+    [(9.999, True), (10.0, False), (10.001, False)],
+)
+def test_terminal_observation_uses_a_strict_monotonic_deadline(
+    terminal_elapsed: float,
+    completion_before_deadline: bool,
+) -> None:
+    observed_times = iter((1.0, terminal_elapsed))
+    observer = process_module._CodexEventObserver(
+        started=0.0,
+        deadline=10.0,
+        clock=lambda: next(observed_times),
+    )
+    payload = json.dumps(implementation_payload())
+    observer.feed(
+        (
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": payload},
+                }
+            )
+            + "\n"
+        ).encode()
+    )
+    observer.feed(b'{"type":"turn.completed"}\n')
+
+    evidence = process_module._evidence(
+        observer,
+        launched_at=0.0,
+        clock=lambda: max(10.0, terminal_elapsed),
+        timeout_seconds=10.0,
+        deadline_outcome="timed-out",
+        finalization_outcome="not-eligible",
+        cleanup=process_module._CleanupResult.not_required(),
+    )
+
+    assert evidence.completion_before_deadline is completion_before_deadline
+    assert evidence.structured_message_before_deadline is True
+
+
+def test_partial_malformed_unknown_and_contradictory_records_fail_closed() -> None:
+    partial_observer = process_module._CodexEventObserver(
+        started=0.0,
+        deadline=10.0,
+        clock=lambda: 1.0,
+    )
+    partial_observer.feed(b'{"type":"turn.completed"}', final=True)
+    assert partial_observer.snapshot()[0] is None
+
+    observer = process_module._CodexEventObserver(
+        started=0.0,
+        deadline=10.0,
+        clock=lambda: 1.0,
+    )
+    observer.feed(b'not-json\n{"type":"future.event"}\n')
+    assert observer.snapshot()[0] is None
+
+    observer.feed(b'{"type":"turn.completed"}\n{"type":"turn.failed"}\n')
+    terminal, _, _, _, problem = observer.snapshot()
+    assert terminal == "turn.completed"
+    assert problem == "contradictory terminal events: turn.completed and turn.failed"
+
+
+def test_oversized_incomplete_record_is_bounded_but_raw_protocol_can_continue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(process_module, "_MAX_OBSERVED_RECORD_CHARS", 32)
+    observer = process_module._CodexEventObserver(
+        started=0.0,
+        deadline=10.0,
+        clock=lambda: 1.0,
+    )
+
+    observer.feed(b"x" * 64)
+    assert observer.pending == ""
+    assert observer.discarding_oversized_record is True
+
+    observer.feed(b'ignored\n{"type":"turn.completed"}\n')
+    assert observer.snapshot()[0] == "turn.completed"
+
+
+def test_stdout_and_stderr_pressure_are_drained_without_output_loss(
+    tmp_path: Path,
+) -> None:
+    payload = json.dumps(implementation_payload())
+    event = (
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": payload},
+            }
+        ).encode()
+        + b"\n"
+    )
+    stdout_bytes = b"x" * (256 * 1024) + b"\n" + event + b'{"type":"turn.completed"}\n'
+    stderr_bytes = b"y" * (256 * 1024) + b"\n"
+    script = (
+        "import sys; "
+        f"event={event!r}; "
+        "sys.stdout.buffer.write(b'x'*(256*1024)+b'\\n'+event+"
+        'b\'{"type":"turn.completed"}\\n\'); '
+        "sys.stdout.buffer.flush(); "
+        "sys.stderr.buffer.write(b'y'*(256*1024)+b'\\n'); "
+        "sys.stderr.buffer.flush()"
+    )
+    stdout = tmp_path / "pressure-events.jsonl"
+    stderr = tmp_path / "pressure-stderr.log"
+
+    result = SubprocessCodexRunner().run(
+        CodexCommand(
+            (sys.executable, "-c", script),
+            tmp_path,
+            stdout_capture=stdout,
+            stderr_capture=stderr,
+        ),
+        stdin="prompt",
+        timeout_seconds=3,
+    )
+
+    assert result.returncode == 0
+    assert result.evidence.completion_before_deadline is True
+    assert stdout.read_bytes() == stdout_bytes
+    assert stderr.read_bytes() == stderr_bytes
+
+
+def test_blocked_stdin_and_silent_process_cannot_bypass_deadline(
+    tmp_path: Path,
+) -> None:
+    stdout = tmp_path / "blocked-events.jsonl"
+    stderr = tmp_path / "blocked-stderr.log"
+    script = (
+        "import sys,time; "
+        'print(\'{"type":"turn.started"}\',flush=True); '
+        "print('stdin blocked',file=sys.stderr,flush=True); "
+        "time.sleep(5)"
+    )
+    started = time.monotonic()
+
+    with pytest.raises(CodexProcessTimedOut) as raised:
+        SubprocessCodexRunner().run(
+            CodexCommand(
+                (sys.executable, "-c", script),
+                tmp_path,
+                stdout_capture=stdout,
+                stderr_capture=stderr,
+            ),
+            stdin="p" * (4 * 1024 * 1024),
+            timeout_seconds=0.5,
+        )
+
+    assert time.monotonic() - started < 3
+    assert raised.value.result.evidence.deadline_outcome == "timed-out"
+    assert raised.value.result.evidence.tree_termination_confirmed is True
+    assert stdout.read_text(encoding="utf-8") == '{"type":"turn.started"}\n'
+    assert stderr.read_text(encoding="utf-8") == "stdin blocked\n"
+
+
+def test_silent_process_is_terminated_at_work_deadline(tmp_path: Path) -> None:
+    started = time.monotonic()
+
+    with pytest.raises(CodexProcessTimedOut) as raised:
+        SubprocessCodexRunner().run(
+            CodexCommand(
+                (sys.executable, "-c", "import time; time.sleep(5)"),
+                tmp_path,
+            ),
+            stdin="",
+            timeout_seconds=0.2,
+        )
+
+    assert time.monotonic() - started < 3
+    assert raised.value.result.stdout == ""
+    assert raised.value.result.stderr == ""
+    assert raised.value.result.evidence.tree_termination_confirmed is True
+
+
+def test_terminal_events_cannot_bypass_incomplete_stdin_delivery(
+    tmp_path: Path,
+) -> None:
+    payload = json.dumps(implementation_payload())
+    event = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": payload},
+        }
+    )
+    script = (
+        "import os,sys,time; os.close(sys.stdin.fileno()); "
+        f"print({event!r},flush=True); "
+        'print(\'{"type":"turn.completed"}\',flush=True); '
+        "time.sleep(5)"
+    )
+
+    started = time.monotonic()
+    with pytest.raises(CodexProcessTimedOut) as raised:
+        SubprocessCodexRunner().run(
+            CodexCommand((sys.executable, "-c", script), tmp_path),
+            stdin="p" * (4 * 1024 * 1024),
+            timeout_seconds=0.3,
+        )
+
+    assert time.monotonic() - started < 3
+    assert raised.value.result.evidence.deadline_outcome == "timed-out"
+    assert raised.value.result.evidence.completion_before_deadline is True
+    assert raised.value.result.evidence.tree_termination_confirmed is True
+
+
+def test_stream_capture_failure_terminates_an_otherwise_successful_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class FailingCapture:
+        def write(self, value: bytes) -> int:
+            del value
+            raise OSError("capture failed")
+
+        def flush(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        process_module,
+        "_open_capture",
+        lambda path: None if path is None else FailingCapture(),
+    )
+    payload = json.dumps(implementation_payload())
+    event = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": payload},
+        }
+    )
+    script = (
+        f"print({event!r},flush=True); "
+        'print(\'{"type":"turn.completed"}\',flush=True); '
+        "import time; time.sleep(5)"
+    )
+
+    result = SubprocessCodexRunner().run(
+        CodexCommand(
+            (sys.executable, "-c", script),
+            tmp_path,
+            stdout_capture=tmp_path / "events.jsonl",
+        ),
+        stdin="prompt",
+        timeout_seconds=2,
+    )
+
+    assert result.transport_failure == "Codex stdout streaming failed: capture failed"
+    assert result.evidence.deadline_outcome == "stream-failure"
+    assert result.evidence.tree_termination_confirmed is True
+
+
+def test_worker_start_failure_preserves_original_exception_and_cleans_process(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def fail_start(worker: object) -> None:
+        del worker
+        raise RuntimeError("input worker could not start")
+
+    monkeypatch.setattr(process_module._InputWorker, "start", fail_start)
+    late = tmp_path / "late"
+    script = (
+        "import pathlib,time; time.sleep(.5); "
+        f"pathlib.Path({str(late)!r}).write_text('late',encoding='utf-8')"
+    )
+
+    with pytest.raises(RuntimeError, match="input worker could not start"):
+        SubprocessCodexRunner().run(
+            CodexCommand((sys.executable, "-c", script), tmp_path),
+            stdin="prompt",
+            timeout_seconds=1,
+        )
+
+    time.sleep(0.7)
+    assert not late.exists()
+
+
+def test_timely_completion_can_exit_during_finalization_allowance(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(process_module, "FINALIZATION_SECONDS", 0.5)
+    payload = json.dumps(implementation_payload())
+    event = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": payload},
+        }
+    )
+    script = (
+        f"print({event!r},flush=True); "
+        'print(\'{"type":"turn.completed"}\',flush=True); '
+        "import time; time.sleep(.1)"
+    )
+
+    result = SubprocessCodexRunner().run(
+        CodexCommand((sys.executable, "-c", script), tmp_path),
+        stdin="prompt",
+        timeout_seconds=2,
+    )
+
+    assert result.returncode == 0
+    assert result.evidence.completion_before_deadline is True
+    assert result.evidence.finalization_outcome == "completed"
+
+
 def test_timely_completion_has_only_bounded_finalization(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1010,7 +1362,7 @@ def test_timely_completion_has_only_bounded_finalization(
     script = (
         "import pathlib,time; "
         f"print({event!r},flush=True); "
-        "print('{\"type\":\"turn.completed\"}',flush=True); "
+        'print(\'{"type":"turn.completed"}\',flush=True); '
         "time.sleep(1); "
         f"pathlib.Path({str(late)!r}).write_text('late',encoding='utf-8')"
     )
@@ -1108,7 +1460,7 @@ def test_windows_job_stops_wrapper_descendant_tree_and_preserves_output(
         "grand=subprocess.Popen([sys.executable,sys.argv[2],sys.argv[5]])\n"
         "pathlib.Path(sys.argv[3]).write_text(json.dumps([int(sys.argv[1]),os.getpid(),grand.pid]),encoding='utf-8')\n"
         "pathlib.Path(sys.argv[4]).write_text('ready',encoding='utf-8')\n"
-        "print('{\"type\":\"turn.started\"}',flush=True)\n"
+        'print(\'{"type":"turn.started"}\',flush=True)\n'
         "print('tree ready',file=sys.stderr,flush=True)\n"
         "time.sleep(4)\n"
         "pathlib.Path(sys.argv[6]).write_text('late',encoding='utf-8')\n",
@@ -1217,7 +1569,7 @@ def test_posix_process_group_stops_descendant_tree_and_preserves_output(
         "grand=subprocess.Popen([sys.executable,sys.argv[2],sys.argv[5]])\n"
         "pathlib.Path(sys.argv[3]).write_text(json.dumps([int(sys.argv[1]),os.getpid(),grand.pid]),encoding='utf-8')\n"
         "pathlib.Path(sys.argv[4]).write_text('ready',encoding='utf-8')\n"
-        "print('{\"type\":\"turn.started\"}',flush=True)\n"
+        'print(\'{"type":"turn.started"}\',flush=True)\n'
         "print('tree ready',file=sys.stderr,flush=True)\n"
         "time.sleep(4)\n"
         "pathlib.Path(sys.argv[6]).write_text('late',encoding='utf-8')\n",
