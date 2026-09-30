@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,8 +27,10 @@ from .evidence import (
     RESULT_ARTIFACT,
     CodexArtifactPaths,
     prepare,
+    process_capture_environment,
     publish_process_output,
     write_diagnostic_result,
+    write_diagnostic_result_bytes,
     write_execution,
     write_process_output,
     write_result,
@@ -41,6 +44,7 @@ from .failures import (
 )
 from .identity import CAPABILITIES, PROVIDER_ID
 from .process import (
+    CLEANUP_SECONDS,
     CodexCommand,
     CodexProcessEvidence,
     CodexProcessRunner,
@@ -184,10 +188,23 @@ class CodexCliAgentExecutor:
             )
 
         raw_result: str | None = None
+        raw_result_bytes: bytes | None = None
         result_read_error: OSError | UnicodeError | None = None
+        output_publication_truncated = False
         command = configured_command
+        overall_deadline = (
+            None
+            if request.policy.timeout_seconds is None
+            else time.monotonic() + request.policy.timeout_seconds + CLEANUP_SECONDS
+        )
         try:
-            with external_scratch_environment(request.repository_path) as environment:
+            with (
+                external_scratch_environment(
+                    request.repository_path,
+                    cleanup_deadline=overall_deadline,
+                ) as environment,
+                process_capture_environment(paths) as capture_paths,
+            ):
                 scratch_result = Path(environment["TEMP"]) / RESULT_ARTIFACT
                 command = build_command(
                     executable=str(resolved),
@@ -201,14 +218,15 @@ class CodexCliAgentExecutor:
                 command = with_environment(command, environment)
                 command = with_capture_paths(
                     command,
-                    stdout=Path(environment["TEMP"]) / "events.jsonl",
-                    stderr=Path(environment["TEMP"]) / "stderr.log",
+                    stdout=capture_paths[0],
+                    stderr=capture_paths[1],
                 )
                 process_started = [False]
                 process_start_observer = _process_start_observer(
                     on_invocation_start,
                     on_started=lambda: process_started.__setitem__(0, True),
                 )
+                runner_started = time.monotonic()
                 try:
                     process = self.runner.run(
                         command,
@@ -218,31 +236,27 @@ class CodexCliAgentExecutor:
                     )
                 except _InvocationStartObserverError as error:
                     raise error.error
-                except FileNotFoundError as error:
-                    write_process_output(paths, stdout="", stderr=f"{error}\n")
-                    return self._failure(
-                        request,
-                        paths,
-                        started,
-                        reason=CodexFailureReason.EXECUTABLE_UNAVAILABLE,
-                        message=(
-                            "Agent provider executable is unavailable: "
-                            f"{command.argv[0]}"
-                        ),
-                        command=command,
-                        exit_code=None,
-                    )
                 except CodexProcessTimedOut as error:
-                    publish_process_output(
+                    publication = publish_process_output(
                         paths,
                         stdout_source=error.result.stdout_capture,
                         stderr_source=error.result.stderr_capture,
                         stdout_fallback=error.result.stdout,
                         stderr_fallback=error.result.stderr,
+                        stdout_capture_complete=(error.result.stdout_capture_complete),
+                        stderr_capture_complete=(error.result.stderr_capture_complete),
                     )
-                    diagnostic = _read_scratch_result(scratch_result)
-                    if diagnostic is not None:
-                        write_diagnostic_result(paths, diagnostic)
+                    diagnostic_bytes, diagnostic, _ = _read_scratch_result(
+                        scratch_result
+                    )
+                    _write_scratch_diagnostic(paths, diagnostic_bytes, diagnostic)
+                    process_metadata = _process_evidence_metadata(
+                        error.result.evidence,
+                        configured_timeout=error.result.timeout_seconds,
+                    )
+                    process_metadata["output_publication_truncated"] = (
+                        publication.truncated
+                    )
                     return self._failure(
                         request,
                         paths,
@@ -253,24 +267,41 @@ class CodexCliAgentExecutor:
                         exit_code=None,
                         timed_out=True,
                         timeout_seconds=error.result.timeout_seconds,
-                        structured_result_present=diagnostic is not None,
-                        extra_metadata=_process_evidence_metadata(
-                            error.result.evidence,
-                            configured_timeout=error.result.timeout_seconds,
-                        ),
+                        structured_result_present=diagnostic_bytes is not None,
+                        extra_metadata=process_metadata,
                     )
-                except OSError as error:
+                except Exception as error:  # noqa: BLE001 - transport boundary
                     if process_started[0]:
-                        publish_process_output(
+                        publication = publish_process_output(
                             paths,
                             stdout_source=command.stdout_capture,
                             stderr_source=command.stderr_capture,
                             stdout_fallback="",
                             stderr_fallback=f"{error}\n",
+                            stdout_capture_complete=False,
+                            stderr_capture_complete=False,
                         )
-                        diagnostic = _read_scratch_result(scratch_result)
-                        if diagnostic is not None:
-                            write_diagnostic_result(paths, diagnostic)
+                        diagnostic_bytes, diagnostic, _ = _read_scratch_result(
+                            scratch_result
+                        )
+                        _write_scratch_diagnostic(paths, diagnostic_bytes, diagnostic)
+                        elapsed = max(0.0, time.monotonic() - runner_started)
+                        process_metadata = _process_evidence_metadata(
+                            CodexProcessEvidence(
+                                work_timeout_seconds=request.policy.timeout_seconds,
+                                work_elapsed_seconds=elapsed,
+                                total_elapsed_seconds=elapsed,
+                                deadline_outcome="transport-exception",
+                                finalization_outcome="failed",
+                                cleanup_outcome="unknown",
+                                tree_termination_confirmed=False,
+                                output_draining_truncated=True,
+                            ),
+                            configured_timeout=request.policy.timeout_seconds,
+                        )
+                        process_metadata["output_publication_truncated"] = (
+                            publication.truncated
+                        )
                         return self._failure(
                             request,
                             paths,
@@ -280,29 +311,43 @@ class CodexCliAgentExecutor:
                             command=command,
                             exit_code=None,
                             timeout_seconds=request.policy.timeout_seconds,
-                            structured_result_present=diagnostic is not None,
+                            structured_result_present=(diagnostic_bytes is not None),
+                            extra_metadata=process_metadata,
                         )
                     write_process_output(paths, stdout="", stderr=f"{error}\n")
+                    if isinstance(error, FileNotFoundError):
+                        reason = CodexFailureReason.EXECUTABLE_UNAVAILABLE
+                        message = (
+                            "Agent provider executable is unavailable: "
+                            f"{command.argv[0]}"
+                        )
+                    else:
+                        reason = CodexFailureReason.PROCESS_START_FAILED
+                        message = f"Could not start agent provider process: {error}"
                     return self._failure(
                         request,
                         paths,
                         started,
-                        reason=CodexFailureReason.PROCESS_START_FAILED,
-                        message=f"Could not start agent provider process: {error}",
+                        reason=reason,
+                        message=message,
                         command=command,
                         exit_code=None,
                     )
-                try:
-                    raw_result = scratch_result.read_text(encoding="utf-8")
-                except (OSError, UnicodeError) as error:
-                    result_read_error = error
-                publish_process_output(
+                raw_result_bytes, raw_result, result_read_error = _read_scratch_result(
+                    scratch_result
+                )
+                if raw_result_bytes is not None and raw_result is None:
+                    write_diagnostic_result_bytes(paths, raw_result_bytes)
+                publication = publish_process_output(
                     paths,
                     stdout_source=process.stdout_capture,
                     stderr_source=process.stderr_capture,
                     stdout_fallback=process.stdout,
                     stderr_fallback=process.stderr,
+                    stdout_capture_complete=process.stdout_capture_complete,
+                    stderr_capture_complete=process.stderr_capture_complete,
                 )
+                output_publication_truncated = publication.truncated
         except CodexScratchDirectoryError as error:
             write_process_output(paths, stdout="", stderr=f"{error}\n")
             return self._failure(
@@ -318,6 +363,7 @@ class CodexCliAgentExecutor:
             process.evidence,
             configured_timeout=request.policy.timeout_seconds,
         )
+        process_metadata["output_publication_truncated"] = output_publication_truncated
         if process.transport_failure is not None:
             if raw_result is not None:
                 write_diagnostic_result(paths, raw_result)
@@ -335,7 +381,7 @@ class CodexCliAgentExecutor:
                 command=command,
                 exit_code=process.returncode,
                 timeout_seconds=request.policy.timeout_seconds,
-                structured_result_present=raw_result is not None,
+                structured_result_present=raw_result_bytes is not None,
                 extra_metadata=process_metadata,
             )
         if process.returncode != 0:
@@ -355,7 +401,7 @@ class CodexCliAgentExecutor:
                 command=command,
                 exit_code=process.returncode,
                 timeout_seconds=request.policy.timeout_seconds,
-                structured_result_present=raw_result is not None,
+                structured_result_present=raw_result_bytes is not None,
                 extra_metadata=process_metadata,
             )
 
@@ -378,7 +424,7 @@ class CodexCliAgentExecutor:
                 command=command,
                 exit_code=process.returncode,
                 timeout_seconds=request.policy.timeout_seconds,
-                structured_result_present=raw_result is not None,
+                structured_result_present=raw_result_bytes is not None,
                 extra_metadata=process_metadata,
             )
 
@@ -398,6 +444,7 @@ class CodexCliAgentExecutor:
                 command=command,
                 exit_code=process.returncode,
                 timeout_seconds=request.policy.timeout_seconds,
+                structured_result_present=raw_result_bytes is not None,
                 extra_metadata=process_metadata,
             )
 
@@ -566,11 +613,36 @@ def _schema_for(task_kind: AgentTaskKind) -> Path:
     )
 
 
-def _read_scratch_result(path: Path) -> str | None:
+def _read_scratch_result(
+    path: Path,
+) -> tuple[bytes | None, str | None, OSError | UnicodeError | None]:
+    value: bytes | None = None
     try:
-        return path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        return None
+        value = path.read_bytes()
+    except OSError as error:
+        return None, None, error
+    finally:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    try:
+        return value, value.decode("utf-8"), None
+    except UnicodeError as error:
+        return value, None, error
+
+
+def _write_scratch_diagnostic(
+    paths: CodexArtifactPaths,
+    value: bytes | None,
+    text: str | None,
+) -> None:
+    if value is None:
+        return
+    if text is None:
+        write_diagnostic_result_bytes(paths, value)
+    else:
+        write_diagnostic_result(paths, text)
 
 
 def _process_evidence_metadata(
@@ -672,9 +744,7 @@ def _execution_record(execution: AgentExecution[TaskResult]) -> JsonObject:
         "structured_result_validated": metadata.get(
             "structured_result_validated", False
         ),
-        "structured_result_accepted": metadata.get(
-            "structured_result_accepted", False
-        ),
+        "structured_result_accepted": metadata.get("structured_result_accepted", False),
         "work_timeout_seconds": metadata.get("work_timeout_seconds"),
         "work_elapsed_seconds": metadata.get("work_elapsed_seconds"),
         "total_elapsed_seconds": metadata.get("total_elapsed_seconds"),
@@ -682,9 +752,7 @@ def _execution_record(execution: AgentExecution[TaskResult]) -> JsonObject:
         "terminal_event_elapsed_seconds": metadata.get(
             "terminal_event_elapsed_seconds"
         ),
-        "completion_before_deadline": metadata.get(
-            "completion_before_deadline", False
-        ),
+        "completion_before_deadline": metadata.get("completion_before_deadline", False),
         "structured_message_observed": metadata.get(
             "structured_message_observed", False
         ),
@@ -700,8 +768,9 @@ def _execution_record(execution: AgentExecution[TaskResult]) -> JsonObject:
         "termination_method": metadata.get("termination_method"),
         "tree_termination_confirmed": metadata.get("tree_termination_confirmed"),
         "cleanup_duration_seconds": metadata.get("cleanup_duration_seconds"),
-        "output_draining_truncated": metadata.get(
-            "output_draining_truncated", False
+        "output_draining_truncated": metadata.get("output_draining_truncated", False),
+        "output_publication_truncated": metadata.get(
+            "output_publication_truncated", False
         ),
         "event_stream_problem": metadata.get("event_stream_problem"),
         "result_json_present": any(

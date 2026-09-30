@@ -147,15 +147,22 @@ Workspace-guard evidence is recorded in the writable execution metadata.
 There are no per-round patch or `.stat` copies, duplicate Codex result files,
 or automatic Git cleanup.
 
-Codex stdout and stderr are drained concurrently into external provider scratch
-storage and then atomically published into the owned attempt. A successful
+Codex stdout and stderr are drained concurrently into exclusively created,
+hidden staging captures inside the owned attempt directory. The runner is the
+only writer, marks a capture incomplete if reading or bounded shutdown fails,
+revokes worker access before return, and atomically promotes only a complete,
+revalidated regular file. The canonical result file is different: Codex writes
+it in external provider scratch storage, and the adapter validates it before
+publishing either a typed result or separate diagnostic evidence. A successful
 `turn.completed` and its final structured agent message must both be observed
 strictly before the monotonic work deadline. Timely completion permits at most
 five seconds from that terminal observation for normal process exit and result
 file publication. A marker or result first observed at/after the deadline is
 diagnostic only and cannot turn a timeout into success. Raw result files from a
 timeout or failed finalisation use the separate
-`codex-diagnostic-result.json` artifact and never the typed-result role.
+`codex-diagnostic-result.json` artifact and never the typed-result role. Raw
+results that are not UTF-8 are preserved byte-for-byte as
+`codex-diagnostic-result.bin` with an octet-stream media type.
 
 Timeout, interruption, stream failure, and failed finalisation terminate the
 entire invocation tree. Windows uses a kill-on-close Job Object assigned while

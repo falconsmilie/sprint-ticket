@@ -110,10 +110,10 @@ class AgentSettings:
         for task_kind, timeout in self.timeouts.items():
             if not isinstance(task_kind, AgentTaskKind):
                 raise ConfigError("agents.timeouts keys must be AgentTaskKind values.")
-            if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 1:
-                raise ConfigError(
-                    f"agents.timeouts.{task_kind.value} must be a positive integer."
-                )
+            _validate_agent_timeout(
+                timeout,
+                f"agents.timeouts.{task_kind.value}_seconds",
+            )
 
         object.__setattr__(
             self, "assignments", MappingProxyType(dict(self.assignments))
@@ -335,9 +335,12 @@ def _parse_agent_settings(agents: dict[str, Any]) -> AgentSettings:
         task_kind: (
             DEFAULT_AGENT_TIMEOUT_SECONDS
             if timeout_keys[task_kind] not in raw_timeouts
-            else _require_positive_int(
-                raw_timeouts,
-                timeout_keys[task_kind],
+            else _validate_agent_timeout(
+                _require_positive_int(
+                    raw_timeouts,
+                    timeout_keys[task_kind],
+                    f"agents.timeouts.{timeout_keys[task_kind]}",
+                ),
                 f"agents.timeouts.{timeout_keys[task_kind]}",
             )
         )
@@ -385,6 +388,22 @@ def _require_positive_int(table: dict[str, Any], key: str, dotted_name: str) -> 
     value = table.get(key)
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise ConfigError(f"{dotted_name} must be a positive integer.")
+    return value
+
+
+def _validate_agent_timeout(value: object, dotted_name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ConfigError(f"{dotted_name} must be a positive integer.")
+    try:
+        represented = float(value)
+    except OverflowError as error:
+        raise ConfigError(
+            f"{dotted_name} must be exactly representable by the execution policy."
+        ) from error
+    if int(represented) != value:
+        raise ConfigError(
+            f"{dotted_name} must be exactly representable by the execution policy."
+        )
     return value
 
 

@@ -47,6 +47,43 @@ def atomic_write_text(path: Path | str, value: str) -> None:
     _atomic_write_text_payload(Path(path), write_payload, description="text")
 
 
+def atomic_write_bytes(path: Path | str, value: bytes) -> None:
+    """Atomically replace one byte artifact without following file links."""
+
+    if not isinstance(value, bytes):
+        raise TypeError("byte artifact value must be bytes.")
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    descriptor = -1
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        with os.fdopen(descriptor, "wb") as output:
+            descriptor = -1
+            output.write(value)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, destination)
+        _sync_directory(destination.parent)
+    except BaseException as error:
+        if descriptor != -1:
+            os.close(descriptor)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        if not isinstance(error, Exception):
+            raise
+        if isinstance(error, PersistenceError):
+            raise
+        raise PersistenceError(
+            f"Could not atomically write bytes {destination}: {error}"
+        ) from error
+
+
 def atomic_copy_file(source: Path | str, destination: Path | str) -> None:
     """Atomically publish a file without loading it all or following the target."""
 
@@ -62,9 +99,10 @@ def atomic_copy_file(source: Path | str, destination: Path | str) -> None:
             suffix=".tmp",
         )
         temporary = Path(temporary_name)
-        with source_path.open("rb") as input_file, os.fdopen(
-            descriptor, "wb"
-        ) as output_file:
+        with (
+            source_path.open("rb") as input_file,
+            os.fdopen(descriptor, "wb") as output_file,
+        ):
             descriptor = -1
             shutil.copyfileobj(input_file, output_file, length=64 * 1024)
             output_file.flush()
@@ -276,6 +314,7 @@ __all__ = [
     "JsonValue",
     "PersistenceError",
     "atomic_copy_file",
+    "atomic_write_bytes",
     "atomic_write_json",
     "atomic_write_text",
     "exclusive_write_bytes",

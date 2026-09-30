@@ -580,6 +580,7 @@ def _resolved_task_policy(
             f"Missing typed provider assignment for {task_kind.value}."
         )
     access = _task_repository_access(task_kind)
+    _validate_resolved_timeout(timeout_seconds, task_kind=task_kind)
     return ResolvedTaskPolicy(
         task_kind=task_kind,
         provider_id=provider_id,
@@ -729,14 +730,16 @@ def _parse_execution_policy(data: dict[str, Any]) -> AgentExecutionPolicy:
     )
     timeout = data.get("timeout_seconds")
     try:
+        # Validate the persisted JSON value before AgentExecutionPolicy converts
+        # integers to float. Otherwise a large integer can be silently rounded.
+        _validate_resolved_timeout(timeout)
         network_access = NetworkAccess(_require_string(data, "network_access"))
         policy = AgentExecutionPolicy(
             timeout_seconds=timeout,
             network_access=network_access,
         )
-        _validate_resolved_timeout(policy.timeout_seconds)
         return policy
-    except (TypeError, ValueError) as error:
+    except (OverflowError, TypeError, ValueError) as error:
         raise ResolvedRunPolicyError(
             f"resolved_policy task execution_policy is invalid: {error}"
         ) from error
@@ -752,14 +755,26 @@ def _validate_resolved_timeout(
         if task_kind is None
         else f"resolved_policy task {task_kind.value} execution_policy.timeout_seconds"
     )
+    valid = not isinstance(timeout_seconds, bool) and isinstance(
+        timeout_seconds, (int, float)
+    )
+    try:
+        represented = float(timeout_seconds) if valid else 0.0
+    except OverflowError:
+        valid = False
+        represented = 0.0
     if (
-        isinstance(timeout_seconds, bool)
-        or not isinstance(timeout_seconds, (int, float))
-        or not float(timeout_seconds).is_integer()
-        or not (0 < float(timeout_seconds) < float("inf"))
+        not valid
+        or not represented.is_integer()
+        or not (0 < represented < float("inf"))
+        or (
+            isinstance(timeout_seconds, int)
+            and int(represented) != timeout_seconds
+        )
     ):
         raise ResolvedRunPolicyError(
-            f"{label} must be a finite, positive whole number of seconds."
+            f"{label} must be a finite, positive whole number of seconds that "
+            "is exactly representable by the execution policy."
         )
 
 

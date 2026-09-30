@@ -41,5 +41,10 @@ gets at most five seconds for normal exit and publication of an identical
 canonical result. Late completion stays diagnostic. Timeout and post-launch
 failure terminate the complete Windows Job Object or POSIX process group, with
 one ten-second budget shared by termination, drain, reap, and thread shutdown.
+Invocation-start recording is included in the launch deadline; a blocked
+recorder cannot keep the contained tree alive. Stdout/stderr use exclusive
+attempt-owned staging captures that are promoted only after their workers stop
+cleanly, while the canonical result remains in external provider scratch until
+validation. Non-UTF-8 result bytes are retained as octet-stream diagnostics.
 Provider-native execution evidence is now schema 2 and records deadline,
 terminal, finalisation, termination, cleanup, and structured-result decisions.

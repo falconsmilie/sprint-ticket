@@ -88,6 +88,30 @@ def test_invalid_agent_timeout_values_are_rejected(value):
         parse_config(raw, configuration_directory=Path.cwd())
 
 
+def test_agent_timeout_rejects_integer_that_execution_policy_cannot_represent():
+    raw = base_raw_config()
+    raw["agents"]["timeouts"] = {  # type: ignore[index]
+        "implementation_seconds": 2**53 + 1
+    }
+
+    with pytest.raises(
+        ConfigError,
+        match=r"agents\.timeouts\.implementation_seconds.*exactly representable",
+    ):
+        parse_config(raw, configuration_directory=Path.cwd())
+
+
+def test_agent_timeout_accepts_exact_execution_policy_precision_boundary():
+    raw = base_raw_config()
+    raw["agents"]["timeouts"] = {  # type: ignore[index]
+        "implementation_seconds": 2**53
+    }
+
+    config = parse_config(raw, configuration_directory=Path.cwd())
+
+    assert config.agents.timeouts[AgentTaskKind.IMPLEMENTATION] == 2**53
+
+
 def test_malformed_and_unknown_agent_timeout_tables_are_rejected():
     raw = base_raw_config()
     raw["agents"]["timeouts"] = "one hour"  # type: ignore[index]

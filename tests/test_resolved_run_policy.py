@@ -167,13 +167,68 @@ def test_distinct_task_deadlines_round_trip_and_reconstruct_configuration(tmp_pa
     assert reconstructed.agents.timeouts == config.agents.timeouts
 
 
-@pytest.mark.parametrize("value", [None, 0, -1, True, 1.5, float("inf")])
+def test_exact_float_boundary_deadline_serializes_and_reconstructs(tmp_path):
+    provider_id = ProviderId("shared")
+    registration = StubRegistration(provider_id)
+    config = _policy_config(
+        tmp_path,
+        assignments={kind: provider_id for kind in AgentTaskKind},
+        registrations={provider_id: registration},
+    )
+    boundary = 2**53
+    config = replace(
+        config,
+        agents=replace(
+            config.agents,
+            timeouts={kind: boundary for kind in AgentTaskKind},
+        ),
+    )
+
+    resolved = resolve_run_policy(
+        config,
+        target_repository_path=tmp_path,
+        assignments=config.agents.assignments,
+        provider_policies={provider_id: StubPolicy("value")},
+        provider_registrations={provider_id: registration},
+    )
+    serialized = resolved.to_dict()
+    loaded = ResolvedRunPolicy.from_dict(serialized)
+    reconstructed = config_from_resolved_run_policy(loaded)
+
+    assert (
+        serialized["tasks"]["implementation"]["execution_policy"]["timeout_seconds"]
+        == boundary
+    )
+    assert (
+        loaded.task_policy(
+            AgentTaskKind.IMPLEMENTATION
+        ).execution_policy.timeout_seconds
+        == boundary
+    )
+    assert reconstructed.agents.timeouts == {kind: boundary for kind in AgentTaskKind}
+
+
+def test_persisted_integer_deadline_is_rejected_before_lossy_conversion(tmp_path):
+    resolved, _ = _shared_policy(tmp_path)
+    data = resolved.to_dict()
+    data["tasks"]["implementation"]["execution_policy"]["timeout_seconds"] = 2**53 + 1
+
+    with pytest.raises(ResolvedRunPolicyError, match="exactly representable"):
+        ResolvedRunPolicy.from_dict(data)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, 0, -1, True, 1.5, float("inf"), 10**1000],
+)
 def test_persisted_task_deadline_requires_positive_whole_seconds(tmp_path, value):
     resolved, _ = _shared_policy(tmp_path)
     data = resolved.to_dict()
     data["tasks"]["implementation"]["execution_policy"]["timeout_seconds"] = value
 
-    with pytest.raises(ResolvedRunPolicyError, match="timeout_seconds|execution_policy"):
+    with pytest.raises(
+        ResolvedRunPolicyError, match="timeout_seconds|execution_policy"
+    ):
         ResolvedRunPolicy.from_dict(data)
 
 
@@ -189,6 +244,17 @@ def test_round_trip_and_executor_selection_with_distinct_task_providers(tmp_path
         repository,
         assignments=ids,
         registrations=registrations,
+    )
+    config = replace(
+        config,
+        agents=replace(
+            config.agents,
+            timeouts={
+                AgentTaskKind.IMPLEMENTATION: 7200,
+                AgentTaskKind.REVIEW: 5400,
+                AgentTaskKind.CORRECTION: 7100,
+            },
+        ),
     )
     resolved = resolve_run_policy(
         config,
@@ -220,6 +286,14 @@ def test_round_trip_and_executor_selection_with_distinct_task_providers(tmp_path
     assert executors.review is registrations[ids[AgentTaskKind.REVIEW]].executor
     assert executors.correction is registrations[ids[AgentTaskKind.CORRECTION]].executor
     assert len(loaded.resolved_policy.provider_policies) == 3
+    assert {
+        kind: loaded.resolved_policy.task_policy(kind).execution_policy.timeout_seconds
+        for kind in AgentTaskKind
+    } == {
+        AgentTaskKind.IMPLEMENTATION: 7200.0,
+        AgentTaskKind.REVIEW: 5400.0,
+        AgentTaskKind.CORRECTION: 7100.0,
+    }
     for provider_id, registration in registrations.items():
         assert registration.created_policies == [
             StubPolicy(setting=f"setting-for-{provider_id}")
@@ -446,6 +520,36 @@ def test_run_creation_rejects_policy_from_a_different_configuration(tmp_path):
             runs_dir=tmp_path / "runs",
             provider_preflight=lambda *, repository_path: PreflightResult(()),
             resolved_policy=mismatched,
+        )
+
+    assert not (tmp_path / "runs").exists()
+
+
+@pytest.mark.parametrize("task_kind", list(AgentTaskKind))
+def test_run_creation_rejects_each_task_deadline_mismatch(tmp_path, task_kind):
+    repository = create_git_repo(tmp_path / "repository")
+    ticket = tmp_path / "TA-PERSIST-001.md"
+    ticket.write_text("# Persist provider-neutral policy\n", encoding="utf-8")
+    resolved, registration = _shared_policy(repository)
+    configured_timeouts = {kind: 3600 for kind in AgentTaskKind}
+    configured_timeouts[task_kind] = 3601
+    config = _policy_config(
+        repository,
+        assignments=resolved.assignments,
+        registrations={registration.provider_id: registration},
+    )
+    config = replace(
+        config,
+        agents=replace(config.agents, timeouts=configured_timeouts),
+    )
+
+    with pytest.raises(RunError, match="agent task deadlines"):
+        create_run_snapshot(
+            config,
+            ticket,
+            runs_dir=tmp_path / "runs",
+            provider_preflight=lambda *, repository_path: PreflightResult(()),
+            resolved_policy=resolved,
         )
 
     assert not (tmp_path / "runs").exists()

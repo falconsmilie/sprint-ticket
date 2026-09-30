@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .application.agent_execution import AgentTaskKind
 from .application.ports.preflight import PreflightResult, ProviderPreflight
 from .config import AppConfig
 from .git import GitCommandError, GitRepository
@@ -470,6 +471,14 @@ def _validate_new_run_policy(
         mismatches.append("correction limit")
     if resolved_policy.assignments != config.agents.assignments:
         mismatches.append("provider assignments")
+    resolved_timeouts = {
+        task_kind: int(
+            resolved_policy.task_policy(task_kind).execution_policy.timeout_seconds
+        )
+        for task_kind in AgentTaskKind
+    }
+    if resolved_timeouts != config.agents.timeouts:
+        mismatches.append("agent task deadlines")
     if mismatches:
         raise RunError(
             "Resolved run policy does not match the run configuration: "
