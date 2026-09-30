@@ -6,6 +6,7 @@ from pathlib import Path
 
 import ticket_automation.review as review_module
 from tests.helpers import (
+    completed_codex_process_result,
     create_git_repo,
     create_trusted_prepared_run,
     make_agent_executor,
@@ -27,7 +28,6 @@ from ticket_automation.models import (
     StageOutcome,
     WorkflowState,
 )
-from ticket_automation.providers.codex_cli import CodexProcessResult
 from ticket_automation.review import run_review_stage
 from ticket_automation.runs import save_run_record
 from ticket_automation.verification import (
@@ -42,7 +42,7 @@ def fixed_clock() -> datetime:
 
 class CompletingCodexRunner:
     def run(self, command, *, stdin, timeout_seconds, on_process_start=None):
-        del stdin, timeout_seconds
+        del stdin
         if on_process_start is not None:
             on_process_start()
         if command.argv[command.argv.index("--sandbox") + 1] == "read-only":
@@ -62,7 +62,10 @@ class CompletingCodexRunner:
             json.dumps(result),
             encoding="utf-8",
         )
-        return CodexProcessResult(returncode=0, stdout="", stderr="")
+        return completed_codex_process_result(
+            result,
+            timeout_seconds=timeout_seconds or 60,
+        )
 
 
 class PassingVerificationRunner:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from pathlib import Path
 from types import MappingProxyType
@@ -17,6 +17,7 @@ from .application.agent_execution import (
 )
 
 DEFAULT_MAX_CORRECTION_ROUNDS = 1
+DEFAULT_AGENT_TIMEOUT_SECONDS = 60 * 60
 SECRET_FIELD_MARKERS = ("secret", "password", "token", "api_key", "apikey")
 _TOP_LEVEL_SECTIONS = frozenset({"project", "runner", "agents", "verification"})
 
@@ -49,10 +50,17 @@ class VerificationSettings:
     commands: tuple[VerificationCommand, ...]
 
 
+def _default_agent_timeouts() -> Mapping[AgentTaskKind, int]:
+    return MappingProxyType(
+        {kind: DEFAULT_AGENT_TIMEOUT_SECONDS for kind in AgentTaskKind}
+    )
+
+
 @dataclass(frozen=True)
 class AgentSettings:
     assignments: Mapping[AgentTaskKind, ProviderId]
     providers: Mapping[ProviderId, Mapping[str, object]]
+    timeouts: Mapping[AgentTaskKind, int] = field(default_factory=_default_agent_timeouts)
 
     def __post_init__(self) -> None:
         if not isinstance(self.assignments, Mapping):
@@ -93,6 +101,19 @@ class AgentSettings:
                 raise ConfigError(
                     f"{task_kind.value} is assigned to unconfigured provider {provider_id}."
                 )
+        if not isinstance(self.timeouts, Mapping):
+            raise ConfigError("agents.timeouts must be a mapping.")
+        if set(self.timeouts) != set(AgentTaskKind):
+            raise ConfigError(
+                "agents.timeouts must contain implementation, review, and correction."
+            )
+        for task_kind, timeout in self.timeouts.items():
+            if not isinstance(task_kind, AgentTaskKind):
+                raise ConfigError("agents.timeouts keys must be AgentTaskKind values.")
+            if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 1:
+                raise ConfigError(
+                    f"agents.timeouts.{task_kind.value} must be a positive integer."
+                )
 
         object.__setattr__(
             self, "assignments", MappingProxyType(dict(self.assignments))
@@ -107,6 +128,7 @@ class AgentSettings:
                 }
             ),
         )
+        object.__setattr__(self, "timeouts", MappingProxyType(dict(self.timeouts)))
 
 
 @dataclass(frozen=True)
@@ -196,6 +218,10 @@ def format_config_summary(
         f"  {task_kind.value}: {config.agents.assignments[task_kind]}"
         for task_kind in AgentTaskKind
     )
+    deadlines = "\n".join(
+        f"  {task_kind.value}: {config.agents.timeouts[task_kind]}s"
+        for task_kind in AgentTaskKind
+    )
     providers: list[str] = []
     for provider_id, settings in provider_settings.items():
         providers.append(f"  {provider_id}")
@@ -218,6 +244,9 @@ def format_config_summary(
             "",
             "Agent assignments",
             assignments,
+            "",
+            "Agent task deadlines",
+            deadlines,
             "",
             "Agent providers",
             *providers,
@@ -263,6 +292,15 @@ def _parse_agent_settings(agents: dict[str, Any]) -> AgentSettings:
         agents, "assignments", "agents.assignments"
     )
     providers_table = _require_nested_table(agents, "providers", "agents.providers")
+    raw_timeouts = agents.get("timeouts", {})
+    if not isinstance(raw_timeouts, dict):
+        raise ConfigError("agents.timeouts must be a configuration table.")
+    timeout_keys = {kind: f"{kind.value}_seconds" for kind in AgentTaskKind}
+    unknown_timeouts = sorted(set(raw_timeouts) - set(timeout_keys.values()))
+    if unknown_timeouts:
+        raise ConfigError(
+            "Unknown agents.timeouts field(s): " + ", ".join(unknown_timeouts) + "."
+        )
     unknown_tasks = sorted(
         set(assignments_table) - {kind.value for kind in AgentTaskKind}
     )
@@ -293,7 +331,23 @@ def _parse_agent_settings(agents: dict[str, Any]) -> AgentSettings:
                 f"{task_kind.value} is assigned to unconfigured provider "
                 f"{provider_id}; add [agents.providers.{provider_id}]."
             )
-    return AgentSettings(assignments=assignments, providers=providers)
+    timeouts = {
+        task_kind: (
+            DEFAULT_AGENT_TIMEOUT_SECONDS
+            if timeout_keys[task_kind] not in raw_timeouts
+            else _require_positive_int(
+                raw_timeouts,
+                timeout_keys[task_kind],
+                f"agents.timeouts.{timeout_keys[task_kind]}",
+            )
+        )
+        for task_kind in AgentTaskKind
+    }
+    return AgentSettings(
+        assignments=assignments,
+        providers=providers,
+        timeouts=timeouts,
+    )
 
 
 def _provider_id(value: str, dotted_name: str) -> ProviderId:
@@ -444,6 +498,7 @@ def _redact_if_secret(key: str, value: str) -> str:
 
 
 __all__ = [
+    "DEFAULT_AGENT_TIMEOUT_SECONDS",
     "AgentSettings",
     "AppConfig",
     "ConfigError",

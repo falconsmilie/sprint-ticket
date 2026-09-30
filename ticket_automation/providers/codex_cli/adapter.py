@@ -26,6 +26,8 @@ from .evidence import (
     RESULT_ARTIFACT,
     CodexArtifactPaths,
     prepare,
+    publish_process_output,
+    write_diagnostic_result,
     write_execution,
     write_process_output,
     write_result,
@@ -40,11 +42,13 @@ from .failures import (
 from .identity import CAPABILITIES, PROVIDER_ID
 from .process import (
     CodexCommand,
+    CodexProcessEvidence,
     CodexProcessRunner,
     CodexProcessTimedOut,
     CodexScratchDirectoryError,
     SubprocessCodexRunner,
     external_scratch_environment,
+    with_capture_paths,
     with_environment,
 )
 from .results import decode_result
@@ -195,7 +199,16 @@ class CodexCliAgentExecutor:
                     output_result=scratch_result,
                 )
                 command = with_environment(command, environment)
-                process_start_observer = _process_start_observer(on_invocation_start)
+                command = with_capture_paths(
+                    command,
+                    stdout=Path(environment["TEMP"]) / "events.jsonl",
+                    stderr=Path(environment["TEMP"]) / "stderr.log",
+                )
+                process_started = [False]
+                process_start_observer = _process_start_observer(
+                    on_invocation_start,
+                    on_started=lambda: process_started.__setitem__(0, True),
+                )
                 try:
                     process = self.runner.run(
                         command,
@@ -220,11 +233,16 @@ class CodexCliAgentExecutor:
                         exit_code=None,
                     )
                 except CodexProcessTimedOut as error:
-                    write_process_output(
+                    publish_process_output(
                         paths,
-                        stdout=error.result.stdout,
-                        stderr=error.result.stderr,
+                        stdout_source=error.result.stdout_capture,
+                        stderr_source=error.result.stderr_capture,
+                        stdout_fallback=error.result.stdout,
+                        stderr_fallback=error.result.stderr,
                     )
+                    diagnostic = _read_scratch_result(scratch_result)
+                    if diagnostic is not None:
+                        write_diagnostic_result(paths, diagnostic)
                     return self._failure(
                         request,
                         paths,
@@ -235,8 +253,35 @@ class CodexCliAgentExecutor:
                         exit_code=None,
                         timed_out=True,
                         timeout_seconds=error.result.timeout_seconds,
+                        structured_result_present=diagnostic is not None,
+                        extra_metadata=_process_evidence_metadata(
+                            error.result.evidence,
+                            configured_timeout=error.result.timeout_seconds,
+                        ),
                     )
                 except OSError as error:
+                    if process_started[0]:
+                        publish_process_output(
+                            paths,
+                            stdout_source=command.stdout_capture,
+                            stderr_source=command.stderr_capture,
+                            stdout_fallback="",
+                            stderr_fallback=f"{error}\n",
+                        )
+                        diagnostic = _read_scratch_result(scratch_result)
+                        if diagnostic is not None:
+                            write_diagnostic_result(paths, diagnostic)
+                        return self._failure(
+                            request,
+                            paths,
+                            started,
+                            reason=CodexFailureReason.TRANSPORT_FAILURE,
+                            message=f"Agent provider transport failed: {error}",
+                            command=command,
+                            exit_code=None,
+                            timeout_seconds=request.policy.timeout_seconds,
+                            structured_result_present=diagnostic is not None,
+                        )
                     write_process_output(paths, stdout="", stderr=f"{error}\n")
                     return self._failure(
                         request,
@@ -251,6 +296,13 @@ class CodexCliAgentExecutor:
                     raw_result = scratch_result.read_text(encoding="utf-8")
                 except (OSError, UnicodeError) as error:
                     result_read_error = error
+                publish_process_output(
+                    paths,
+                    stdout_source=process.stdout_capture,
+                    stderr_source=process.stderr_capture,
+                    stdout_fallback=process.stdout,
+                    stderr_fallback=process.stderr,
+                )
         except CodexScratchDirectoryError as error:
             write_process_output(paths, stdout="", stderr=f"{error}\n")
             return self._failure(
@@ -262,10 +314,33 @@ class CodexCliAgentExecutor:
                 command=command,
                 exit_code=None,
             )
-        if raw_result is not None:
-            write_result(paths, raw_result)
-        write_process_output(paths, stdout=process.stdout, stderr=process.stderr)
+        process_metadata = _process_evidence_metadata(
+            process.evidence,
+            configured_timeout=request.policy.timeout_seconds,
+        )
+        if process.transport_failure is not None:
+            if raw_result is not None:
+                write_diagnostic_result(paths, raw_result)
+            reason = (
+                CodexFailureReason.FINALIZATION_FAILED
+                if process.evidence.finalization_outcome == "expired"
+                else CodexFailureReason.TRANSPORT_FAILURE
+            )
+            return self._failure(
+                request,
+                paths,
+                started,
+                reason=reason,
+                message=process.transport_failure,
+                command=command,
+                exit_code=process.returncode,
+                timeout_seconds=request.policy.timeout_seconds,
+                structured_result_present=raw_result is not None,
+                extra_metadata=process_metadata,
+            )
         if process.returncode != 0:
+            if raw_result is not None:
+                write_diagnostic_result(paths, raw_result)
             reason = (
                 CodexFailureReason.AUTHENTICATION_OR_SERVICE
                 if looks_like_authentication_or_service_failure(process.stderr)
@@ -279,6 +354,32 @@ class CodexCliAgentExecutor:
                 message=f"Agent provider exited with code {process.returncode}.",
                 command=command,
                 exit_code=process.returncode,
+                timeout_seconds=request.policy.timeout_seconds,
+                structured_result_present=raw_result is not None,
+                extra_metadata=process_metadata,
+            )
+
+        if not (
+            process.evidence.completion_before_deadline
+            and process.evidence.structured_message_before_deadline
+            and process.evidence.structured_message is not None
+        ):
+            if raw_result is not None:
+                write_diagnostic_result(paths, raw_result)
+            return self._failure(
+                request,
+                paths,
+                started,
+                reason=CodexFailureReason.TRANSPORT_FAILURE,
+                message=(
+                    "Agent provider exited without a terminal success and final "
+                    "structured message observed before the work deadline."
+                ),
+                command=command,
+                exit_code=process.returncode,
+                timeout_seconds=request.policy.timeout_seconds,
+                structured_result_present=raw_result is not None,
+                extra_metadata=process_metadata,
             )
 
         if raw_result is None:
@@ -296,14 +397,21 @@ class CodexCliAgentExecutor:
                 message=f"Agent provider {detail}.",
                 command=command,
                 exit_code=process.returncode,
+                timeout_seconds=request.policy.timeout_seconds,
+                extra_metadata=process_metadata,
             )
 
         try:
-            decoded = decode_result(
-                json.loads(raw_result),
-                request,
-            )
+            raw_value = json.loads(raw_result)
+            if process.evidence.structured_message is not None:
+                message_value = json.loads(process.evidence.structured_message)
+                if message_value != raw_value:
+                    raise ResultValidationError(
+                        "Canonical result did not match the timely final agent message."
+                    )
+            decoded = decode_result(raw_value, request)
         except json.JSONDecodeError as error:
+            write_diagnostic_result(paths, raw_result)
             return self._failure(
                 request,
                 paths,
@@ -313,8 +421,11 @@ class CodexCliAgentExecutor:
                 command=command,
                 exit_code=process.returncode,
                 structured_result_present=True,
+                timeout_seconds=request.policy.timeout_seconds,
+                extra_metadata=process_metadata,
             )
         except (ResultValidationError, TypeError) as error:
+            write_diagnostic_result(paths, raw_result)
             return self._failure(
                 request,
                 paths,
@@ -324,8 +435,17 @@ class CodexCliAgentExecutor:
                 command=command,
                 exit_code=process.returncode,
                 structured_result_present=True,
+                timeout_seconds=request.policy.timeout_seconds,
+                extra_metadata=process_metadata,
             )
 
+        write_result(paths, raw_result)
+        process_metadata.update(
+            {
+                "structured_result_validated": True,
+                "structured_result_accepted": True,
+            }
+        )
         ended = _ended_at(self._clock(), started)
         execution = AgentExecution(
             provider_id=self.provider_id,
@@ -344,8 +464,9 @@ class CodexCliAgentExecutor:
                 exit_code=process.returncode,
                 reason=None,
                 timed_out=False,
-                timeout_seconds=None,
+                timeout_seconds=request.policy.timeout_seconds,
                 structured_result_present=True,
+                extra_metadata=process_metadata,
             ),
         )
         write_execution(paths, _execution_record(execution))
@@ -398,11 +519,17 @@ class CodexCliAgentExecutor:
 
 def _process_start_observer(
     observer: Callable[[], None] | None,
+    *,
+    on_started: Callable[[], None] | None = None,
 ) -> Callable[[], None] | None:
-    if observer is None:
+    if observer is None and on_started is None:
         return None
 
     def notify() -> None:
+        if on_started is not None:
+            on_started()
+        if observer is None:
+            return
         try:
             observer()
         except BaseException as error:
@@ -439,6 +566,49 @@ def _schema_for(task_kind: AgentTaskKind) -> Path:
     )
 
 
+def _read_scratch_result(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+
+
+def _process_evidence_metadata(
+    evidence: CodexProcessEvidence,
+    *,
+    configured_timeout: float | None,
+) -> dict[str, ProviderMetadataValue]:
+    return {
+        "work_timeout_seconds": (
+            configured_timeout
+            if evidence.work_timeout_seconds is None
+            else evidence.work_timeout_seconds
+        ),
+        "work_elapsed_seconds": evidence.work_elapsed_seconds,
+        "total_elapsed_seconds": evidence.total_elapsed_seconds,
+        "terminal_event_type": evidence.terminal_event_type,
+        "terminal_event_elapsed_seconds": evidence.terminal_event_elapsed_seconds,
+        "completion_before_deadline": evidence.completion_before_deadline,
+        "structured_message_observed": evidence.structured_message is not None,
+        "structured_message_elapsed_seconds": (
+            evidence.structured_message_elapsed_seconds
+        ),
+        "structured_message_before_deadline": (
+            evidence.structured_message_before_deadline
+        ),
+        "deadline_outcome": evidence.deadline_outcome,
+        "finalization_outcome": evidence.finalization_outcome,
+        "cleanup_outcome": evidence.cleanup_outcome,
+        "termination_method": evidence.termination_method,
+        "tree_termination_confirmed": evidence.tree_termination_confirmed,
+        "cleanup_duration_seconds": evidence.cleanup_duration_seconds,
+        "output_draining_truncated": evidence.output_draining_truncated,
+        "event_stream_problem": evidence.event_stream_problem,
+        "structured_result_validated": False,
+        "structured_result_accepted": False,
+    }
+
+
 def _metadata(
     *,
     request: AgentExecutionRequest[TaskResult],
@@ -449,8 +619,9 @@ def _metadata(
     timed_out: bool,
     timeout_seconds: float | None,
     structured_result_present: bool,
+    extra_metadata: dict[str, ProviderMetadataValue] | None = None,
 ) -> dict[str, ProviderMetadataValue]:
-    return {
+    metadata: dict[str, ProviderMetadataValue] = {
         "argv": () if command is None else command.argv,
         "process_exit_code": exit_code,
         "timed_out": timed_out,
@@ -463,12 +634,15 @@ def _metadata(
         "output_schema_path": str(_schema_for(request.task_kind).resolve()),
         "structured_result_present": structured_result_present,
     }
+    if extra_metadata:
+        metadata.update(extra_metadata)
+    return metadata
 
 
 def _execution_record(execution: AgentExecution[TaskResult]) -> JsonObject:
     metadata = execution.provider_metadata
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "format": "ticket_automation.codex_execution",
         "provider_id": str(execution.provider_id),
         "status": "SUCCESS" if execution.successful else "FAILED",
@@ -495,6 +669,41 @@ def _execution_record(execution: AgentExecution[TaskResult]) -> JsonObject:
         "repo_path": metadata.get("repository_path"),
         "output_schema_path": metadata.get("output_schema_path"),
         "structured_result_present": metadata.get("structured_result_present", False),
+        "structured_result_validated": metadata.get(
+            "structured_result_validated", False
+        ),
+        "structured_result_accepted": metadata.get(
+            "structured_result_accepted", False
+        ),
+        "work_timeout_seconds": metadata.get("work_timeout_seconds"),
+        "work_elapsed_seconds": metadata.get("work_elapsed_seconds"),
+        "total_elapsed_seconds": metadata.get("total_elapsed_seconds"),
+        "terminal_event_type": metadata.get("terminal_event_type"),
+        "terminal_event_elapsed_seconds": metadata.get(
+            "terminal_event_elapsed_seconds"
+        ),
+        "completion_before_deadline": metadata.get(
+            "completion_before_deadline", False
+        ),
+        "structured_message_observed": metadata.get(
+            "structured_message_observed", False
+        ),
+        "structured_message_elapsed_seconds": metadata.get(
+            "structured_message_elapsed_seconds"
+        ),
+        "structured_message_before_deadline": metadata.get(
+            "structured_message_before_deadline", False
+        ),
+        "deadline_outcome": metadata.get("deadline_outcome"),
+        "finalization_outcome": metadata.get("finalization_outcome"),
+        "cleanup_outcome": metadata.get("cleanup_outcome"),
+        "termination_method": metadata.get("termination_method"),
+        "tree_termination_confirmed": metadata.get("tree_termination_confirmed"),
+        "cleanup_duration_seconds": metadata.get("cleanup_duration_seconds"),
+        "output_draining_truncated": metadata.get(
+            "output_draining_truncated", False
+        ),
+        "event_stream_problem": metadata.get("event_stream_problem"),
         "result_json_present": any(
             artifact.name == "typed-result" for artifact in execution.artifacts
         ),

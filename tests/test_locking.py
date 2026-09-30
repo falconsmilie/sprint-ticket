@@ -14,6 +14,7 @@ import pytest
 from tests.helpers import (
     GIT,
     PROJECT_ROOT,
+    completed_codex_process_result,
     create_git_repo,
     create_test_run_snapshot,
     make_agent_executors,
@@ -119,7 +120,7 @@ class SequencedCodexRunner:
         timeout_seconds: float | None,
         on_process_start=None,
     ) -> CodexProcessResult:
-        del stdin, timeout_seconds
+        del stdin
         assert self.steps, "Unexpected Codex invocation."
         step = self.steps.pop(0)
         if step.error is not None:
@@ -132,10 +133,11 @@ class SequencedCodexRunner:
         Path(command.argv[command.argv.index("--output-last-message") + 1]).write_text(
             json.dumps(step.result), encoding="utf-8"
         )
-        return CodexProcessResult(
-            returncode=0,
+        return completed_codex_process_result(
+            step.result,
             stdout=_event_stream(step.result),
             stderr="fake codex progress\n",
+            timeout_seconds=timeout_seconds or 60,
         )
 
 

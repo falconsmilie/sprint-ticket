@@ -34,11 +34,42 @@ from ticket_automation.providers.codex_cli import (
     DEFAULT_CODEX_REASONING_EFFORT,
     CodexCliAgentExecutor,
     CodexCliSettings,
+    CodexProcessEvidence,
+    CodexProcessResult,
 )
 from ticket_automation.providers.codex_cli.composition import (
     CodexCliProviderRegistration,
 )
 from ticket_automation.providers.codex_cli.identity import PROVIDER_ID
+
+
+def completed_codex_process_result(
+    payload: object,
+    *,
+    stdout: str = "",
+    stderr: str = "",
+    timeout_seconds: float = 60,
+) -> CodexProcessResult:
+    message = payload if isinstance(payload, str) else json.dumps(payload)
+    return CodexProcessResult(
+        0,
+        stdout,
+        stderr,
+        evidence=CodexProcessEvidence(
+            work_timeout_seconds=timeout_seconds,
+            work_elapsed_seconds=1,
+            total_elapsed_seconds=1,
+            terminal_event_type="turn.completed",
+            terminal_event_elapsed_seconds=1,
+            completion_before_deadline=True,
+            structured_message=message,
+            structured_message_elapsed_seconds=0.9,
+            structured_message_before_deadline=True,
+            deadline_outcome="completed-before-deadline",
+            finalization_outcome="completed",
+            tree_termination_confirmed=True,
+        ),
+    )
 
 
 def create_directory_link(link: Path, target: Path) -> str | None:

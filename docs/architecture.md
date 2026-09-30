@@ -59,6 +59,12 @@ executor. Composition retains the provider registry and supplies application
 workflows with a provider-neutral factory port that accepts the persisted
 policy; application code never receives the registry itself.
 
+Provider-neutral task deadlines are configured by phase and persisted in each
+task's execution policy. Concrete adapters own live protocol observation and OS
+containment. In particular, Codex JSONL terminal parsing, Node/wrapper process
+details, Windows Job Objects, and POSIX process groups never cross into the
+domain or lifecycle controller.
+
 Run and attempt paths are ownership boundaries as well as naming conventions.
 Resume accepts only a direct, non-linked run directory whose persisted identity
 matches its directory. Attempt creation, loading, and mutation resolve through

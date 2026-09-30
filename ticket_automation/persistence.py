@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
@@ -44,6 +45,44 @@ def atomic_write_text(path: Path | str, value: str) -> None:
         output.write(value)
 
     _atomic_write_text_payload(Path(path), write_payload, description="text")
+
+
+def atomic_copy_file(source: Path | str, destination: Path | str) -> None:
+    """Atomically publish a file without loading it all or following the target."""
+
+    source_path = Path(source)
+    destination_path = Path(destination)
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    descriptor = -1
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=destination_path.parent,
+            prefix=f".{destination_path.name}.",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        with source_path.open("rb") as input_file, os.fdopen(
+            descriptor, "wb"
+        ) as output_file:
+            descriptor = -1
+            shutil.copyfileobj(input_file, output_file, length=64 * 1024)
+            output_file.flush()
+            os.fsync(output_file.fileno())
+        os.replace(temporary, destination_path)
+        _sync_directory(destination_path.parent)
+    except BaseException as error:
+        if descriptor != -1:
+            os.close(descriptor)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        if not isinstance(error, Exception):
+            raise
+        if isinstance(error, PersistenceError):
+            raise
+        raise PersistenceError(
+            f"Could not atomically publish file {destination_path}: {error}"
+        ) from error
 
 
 def exclusive_write_text(path: Path | str, value: str) -> None:
@@ -236,6 +275,7 @@ __all__ = [
     "JsonScalar",
     "JsonValue",
     "PersistenceError",
+    "atomic_copy_file",
     "atomic_write_json",
     "atomic_write_text",
     "exclusive_write_bytes",

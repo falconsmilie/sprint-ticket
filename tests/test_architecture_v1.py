@@ -13,6 +13,7 @@ import ticket_automation.workflow as workflow_module
 from tests.fake_agent_executor import InMemoryAgentExecutor
 from tests.helpers import (
     GIT,
+    completed_codex_process_result,
     create_directory_link,
     create_git_repo,
     create_test_run_snapshot,
@@ -58,7 +59,6 @@ from ticket_automation.models import (
     WorkflowState,
 )
 from ticket_automation.presentation.reporting import run_report_stage
-from ticket_automation.providers.codex_cli import CodexProcessResult
 from ticket_automation.review import run_review_stage
 from ticket_automation.runs import load_run_record, save_run_record
 from ticket_automation.verification import (
@@ -129,7 +129,7 @@ class CompletingCodexRunner:
     calls: int = 0
 
     def run(self, command, *, stdin, timeout_seconds, on_process_start=None):
-        del stdin, timeout_seconds
+        del stdin
         if on_process_start is not None:
             on_process_start()
         self.calls += 1
@@ -153,7 +153,10 @@ class CompletingCodexRunner:
             }
         output = Path(command.argv[command.argv.index("--output-last-message") + 1])
         output.write_text(json.dumps(result), encoding="utf-8")
-        return CodexProcessResult(returncode=0, stdout="", stderr="")
+        return completed_codex_process_result(
+            result,
+            timeout_seconds=timeout_seconds or 60,
+        )
 
 
 def _ticket(tmp_path: Path) -> Path:
@@ -1028,7 +1031,7 @@ def test_agent_cannot_redirect_post_execution_evidence_after_run_retarget(
             timeout_seconds,
             on_process_start=None,
         ):
-            del stdin, timeout_seconds
+            del stdin
             if on_process_start is not None:
                 on_process_start()
             command.cwd.joinpath("file.txt").write_text(
@@ -1036,22 +1039,21 @@ def test_agent_cannot_redirect_post_execution_evidence_after_run_retarget(
                 encoding="utf-8",
             )
             output = Path(command.argv[command.argv.index("--output-last-message") + 1])
-            output.write_text(
-                json.dumps(
-                    {
-                        "status": "COMPLETED",
-                        "summary": "implementation passed",
-                        "tests_run": [],
-                        "assumptions": [],
-                        "known_issues": [],
-                    }
-                ),
-                encoding="utf-8",
-            )
+            payload = {
+                "status": "COMPLETED",
+                "summary": "implementation passed",
+                "tests_run": [],
+                "assumptions": [],
+                "known_issues": [],
+            }
+            output.write_text(json.dumps(payload), encoding="utf-8")
             run_dir = next(path for path in runs_dir.iterdir() if path.is_dir())
             run_dir.rename(moved_run)
             assert create_directory_link(run_dir, external_target) is not None
-            return CodexProcessResult(returncode=0, stdout="", stderr="")
+            return completed_codex_process_result(
+                payload,
+                timeout_seconds=timeout_seconds or 60,
+            )
 
     executor = make_agent_executor(
         config,

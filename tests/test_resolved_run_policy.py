@@ -30,6 +30,7 @@ from ticket_automation.resolved_config import (
     ResolvedRunPolicy,
     ResolvedRunPolicyError,
     ResolvedTaskPolicy,
+    config_from_resolved_run_policy,
     resolve_run_policy,
 )
 from ticket_automation.runs import RunError, create_run_snapshot, load_run_record
@@ -123,6 +124,57 @@ def test_round_trip_with_one_provider_assigned_to_every_task(tmp_path):
     assert loaded.task_policy(AgentTaskKind.IMPLEMENTATION).execution_policy == (
         AgentExecutionPolicy(3600, NetworkAccess.ALLOWED)
     )
+
+
+def test_distinct_task_deadlines_round_trip_and_reconstruct_configuration(tmp_path):
+    provider_id = ProviderId("shared")
+    registration = StubRegistration(provider_id)
+    config = _policy_config(
+        tmp_path,
+        assignments={kind: provider_id for kind in AgentTaskKind},
+        registrations={provider_id: registration},
+    )
+    config = replace(
+        config,
+        agents=replace(
+            config.agents,
+            timeouts={
+                AgentTaskKind.IMPLEMENTATION: 7200,
+                AgentTaskKind.REVIEW: 5400,
+                AgentTaskKind.CORRECTION: 7100,
+            },
+        ),
+    )
+
+    resolved = resolve_run_policy(
+        config,
+        target_repository_path=tmp_path,
+        assignments=config.agents.assignments,
+        provider_policies={provider_id: StubPolicy("value")},
+        provider_registrations={provider_id: registration},
+    )
+    loaded = ResolvedRunPolicy.from_dict(resolved.to_dict())
+    reconstructed = config_from_resolved_run_policy(loaded)
+
+    assert {
+        kind: loaded.task_policy(kind).execution_policy.timeout_seconds
+        for kind in AgentTaskKind
+    } == {
+        AgentTaskKind.IMPLEMENTATION: 7200.0,
+        AgentTaskKind.REVIEW: 5400.0,
+        AgentTaskKind.CORRECTION: 7100.0,
+    }
+    assert reconstructed.agents.timeouts == config.agents.timeouts
+
+
+@pytest.mark.parametrize("value", [None, 0, -1, True, 1.5, float("inf")])
+def test_persisted_task_deadline_requires_positive_whole_seconds(tmp_path, value):
+    resolved, _ = _shared_policy(tmp_path)
+    data = resolved.to_dict()
+    data["tasks"]["implementation"]["execution_policy"]["timeout_seconds"] = value
+
+    with pytest.raises(ResolvedRunPolicyError, match="timeout_seconds|execution_policy"):
+        ResolvedRunPolicy.from_dict(data)
 
 
 def test_round_trip_and_executor_selection_with_distinct_task_providers(tmp_path):

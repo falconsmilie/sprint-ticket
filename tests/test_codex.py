@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
 
-from tests.helpers import prepend_executable_path, write_path_executable
+from tests.helpers import (
+    completed_codex_process_result,
+    prepend_executable_path,
+    write_path_executable,
+)
 from ticket_automation import executable_resolution
 from ticket_automation.application.agent_execution import (
     CORRECTION_RESULT_CONTRACT,
@@ -32,6 +38,7 @@ from ticket_automation.providers.codex_cli import (
     CodexCliSettings,
     CodexCliSettingsError,
     CodexCommand,
+    CodexProcessEvidence,
     CodexProcessResult,
     CodexProcessTimedOut,
     CodexProcessTimeout,
@@ -96,6 +103,19 @@ class FakeRunner:
             output = Path(command.argv[command.argv.index("--output-last-message") + 1])
             output.write_text(self.typed_result, encoding="utf-8")
         assert self.result is not None
+        if self.result.returncode == 0 and self.result.evidence == CodexProcessEvidence():
+            fallback = (
+                review_payload()
+                if "review-result.schema.json" in " ".join(command.argv)
+                else implementation_payload()
+            )
+            return replace(
+                self.result,
+                evidence=completed_codex_process_result(
+                    self.typed_result or fallback,
+                    timeout_seconds=timeout_seconds or 60,
+                ).evidence,
+            )
         return self.result
 
 
@@ -368,7 +388,18 @@ def test_process_output_atomically_replaces_hardlinks_created_during_invocation(
             ):
                 (artifacts / name).unlink()
                 os.link(target, artifacts / name)
-            return super().run(command, **kwargs)
+            result = super().run(command, **kwargs)
+            assert command.stdout_capture is not None
+            assert command.stderr_capture is not None
+            command.stdout_capture.write_text("local events\n", encoding="utf-8")
+            command.stderr_capture.write_text("local stderr\n", encoding="utf-8")
+            return replace(
+                result,
+                stdout="",
+                stderr="",
+                stdout_capture=command.stdout_capture,
+                stderr_capture=command.stderr_capture,
+            )
 
     runner = ReplacingRunner(
         CodexProcessResult(0, "local events\n", "local stderr\n"),
@@ -420,6 +451,8 @@ def test_typed_results_cross_the_adapter_boundary(
     assert execution.successful
     assert type(execution.result) is result_type
     assert execution.invocation_start is InvocationStart.STARTED
+    assert execution.provider_metadata["work_timeout_seconds"] == 60
+    assert execution.provider_metadata["structured_result_accepted"] is True
     assert (tmp_path / "artifacts" / "prompt.md").read_text(encoding="utf-8") == (
         "Application-owned task prompt."
     )
@@ -566,7 +599,8 @@ def test_adapter_strictly_rejects_invalid_result_fields(
     )
 
     assert execution.failure_category is AgentFailureCategory.INVALID_RESULT
-    assert (tmp_path / "artifacts" / "codex-result.json").is_file()
+    assert (tmp_path / "artifacts" / "codex-diagnostic-result.json").is_file()
+    assert not (tmp_path / "artifacts" / "codex-result.json").exists()
 
 
 def test_stale_typed_result_cannot_satisfy_a_new_execution(tmp_path: Path) -> None:
@@ -714,6 +748,34 @@ def test_timeout_preserves_partial_diagnostic_evidence(tmp_path: Path) -> None:
     assert (tmp_path / "artifacts" / "stderr.log").read_text(
         encoding="utf-8"
     ) == "still working\n"
+    assert execution.provider_metadata["work_timeout_seconds"] == 3
+
+
+def test_timeout_preserves_raw_result_only_as_native_diagnostic(tmp_path: Path) -> None:
+    payload = json.dumps(implementation_payload())
+
+    class ResultThenTimeoutRunner:
+        def run(self, command, *, stdin, timeout_seconds, on_process_start=None):
+            del stdin
+            if on_process_start is not None:
+                on_process_start()
+            output = Path(command.argv[command.argv.index("--output-last-message") + 1])
+            output.write_text(payload, encoding="utf-8")
+            raise CodexProcessTimedOut(
+                CodexProcessTimeout("partial\n", "late\n", timeout_seconds or 0)
+            )
+
+    execution = CodexCliAgentExecutor(
+        SETTINGS,
+        runner=ResultThenTimeoutRunner(),
+    ).execute(request(tmp_path))
+
+    diagnostic = tmp_path / "artifacts" / "codex-diagnostic-result.json"
+    assert execution.failure_category is AgentFailureCategory.TIMEOUT
+    assert diagnostic.read_text(encoding="utf-8") == payload
+    assert not (tmp_path / "artifacts" / "codex-result.json").exists()
+    assert execution.provider_metadata["structured_result_present"] is True
+    assert execution.provider_metadata["structured_result_accepted"] is False
 
 
 def test_subprocess_runner_uses_argv_and_disables_shell(
@@ -842,7 +904,8 @@ def test_tracked_subprocess_stops_child_when_start_observer_is_interrupted(
         def kill(self) -> None:
             self.killed = True
 
-        def wait(self) -> int:
+        def wait(self, timeout=None) -> int:
+            del timeout
             self.waited = True
             return 1
 
@@ -891,6 +954,341 @@ def test_subprocess_spawn_failure_does_not_report_process_start(
         )
 
     assert started is False
+
+
+def test_real_runner_observes_chunked_jsonl_and_split_utf8(tmp_path: Path) -> None:
+    payload = json.dumps(implementation_payload(summary="café"), ensure_ascii=False)
+    event = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": payload},
+        },
+        ensure_ascii=False,
+    ).encode("utf-8") + b"\n"
+    marker = event.index("é".encode()) + 1
+    script = (
+        "import os,sys,time; "
+        f"data={event!r}; marker={marker}; "
+        "os.write(sys.stdout.fileno(),data[:marker]); time.sleep(.02); "
+        "os.write(sys.stdout.fileno(),data[marker:]); "
+        "os.write(sys.stdout.fileno(),b'{\"type\":\"turn.completed\"}\\n')"
+    )
+    stdout = tmp_path / "captured-events.jsonl"
+    stderr = tmp_path / "captured-stderr.log"
+
+    result = SubprocessCodexRunner().run(
+        CodexCommand(
+            (sys.executable, "-c", script),
+            tmp_path,
+            stdout_capture=stdout,
+            stderr_capture=stderr,
+        ),
+        stdin="prompt",
+        timeout_seconds=2,
+    )
+
+    assert result.returncode == 0
+    assert result.evidence.completion_before_deadline is True
+    assert result.evidence.structured_message_before_deadline is True
+    assert result.evidence.structured_message == payload
+    assert stdout.read_bytes() == event + b'{"type":"turn.completed"}\n'
+
+
+def test_timely_completion_has_only_bounded_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(process_module, "FINALIZATION_SECONDS", 0.1)
+    late = tmp_path / "late"
+    payload = json.dumps(implementation_payload())
+    event = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": payload},
+        }
+    )
+    script = (
+        "import pathlib,time; "
+        f"print({event!r},flush=True); "
+        "print('{\"type\":\"turn.completed\"}',flush=True); "
+        "time.sleep(1); "
+        f"pathlib.Path({str(late)!r}).write_text('late',encoding='utf-8')"
+    )
+    started = time.monotonic()
+
+    result = SubprocessCodexRunner().run(
+        CodexCommand((sys.executable, "-c", script), tmp_path),
+        stdin="prompt",
+        timeout_seconds=2,
+    )
+
+    assert time.monotonic() - started < 1
+    assert result.evidence.completion_before_deadline is True
+    assert result.evidence.finalization_outcome == "expired"
+    assert result.evidence.tree_termination_confirmed is True
+    assert result.transport_failure is not None
+    time.sleep(1.1)
+    assert not late.exists()
+
+
+def test_canonical_result_must_match_timely_structured_message(tmp_path: Path) -> None:
+    canonical = implementation_payload(status="COMPLETED")
+    conflicting = implementation_payload(status="BLOCKED")
+    evidence = CodexProcessEvidence(
+        work_timeout_seconds=60,
+        terminal_event_type="turn.completed",
+        terminal_event_elapsed_seconds=1,
+        completion_before_deadline=True,
+        structured_message=json.dumps(conflicting),
+        structured_message_elapsed_seconds=0.9,
+        structured_message_before_deadline=True,
+        deadline_outcome="completed-before-deadline",
+        finalization_outcome="completed",
+        tree_termination_confirmed=True,
+    )
+    runner = FakeRunner(
+        CodexProcessResult(0, "", "", evidence=evidence),
+        json.dumps(canonical),
+    )
+
+    execution = CodexCliAgentExecutor(SETTINGS, runner=runner).execute(
+        request(tmp_path)
+    )
+
+    assert execution.failure_category is AgentFailureCategory.INVALID_RESULT
+    assert not (tmp_path / "artifacts" / "codex-result.json").exists()
+    assert (tmp_path / "artifacts" / "codex-diagnostic-result.json").is_file()
+
+
+def test_adapter_rejects_success_without_live_timing_evidence(tmp_path: Path) -> None:
+    class UntimedRunner:
+        def run(self, command, *, stdin, timeout_seconds, on_process_start=None):
+            del stdin, timeout_seconds
+            if on_process_start is not None:
+                on_process_start()
+            output = Path(command.argv[command.argv.index("--output-last-message") + 1])
+            output.write_text(
+                json.dumps(implementation_payload()),
+                encoding="utf-8",
+            )
+            return CodexProcessResult(0, "", "")
+
+    execution = CodexCliAgentExecutor(SETTINGS, runner=UntimedRunner()).execute(
+        request(tmp_path)
+    )
+
+    assert execution.failure_category is AgentFailureCategory.NON_SUCCESSFUL_EXECUTION
+    assert execution.provider_metadata["completion_before_deadline"] is False
+    assert execution.provider_metadata["structured_result_accepted"] is False
+    assert not (tmp_path / "artifacts" / "codex-result.json").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows Job Objects")
+def test_windows_job_stops_wrapper_descendant_tree_and_preserves_output(
+    tmp_path: Path,
+) -> None:
+    helper = tmp_path / "helper.py"
+    child = tmp_path / "child.py"
+    grandchild = tmp_path / "grandchild.py"
+    wrapper = tmp_path / "codex-wrapper.cmd"
+    ready = tmp_path / "ready"
+    pids_path = tmp_path / "pids.json"
+    late_child = tmp_path / "late-child"
+    late_grandchild = tmp_path / "late-grandchild"
+    stdout = tmp_path / "events.jsonl"
+    stderr = tmp_path / "stderr.log"
+    grandchild.write_text(
+        "import pathlib,sys,time\n"
+        "time.sleep(4)\n"
+        "pathlib.Path(sys.argv[1]).write_text('late', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    child.write_text(
+        "import json,os,pathlib,subprocess,sys,time\n"
+        "grand=subprocess.Popen([sys.executable,sys.argv[2],sys.argv[5]])\n"
+        "pathlib.Path(sys.argv[3]).write_text(json.dumps([int(sys.argv[1]),os.getpid(),grand.pid]),encoding='utf-8')\n"
+        "pathlib.Path(sys.argv[4]).write_text('ready',encoding='utf-8')\n"
+        "print('{\"type\":\"turn.started\"}',flush=True)\n"
+        "print('tree ready',file=sys.stderr,flush=True)\n"
+        "time.sleep(4)\n"
+        "pathlib.Path(sys.argv[6]).write_text('late',encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    helper.write_text(
+        "import os,subprocess,sys\n"
+        "child=subprocess.Popen([sys.executable,sys.argv[1],str(os.getpid()),*sys.argv[2:]])\n"
+        "child.wait()\n",
+        encoding="utf-8",
+    )
+    wrapper.write_text(
+        "@echo off\n"
+        f'start "" /b "{sys.executable}" "{helper}" "{child}" "{grandchild}" '
+        f'"{pids_path}" "{ready}" "{late_grandchild}" "{late_child}"\n'
+        "exit /b 0\n",
+        encoding="utf-8",
+    )
+    control = subprocess.Popen(
+        (sys.executable, "-c", "import time; time.sleep(15)"),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    pids: list[int] = []
+    started = time.monotonic()
+    try:
+        with pytest.raises(CodexProcessTimedOut) as raised:
+            SubprocessCodexRunner().run(
+                CodexCommand(
+                    (str(wrapper),),
+                    tmp_path,
+                    stdout_capture=stdout,
+                    stderr_capture=stderr,
+                ),
+                stdin="prompt",
+                timeout_seconds=1.5,
+            )
+        elapsed = time.monotonic() - started
+        assert elapsed <= 13.5
+        assert ready.is_file()
+        pids = json.loads(pids_path.read_text(encoding="utf-8"))
+        assert len(pids) == 3
+        assert all(not _windows_pid_is_running(pid) for pid in pids)
+        assert control.poll() is None
+        assert raised.value.result.evidence.deadline_outcome == "timed-out"
+        assert raised.value.result.evidence.termination_method == "windows-job-object"
+        assert raised.value.result.evidence.tree_termination_confirmed is True
+        assert "turn.started" in stdout.read_text(encoding="utf-8")
+        assert "tree ready" in stderr.read_text(encoding="utf-8")
+        time.sleep(4.2)
+        assert not late_child.exists()
+        assert not late_grandchild.exists()
+    finally:
+        control.kill()
+        control.wait(timeout=5)
+        for pid in pids:
+            if _windows_pid_is_running(pid):
+                subprocess.run(
+                    ("taskkill", "/PID", str(pid), "/T", "/F"),
+                    check=False,
+                    capture_output=True,
+                    timeout=5,
+                )
+
+
+def _windows_pid_is_running(pid: int) -> bool:
+    if os.name != "nt":
+        return False
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    handle = kernel32.OpenProcess(0x1000, False, pid)
+    if not handle:
+        return False
+    try:
+        exit_code = ctypes.c_uint32()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return False
+        return exit_code.value == 259
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX process groups")
+def test_posix_process_group_stops_descendant_tree_and_preserves_output(
+    tmp_path: Path,
+) -> None:
+    helper = tmp_path / "helper.py"
+    child = tmp_path / "child.py"
+    grandchild = tmp_path / "grandchild.py"
+    ready = tmp_path / "ready"
+    pids_path = tmp_path / "pids.json"
+    late_child = tmp_path / "late-child"
+    late_grandchild = tmp_path / "late-grandchild"
+    stdout = tmp_path / "events.jsonl"
+    stderr = tmp_path / "stderr.log"
+    grandchild.write_text(
+        "import pathlib,sys,time\n"
+        "time.sleep(4)\n"
+        "pathlib.Path(sys.argv[1]).write_text('late', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    child.write_text(
+        "import json,os,pathlib,subprocess,sys,time\n"
+        "grand=subprocess.Popen([sys.executable,sys.argv[2],sys.argv[5]])\n"
+        "pathlib.Path(sys.argv[3]).write_text(json.dumps([int(sys.argv[1]),os.getpid(),grand.pid]),encoding='utf-8')\n"
+        "pathlib.Path(sys.argv[4]).write_text('ready',encoding='utf-8')\n"
+        "print('{\"type\":\"turn.started\"}',flush=True)\n"
+        "print('tree ready',file=sys.stderr,flush=True)\n"
+        "time.sleep(4)\n"
+        "pathlib.Path(sys.argv[6]).write_text('late',encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    helper.write_text(
+        "import os,subprocess,sys\n"
+        "child=subprocess.Popen([sys.executable,sys.argv[1],str(os.getpid()),*sys.argv[2:]])\n"
+        "child.wait()\n",
+        encoding="utf-8",
+    )
+    control = subprocess.Popen(
+        (sys.executable, "-c", "import time; time.sleep(15)"),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    pids: list[int] = []
+    try:
+        with pytest.raises(CodexProcessTimedOut) as raised:
+            SubprocessCodexRunner().run(
+                CodexCommand(
+                    (
+                        sys.executable,
+                        str(helper),
+                        str(child),
+                        str(grandchild),
+                        str(pids_path),
+                        str(ready),
+                        str(late_grandchild),
+                        str(late_child),
+                    ),
+                    tmp_path,
+                    stdout_capture=stdout,
+                    stderr_capture=stderr,
+                ),
+                stdin="prompt",
+                timeout_seconds=1.5,
+            )
+        assert ready.is_file()
+        pids = json.loads(pids_path.read_text(encoding="utf-8"))
+        assert len(pids) == 3
+        assert all(not _posix_pid_is_running(pid) for pid in pids)
+        assert control.poll() is None
+        assert raised.value.result.evidence.termination_method == (
+            "posix-process-group"
+        )
+        assert raised.value.result.evidence.tree_termination_confirmed is True
+        assert "turn.started" in stdout.read_text(encoding="utf-8")
+        assert "tree ready" in stderr.read_text(encoding="utf-8")
+        time.sleep(4.2)
+        assert not late_child.exists()
+        assert not late_grandchild.exists()
+    finally:
+        control.kill()
+        control.wait(timeout=5)
+        if os.name != "nt":
+            import signal
+
+            for pid in pids:
+                if _posix_pid_is_running(pid):
+                    os.kill(pid, signal.SIGKILL)
+
+
+def _posix_pid_is_running(pid: int) -> bool:
+    if os.name == "nt":
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 def test_adapter_rejects_scratch_inside_repository(

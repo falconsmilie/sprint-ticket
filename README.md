@@ -18,6 +18,11 @@ tooling. For example:
 [runner]
 max_correction_rounds = 3
 
+[agents.timeouts]
+implementation_seconds = 7200
+review_seconds = 5400
+correction_seconds = 7200
+
 [agents.assignments]
 implementation = "codex-cli"
 review = "codex-cli"
@@ -41,6 +46,12 @@ required access, structured result, isolation, or evidence capabilities are
 rejected before a run is created. Provider preflight runs once per assigned
 provider and reports all affected task assignments.
 
+Agent deadlines are provider-neutral work budgets. Each key under
+`agents.timeouts` is optional and defaults to 3600 seconds; the example uses
+120 minutes for implementation/correction and 90 minutes for review. These are
+separate from `verification.commands[*].timeout_seconds`, which bounds an
+individual deterministic command. Both policies are shown by `preflight`.
+
 SprintTicket does not install or own pytest, ruff, pyright, or any other
 target-project verification tool. Its own development tools are in the `dev`
 dependency group.
@@ -57,6 +68,8 @@ correction use `workspace-write`; verification, review, and reporting are
 read-only with respect to the target project. Workspace-write Codex calls
 enable outbound network access so implementation and correction can run
 dependency-resolving validation; read-only Codex calls do not enable it.
+The three resolved agent deadlines are also snapshotted, so local TOML edits
+affect new runs only and cannot extend or shorten a resumed invocation.
 
 ## Commands
 
@@ -133,6 +146,23 @@ human-readable patch is the final `final.patch`.
 Workspace-guard evidence is recorded in the writable execution metadata.
 There are no per-round patch or `.stat` copies, duplicate Codex result files,
 or automatic Git cleanup.
+
+Codex stdout and stderr are drained concurrently into external provider scratch
+storage and then atomically published into the owned attempt. A successful
+`turn.completed` and its final structured agent message must both be observed
+strictly before the monotonic work deadline. Timely completion permits at most
+five seconds from that terminal observation for normal process exit and result
+file publication. A marker or result first observed at/after the deadline is
+diagnostic only and cannot turn a timeout into success. Raw result files from a
+timeout or failed finalisation use the separate
+`codex-diagnostic-result.json` artifact and never the typed-result role.
+
+Timeout, interruption, stream failure, and failed finalisation terminate the
+entire invocation tree. Windows uses a kill-on-close Job Object assigned while
+the launched wrapper is suspended; POSIX uses a dedicated session/process
+group. Termination, drain, reap, and worker shutdown share one ten-second cleanup
+budget. `codex-execution.json` is the provider-native schema (version 2);
+`execution.json` remains the provider-neutral lifecycle envelope.
 
 ## Resume Behaviour
 

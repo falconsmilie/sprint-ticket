@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.helpers import completed_codex_process_result
 from tests.provider_contract import (
     AdapterProbe,
     ContractOutcome,
@@ -81,19 +82,27 @@ class DeterministicCodexTransport:
         if self.outcome is ContractOutcome.NON_SUCCESSFUL_EXECUTION:
             return CodexProcessResult(2, "", "deterministic execution failure")
         if self.outcome is ContractOutcome.MISSING_RESULT:
-            return CodexProcessResult(0, "", "")
+            return completed_codex_process_result(
+                _result_payload(self.task_kind),
+                timeout_seconds=timeout_seconds or 2,
+            )
 
         result_path = Path(
             command.argv[command.argv.index("--output-last-message") + 1]
         )
         if self.outcome is ContractOutcome.INVALID_RESULT:
             result_path.write_text("{invalid", encoding="utf-8")
+            payload: object = "{invalid"
         else:
+            payload = _result_payload(self.task_kind)
             result_path.write_text(
-                json.dumps(_result_payload(self.task_kind)),
+                json.dumps(payload),
                 encoding="utf-8",
             )
-        return CodexProcessResult(0, "", "")
+        return completed_codex_process_result(
+            payload,
+            timeout_seconds=timeout_seconds or 2,
+        )
 
 
 @dataclass

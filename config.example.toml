@@ -8,6 +8,13 @@ protected_branches = ["main", "master"]
 [runner]
 max_correction_rounds = 1
 
+# Agent work deadlines are provider-neutral and snapshotted when a run is created.
+# Omit this table (or an individual key) to use the 3600-second default.
+[agents.timeouts]
+implementation_seconds = 7200
+review_seconds = 5400
+correction_seconds = 7200
+
 [agents.assignments]
 implementation = "codex-cli"
 review = "codex-cli"

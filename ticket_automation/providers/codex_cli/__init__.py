@@ -4,6 +4,7 @@ from .adapter import CodexCliAgentExecutor
 from .identity import CAPABILITIES, PROVIDER_ID
 from .process import (
     CodexCommand,
+    CodexProcessEvidence,
     CodexProcessResult,
     CodexProcessRunner,
     CodexProcessTimedOut,
@@ -27,6 +28,7 @@ __all__ = [
     "CodexCliSettings",
     "CodexCliSettingsError",
     "CodexCommand",
+    "CodexProcessEvidence",
     "CodexProcessResult",
     "CodexProcessRunner",
     "CodexProcessTimedOut",

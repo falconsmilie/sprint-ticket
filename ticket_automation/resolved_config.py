@@ -22,6 +22,7 @@ from .application.agent_execution import (
     required_execution_capabilities,
 )
 from .config import (
+    DEFAULT_AGENT_TIMEOUT_SECONDS,
     AgentSettings,
     AppConfig,
     ProjectSettings,
@@ -31,7 +32,6 @@ from .config import (
 )
 
 RESOLVED_RUN_POLICY_SCHEMA_VERSION = 3
-_DEFAULT_AGENT_TIMEOUT_SECONDS = 60 * 60
 _APPLICATION_VERSION = distribution_version("ticket-automation")
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _PACKAGE_ROOT = Path(__file__).resolve().parent
@@ -88,7 +88,14 @@ class ResolvedTaskPolicy:
             )
         expected_access = _task_repository_access(self.task_kind)
         expected_capabilities = required_execution_capabilities(expected_access)
-        expected_execution_policy = _task_execution_policy(self.task_kind)
+        _validate_resolved_timeout(
+            self.execution_policy.timeout_seconds,
+            task_kind=self.task_kind,
+        )
+        expected_execution_policy = _task_execution_policy(
+            self.task_kind,
+            int(self.execution_policy.timeout_seconds),
+        )
         if (
             self.repository_access is not expected_access
             or self.required_capabilities != expected_capabilities
@@ -476,7 +483,11 @@ def resolve_run_policy(
     provider_registrations: Mapping[ProviderId, ProviderPolicyCodec],
 ) -> ResolvedRunPolicy:
     tasks = tuple(
-        _resolved_task_policy(task_kind, assignments.get(task_kind))
+        _resolved_task_policy(
+            task_kind,
+            assignments.get(task_kind),
+            config.agents.timeouts[task_kind],
+        )
         for task_kind in AgentTaskKind
     )
     referenced = {task.provider_id for task in tasks}
@@ -548,6 +559,10 @@ def config_from_resolved_run_policy(resolved: ResolvedRunPolicy) -> AppConfig:
         agents=AgentSettings(
             assignments=resolved.assignments,
             providers={provider_id: {} for provider_id in provider_ids},
+            timeouts={
+                task.task_kind: int(task.execution_policy.timeout_seconds)
+                for task in resolved.task_policies
+            },
         ),
         verification=VerificationSettings(commands=resolved.verification_commands),
         source_files=(),
@@ -556,7 +571,9 @@ def config_from_resolved_run_policy(resolved: ResolvedRunPolicy) -> AppConfig:
 
 
 def _resolved_task_policy(
-    task_kind: AgentTaskKind, provider_id: ProviderId | None
+    task_kind: AgentTaskKind,
+    provider_id: ProviderId | None,
+    timeout_seconds: int = DEFAULT_AGENT_TIMEOUT_SECONDS,
 ) -> ResolvedTaskPolicy:
     if not isinstance(provider_id, ProviderId):
         raise ResolvedRunPolicyError(
@@ -568,7 +585,7 @@ def _resolved_task_policy(
         provider_id=provider_id,
         repository_access=access,
         required_capabilities=required_execution_capabilities(access),
-        execution_policy=_task_execution_policy(task_kind),
+        execution_policy=_task_execution_policy(task_kind, timeout_seconds),
     )
 
 
@@ -590,9 +607,7 @@ def _parse_task_policies(data: dict[str, Any]) -> tuple[ResolvedTaskPolicy, ...]
             },
             context=f"resolved_policy task {task_kind.value}",
         )
-        expected = _resolved_task_policy(
-            task_kind, _provider_id(_require_string(task, "provider_id"))
-        )
+        provider_id = _provider_id(_require_string(task, "provider_id"))
         try:
             access = RepositoryAccess(_require_string(task, "repository_access"))
         except ValueError as error:
@@ -602,6 +617,11 @@ def _parse_task_policies(data: dict[str, Any]) -> tuple[ResolvedTaskPolicy, ...]
         capabilities = _parse_capabilities(task, "required_capabilities")
         execution_policy = _parse_execution_policy(
             _require_table(task, "execution_policy")
+        )
+        expected = _resolved_task_policy(
+            task_kind,
+            provider_id,
+            int(execution_policy.timeout_seconds),
         )
         if (
             access is not expected.repository_access
@@ -687,9 +707,12 @@ def _task_repository_access(task_kind: AgentTaskKind) -> RepositoryAccess:
     )
 
 
-def _task_execution_policy(task_kind: AgentTaskKind) -> AgentExecutionPolicy:
+def _task_execution_policy(
+    task_kind: AgentTaskKind,
+    timeout_seconds: int = DEFAULT_AGENT_TIMEOUT_SECONDS,
+) -> AgentExecutionPolicy:
     return AgentExecutionPolicy(
-        timeout_seconds=_DEFAULT_AGENT_TIMEOUT_SECONDS,
+        timeout_seconds=timeout_seconds,
         network_access=(
             NetworkAccess.DENIED
             if task_kind is AgentTaskKind.REVIEW
@@ -707,14 +730,37 @@ def _parse_execution_policy(data: dict[str, Any]) -> AgentExecutionPolicy:
     timeout = data.get("timeout_seconds")
     try:
         network_access = NetworkAccess(_require_string(data, "network_access"))
-        return AgentExecutionPolicy(
+        policy = AgentExecutionPolicy(
             timeout_seconds=timeout,
             network_access=network_access,
         )
+        _validate_resolved_timeout(policy.timeout_seconds)
+        return policy
     except (TypeError, ValueError) as error:
         raise ResolvedRunPolicyError(
             f"resolved_policy task execution_policy is invalid: {error}"
         ) from error
+
+
+def _validate_resolved_timeout(
+    timeout_seconds: object,
+    *,
+    task_kind: AgentTaskKind | None = None,
+) -> None:
+    label = (
+        "resolved_policy task execution_policy.timeout_seconds"
+        if task_kind is None
+        else f"resolved_policy task {task_kind.value} execution_policy.timeout_seconds"
+    )
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not float(timeout_seconds).is_integer()
+        or not (0 < float(timeout_seconds) < float("inf"))
+    ):
+        raise ResolvedRunPolicyError(
+            f"{label} must be a finite, positive whole number of seconds."
+        )
 
 
 def _validate_non_empty_strings(values: tuple[str, ...], *, field: str) -> None:

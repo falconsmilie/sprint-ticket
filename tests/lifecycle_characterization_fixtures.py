@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from tests.helpers import create_git_repo, make_config, run_git
+from tests.helpers import (
+    completed_codex_process_result,
+    create_git_repo,
+    make_config,
+    run_git,
+)
 from ticket_automation.attempts import AttemptRecord, load_attempt_records
 from ticket_automation.config import AppConfig
 from ticket_automation.providers.codex_cli import (
@@ -92,7 +97,15 @@ class ScriptedCodexRunner:
         if action == "fail":
             return CodexProcessResult(2, "", "fake codex failed\n")
         if action == "missing-result":
-            return CodexProcessResult(0, "", "")
+            missing_payload = (
+                _scripted_review_result("review-pass")
+                if command.argv[command.argv.index("--sandbox") + 1] == "read-only"
+                else _scripted_implementation_result("success")
+            )
+            return completed_codex_process_result(
+                missing_payload,
+                timeout_seconds=timeout_seconds or 60,
+            )
         if action == "timeout":
             raise CodexProcessTimedOut(
                 CodexProcessTimeout("", "fake timeout\n", timeout_seconds or 0)
@@ -103,7 +116,10 @@ class ScriptedCodexRunner:
         )
         if action == "malformed-result":
             output_path.write_text("{malformed", encoding="utf-8")
-            return CodexProcessResult(0, "", "")
+            return completed_codex_process_result(
+                "{malformed",
+                timeout_seconds=timeout_seconds or 60,
+            )
 
         read_only = command.argv[command.argv.index("--sandbox") + 1] == "read-only"
         if read_only:
@@ -140,7 +156,10 @@ class ScriptedCodexRunner:
                     "home = fake\n", encoding="utf-8"
                 )
         output_path.write_text(json.dumps(result), encoding="utf-8")
-        return CodexProcessResult(0, "", "")
+        return completed_codex_process_result(
+            result,
+            timeout_seconds=timeout_seconds or 60,
+        )
 
 
 def _scripted_implementation_result(action: str) -> dict[str, object]:

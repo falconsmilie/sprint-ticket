@@ -108,6 +108,7 @@ def _config_with_assignments(
                 CODEX_PROVIDER_ID: dict(base.agents.providers[CODEX_PROVIDER_ID]),
                 SCRIPTED_PROVIDER_ID: scripted_settings,
             },
+            timeouts=base.agents.timeouts,
         ),
     )
 
@@ -298,6 +299,78 @@ def test_scripted_provider_can_own_both_writable_tasks_and_generic_reporting(
     report = (result.run_dir / "report.md").read_text(encoding="utf-8")
     assert f"Provider {SCRIPTED_PROVIDER_ID}: success" in report
     assert "scripted-provider-diagnostic" not in report
+
+
+def test_three_distinct_snapshotted_deadlines_dispatch_by_phase(tmp_path: Path) -> None:
+    repository = create_git_repo(tmp_path / "repository")
+    ticket = tmp_path / "TA-AGENT-TIMEOUTS.md"
+    ticket.write_text("# Dispatch independent deadlines\n", encoding="utf-8")
+    provider = ScriptedProviderRegistration()
+    base = make_config(repository, max_correction_rounds=1)
+    config = replace(
+        base,
+        agents=AgentSettings(
+            assignments={kind: SCRIPTED_PROVIDER_ID for kind in AgentTaskKind},
+            providers={
+                SCRIPTED_PROVIDER_ID: {
+                    "label": "deadline-dispatch",
+                    "write_workspace": True,
+                    "script": {
+                        "review": ["review-corrections", "success"],
+                    },
+                }
+            },
+            timeouts={
+                AgentTaskKind.IMPLEMENTATION: 7200,
+                AgentTaskKind.REVIEW: 5400,
+                AgentTaskKind.CORRECTION: 7100,
+            },
+        ),
+    )
+    prepared = prepare_agent_providers(
+        config.agents,
+        registry={SCRIPTED_PROVIDER_ID: provider},
+        configuration_directory=config.configuration_directory,
+    )
+    policy = prepared.resolve_run_policy(
+        config,
+        target_repository_path=repository,
+    )
+
+    result = run_ticket_lifecycle(
+        config,
+        ticket,
+        runs_dir=tmp_path / "runs",
+        provider_preflight=prepared.run_preflight,
+        resolved_policy=policy,
+        agent_executor_factory=RegisteredProviderExecutorFactory(
+            {SCRIPTED_PROVIDER_ID: provider}
+        ),
+        final_patch_capture=make_final_patch_capture(),
+        report_publisher=make_report_publisher(),
+        verification_runner=ScriptedVerificationRunner([0, 0, 0]),
+        clock=TickingClock(),
+    )
+
+    assert result.run_record.state is WorkflowState.READY_FOR_HUMAN
+    observed = provider.observation.requests
+    assert [request.task_kind for request in observed] == [
+        AgentTaskKind.IMPLEMENTATION,
+        AgentTaskKind.REVIEW,
+        AgentTaskKind.CORRECTION,
+        AgentTaskKind.REVIEW,
+    ]
+    assert [request.policy.timeout_seconds for request in observed] == [
+        7200.0,
+        5400.0,
+        7100.0,
+        5400.0,
+    ]
+    persisted = load_run_record(result.run_dir / "run.json").resolved_policy
+    assert [
+        persisted.task_policy(kind).execution_policy.timeout_seconds
+        for kind in AgentTaskKind
+    ] == [7200.0, 5400.0, 7100.0]
 
 
 def test_capability_mismatch_is_rejected_before_run_creation_or_execution(

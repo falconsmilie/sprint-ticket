@@ -144,6 +144,7 @@ class ArtifactRole(StrEnum):
     PROVIDER_EVENTS = "provider-events"
     STANDARD_ERROR = "standard-error"
     PROVIDER_EXECUTION_DETAILS = "provider-execution-details"
+    PROVIDER_DIAGNOSTIC_RESULT = "provider-diagnostic-result"
     WORKSPACE_GUARD = "workspace-guard"
     CORRECTION_TICKET = "correction-ticket"
 

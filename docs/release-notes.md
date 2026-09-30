@@ -25,3 +25,21 @@ Authoritative lifecycle reads retain the controller's bound run identity as well
 a direct-directory replacement during resume, handoff, review/correction evidence
 loading, verification evidence loading, or reporting is rejected before its data
 can influence workflow or presentation decisions.
+
+## Configurable agent deadlines and bounded cleanup
+
+Implementation, review, and correction now have independent provider-neutral
+deadlines under `[agents.timeouts]`. Omitted values retain the previous
+3600-second default; the release example uses 7200, 5400, and 7200 seconds.
+Resolved values remain in the existing task execution-policy fields, so policy
+schema 3 is unchanged and resumed runs retain their original deadlines.
+Deterministic verification command timeouts remain independent.
+
+The Codex runner now drains stdout and stderr concurrently and observes complete
+JSONL records against one monotonic launch deadline. A timely terminal success
+gets at most five seconds for normal exit and publication of an identical
+canonical result. Late completion stays diagnostic. Timeout and post-launch
+failure terminate the complete Windows Job Object or POSIX process group, with
+one ten-second budget shared by termination, drain, reap, and thread shutdown.
+Provider-native execution evidence is now schema 2 and records deadline,
+terminal, finalisation, termination, cleanup, and structured-result decisions.

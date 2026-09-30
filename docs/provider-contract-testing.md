@@ -37,3 +37,8 @@ provider does not declare.
 The Codex registration is `TestCodexProviderContract` in
 `tests/test_codex_provider_contract.py`. Its transport is an in-memory deterministic
 runner. It does not launch Codex, use provider credentials, or access the network.
+Provider-specific tests additionally exercise live JSONL framing/timing,
+structured-message agreement, bounded finalisation, partial diagnostics, and
+native process-tree cleanup. Native Windows Job Object and POSIX process-group
+regressions use short offline helper processes and must only be skipped when the
+corresponding operating system is unavailable.
