@@ -67,6 +67,35 @@ class _InvocationStartObserverError(BaseException):
         self.error = error
 
 
+class _ProcessStartObserver:
+    """Preserve cancellation when adapting the neutral start callback."""
+
+    def __init__(
+        self,
+        observer: Callable[[], None] | None,
+        on_started: Callable[[], None] | None,
+    ) -> None:
+        self.observer = observer
+        self.on_started = on_started
+
+    def __call__(self) -> None:
+        if self.on_started is not None:
+            self.on_started()
+        if self.observer is None:
+            return
+        try:
+            self.observer()
+        except BaseException as error:
+            raise _InvocationStartObserverError(error) from error
+
+    def cancel(self) -> None:
+        if self.observer is None:
+            return
+        cancel = getattr(self.observer, "cancel", None)
+        if cancel is not None:
+            cancel()
+
+
 _DOMAIN_SCHEMAS = Path(__file__).resolve().parents[2] / "domain" / "schemas"
 _IMPLEMENTATION_SCHEMA = _DOMAIN_SCHEMAS / "implementation-result.schema.json"
 _REVIEW_SCHEMA = _DOMAIN_SCHEMAS / "review-result.schema.json"
@@ -191,6 +220,7 @@ class CodexCliAgentExecutor:
         raw_result_bytes: bytes | None = None
         result_read_error: OSError | UnicodeError | None = None
         output_publication_truncated = False
+        output_publication_deadline_exhausted = False
         command = configured_command
         overall_deadline = (
             None
@@ -245,6 +275,19 @@ class CodexCliAgentExecutor:
                         stderr_fallback=error.result.stderr,
                         stdout_capture_complete=(error.result.stdout_capture_complete),
                         stderr_capture_complete=(error.result.stderr_capture_complete),
+                        stdout_capture_stable=error.result.stdout_capture_stable,
+                        stderr_capture_stable=error.result.stderr_capture_stable,
+                        stdout_capture_prefix_bytes=(
+                            error.result.stdout_capture_prefix_bytes
+                        ),
+                        stderr_capture_prefix_bytes=(
+                            error.result.stderr_capture_prefix_bytes
+                        ),
+                        stdout_observed_bytes=error.result.stdout_observed_bytes,
+                        stderr_observed_bytes=error.result.stderr_observed_bytes,
+                        stdout_observed_tail=error.result.stdout_observed_tail,
+                        stderr_observed_tail=error.result.stderr_observed_tail,
+                        deadline=overall_deadline,
                     )
                     diagnostic_bytes, diagnostic, _ = _read_scratch_result(
                         scratch_result
@@ -256,6 +299,9 @@ class CodexCliAgentExecutor:
                     )
                     process_metadata["output_publication_truncated"] = (
                         publication.truncated
+                    )
+                    process_metadata["output_publication_deadline_exhausted"] = (
+                        publication.deadline_exhausted
                     )
                     return self._failure(
                         request,
@@ -280,6 +326,7 @@ class CodexCliAgentExecutor:
                             stderr_fallback=f"{error}\n",
                             stdout_capture_complete=False,
                             stderr_capture_complete=False,
+                            deadline=overall_deadline,
                         )
                         diagnostic_bytes, diagnostic, _ = _read_scratch_result(
                             scratch_result
@@ -301,6 +348,9 @@ class CodexCliAgentExecutor:
                         )
                         process_metadata["output_publication_truncated"] = (
                             publication.truncated
+                        )
+                        process_metadata["output_publication_deadline_exhausted"] = (
+                            publication.deadline_exhausted
                         )
                         return self._failure(
                             request,
@@ -346,8 +396,20 @@ class CodexCliAgentExecutor:
                     stderr_fallback=process.stderr,
                     stdout_capture_complete=process.stdout_capture_complete,
                     stderr_capture_complete=process.stderr_capture_complete,
+                    stdout_capture_stable=process.stdout_capture_stable,
+                    stderr_capture_stable=process.stderr_capture_stable,
+                    stdout_capture_prefix_bytes=process.stdout_capture_prefix_bytes,
+                    stderr_capture_prefix_bytes=process.stderr_capture_prefix_bytes,
+                    stdout_observed_bytes=process.stdout_observed_bytes,
+                    stderr_observed_bytes=process.stderr_observed_bytes,
+                    stdout_observed_tail=process.stdout_observed_tail,
+                    stderr_observed_tail=process.stderr_observed_tail,
+                    deadline=overall_deadline,
                 )
                 output_publication_truncated = publication.truncated
+                output_publication_deadline_exhausted = (
+                    publication.deadline_exhausted
+                )
         except CodexScratchDirectoryError as error:
             write_process_output(paths, stdout="", stderr=f"{error}\n")
             return self._failure(
@@ -364,6 +426,9 @@ class CodexCliAgentExecutor:
             configured_timeout=request.policy.timeout_seconds,
         )
         process_metadata["output_publication_truncated"] = output_publication_truncated
+        process_metadata["output_publication_deadline_exhausted"] = (
+            output_publication_deadline_exhausted
+        )
         if process.transport_failure is not None:
             if raw_result is not None:
                 write_diagnostic_result(paths, raw_result)
@@ -555,7 +620,17 @@ class CodexCliAgentExecutor:
             started_at=started,
             ended_at=ended,
             duration_seconds=(ended - started).total_seconds(),
-            failure_category=map_failure(reason),
+            failure_category=map_failure(
+                reason,
+                tree_termination_confirmed=(
+                    None
+                    if extra_metadata is None
+                    else cast(
+                        bool | None,
+                        extra_metadata.get("tree_termination_confirmed"),
+                    )
+                ),
+            ),
             failure_message=message,
             artifacts=paths.references(),
             provider_metadata=metadata,
@@ -571,18 +646,7 @@ def _process_start_observer(
 ) -> Callable[[], None] | None:
     if observer is None and on_started is None:
         return None
-
-    def notify() -> None:
-        if on_started is not None:
-            on_started()
-        if observer is None:
-            return
-        try:
-            observer()
-        except BaseException as error:
-            raise _InvocationStartObserverError(error) from error
-
-    return notify
+    return _ProcessStartObserver(observer, on_started)
 
 
 def _policy_problem(request: AgentExecutionRequest[TaskResult]) -> str | None:
@@ -771,6 +835,9 @@ def _execution_record(execution: AgentExecution[TaskResult]) -> JsonObject:
         "output_draining_truncated": metadata.get("output_draining_truncated", False),
         "output_publication_truncated": metadata.get(
             "output_publication_truncated", False
+        ),
+        "output_publication_deadline_exhausted": metadata.get(
+            "output_publication_deadline_exhausted", False
         ),
         "event_stream_problem": metadata.get("event_stream_problem"),
         "result_json_present": any(

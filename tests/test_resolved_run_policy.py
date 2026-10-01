@@ -14,6 +14,7 @@ from ticket_automation.application.agent_execution import (
     NetworkAccess,
     ProviderId,
     RepositoryAccess,
+    required_execution_capabilities,
 )
 from ticket_automation.application.ports.preflight import PreflightResult
 from ticket_automation.composition.providers import RegisteredProviderExecutorFactory
@@ -566,6 +567,54 @@ def test_trusted_task_policy_construction_rejects_incompatible_requirements():
             required_capabilities=ALL_CAPABILITIES,
             execution_policy=AgentExecutionPolicy(3600, NetworkAccess.DENIED),
         )
+
+
+@pytest.mark.parametrize("timeout", [None, 0.5, 1.5])
+def test_trusted_task_policy_rejects_invalid_direct_timeout(timeout):
+    with pytest.raises(
+        ResolvedRunPolicyError,
+        match="finite, positive whole number",
+    ):
+        ResolvedTaskPolicy(
+            task_kind=AgentTaskKind.REVIEW,
+            provider_id=ProviderId("shared"),
+            repository_access=RepositoryAccess.READ_ONLY,
+            required_capabilities=required_execution_capabilities(
+                RepositoryAccess.READ_ONLY
+            ),
+            execution_policy=AgentExecutionPolicy(timeout, NetworkAccess.DENIED),
+        )
+
+
+@pytest.mark.parametrize(
+    ("task_kind", "timeout"),
+    [
+        (AgentTaskKind.IMPLEMENTATION, 7200),
+        (AgentTaskKind.REVIEW, 5400.0),
+        (AgentTaskKind.CORRECTION, 9000),
+    ],
+)
+def test_trusted_task_policy_accepts_distinct_direct_timeouts(task_kind, timeout):
+    access = (
+        RepositoryAccess.READ_ONLY
+        if task_kind is AgentTaskKind.REVIEW
+        else RepositoryAccess.WORKSPACE_WRITE
+    )
+    network = (
+        NetworkAccess.DENIED
+        if task_kind is AgentTaskKind.REVIEW
+        else NetworkAccess.ALLOWED
+    )
+
+    policy = ResolvedTaskPolicy(
+        task_kind=task_kind,
+        provider_id=ProviderId("shared"),
+        repository_access=access,
+        required_capabilities=required_execution_capabilities(access),
+        execution_policy=AgentExecutionPolicy(timeout, network),
+    )
+
+    assert policy.execution_policy.timeout_seconds == float(timeout)
 
 
 @pytest.mark.parametrize(

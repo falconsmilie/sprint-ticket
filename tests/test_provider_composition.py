@@ -274,6 +274,68 @@ def test_trusted_agent_settings_reject_unconfigured_assignment():
         )
 
 
+@pytest.mark.parametrize(
+    "timeouts",
+    [
+        {AgentTaskKind.REVIEW: 3600},
+        {
+            AgentTaskKind.IMPLEMENTATION: True,
+            AgentTaskKind.REVIEW: 3600,
+            AgentTaskKind.CORRECTION: 3600,
+        },
+        {
+            AgentTaskKind.IMPLEMENTATION: 0,
+            AgentTaskKind.REVIEW: 3600,
+            AgentTaskKind.CORRECTION: 3600,
+        },
+        {
+            AgentTaskKind.IMPLEMENTATION: -1,
+            AgentTaskKind.REVIEW: 3600,
+            AgentTaskKind.CORRECTION: 3600,
+        },
+        {
+            AgentTaskKind.IMPLEMENTATION: 2**53 + 1,
+            AgentTaskKind.REVIEW: 3600,
+            AgentTaskKind.CORRECTION: 3600,
+        },
+    ],
+)
+def test_trusted_agent_settings_reject_invalid_timeout_invariants(timeouts):
+    valid = _settings(
+        implementation="shared",
+        review="shared",
+        correction="shared",
+    )
+
+    with pytest.raises(ConfigError, match="agents.timeouts"):
+        AgentSettings(
+            assignments=valid.assignments,
+            providers=valid.providers,
+            timeouts=timeouts,
+        )
+
+
+def test_trusted_agent_settings_accept_distinct_exact_timeouts():
+    valid = _settings(
+        implementation="shared",
+        review="shared",
+        correction="shared",
+    )
+    timeouts = {
+        AgentTaskKind.IMPLEMENTATION: 7200,
+        AgentTaskKind.REVIEW: 5400,
+        AgentTaskKind.CORRECTION: 9000,
+    }
+
+    settings = AgentSettings(
+        assignments=valid.assignments,
+        providers=valid.providers,
+        timeouts=timeouts,
+    )
+
+    assert settings.timeouts == timeouts
+
+
 def test_registry_key_must_match_registration_identity(tmp_path):
     configured_id = ProviderId("configured")
     registration = StubRegistration(ProviderId("different"))

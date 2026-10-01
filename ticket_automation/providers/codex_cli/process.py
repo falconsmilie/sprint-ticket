@@ -26,6 +26,68 @@ CLEANUP_SECONDS = 10.0
 _READ_SIZE = 64 * 1024
 _DIAGNOSTIC_TAIL_BYTES = _READ_SIZE
 _MAX_OBSERVED_RECORD_CHARS = 8 * 1024 * 1024
+_CAPTURE_POPEN = subprocess.Popen
+
+
+def _capture_helper_source() -> str:
+    """Return the isolated staging writer used for one output stream."""
+
+    return r"""
+import os
+import sys
+
+path = sys.argv[1]
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+if hasattr(os, "O_BINARY"):
+    flags |= os.O_BINARY
+if hasattr(os, "O_NOFOLLOW"):
+    flags |= os.O_NOFOLLOW
+descriptor = os.open(path, flags, 0o600)
+
+def read_exact(size):
+    value = bytearray()
+    while len(value) < size:
+        chunk = os.read(sys.stdin.fileno(), size - len(value))
+        if not chunk:
+            raise EOFError
+        value.extend(chunk)
+    return bytes(value)
+
+def write_all(target, value):
+    view = memoryview(value)
+    while view:
+        written = os.write(target, view)
+        if written <= 0:
+            raise OSError("capture write made no progress")
+        view = view[written:]
+
+try:
+    write_all(sys.stdout.fileno(), b"R")
+    while True:
+        header = os.read(sys.stdin.fileno(), 8)
+        if not header:
+            break
+        while len(header) < 8:
+            header += read_exact(8 - len(header))
+        size = int.from_bytes(header, "big")
+        payload = read_exact(size)
+        write_all(descriptor, payload)
+        write_all(sys.stdout.fileno(), b"A")
+    os.close(descriptor)
+    descriptor = -1
+except BaseException:
+    try:
+        write_all(sys.stdout.fileno(), b"E")
+    except BaseException:
+        pass
+    raise
+finally:
+    if descriptor >= 0:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+"""
 
 
 @dataclass(frozen=True)
@@ -70,7 +132,15 @@ class CodexProcessResult:
     stderr_capture: Path | None = None
     stdout_capture_complete: bool = True
     stderr_capture_complete: bool = True
+    stdout_capture_stable: bool = False
+    stderr_capture_stable: bool = False
     transport_failure: str | None = None
+    stdout_capture_prefix_bytes: int = 0
+    stderr_capture_prefix_bytes: int = 0
+    stdout_observed_bytes: int = 0
+    stderr_observed_bytes: int = 0
+    stdout_observed_tail: bytes = b""
+    stderr_observed_tail: bytes = b""
 
 
 @dataclass(frozen=True)
@@ -85,6 +155,14 @@ class CodexProcessTimeout:
     stderr_capture: Path | None = None
     stdout_capture_complete: bool = True
     stderr_capture_complete: bool = True
+    stdout_capture_stable: bool = False
+    stderr_capture_stable: bool = False
+    stdout_capture_prefix_bytes: int = 0
+    stderr_capture_prefix_bytes: int = 0
+    stdout_observed_bytes: int = 0
+    stderr_observed_bytes: int = 0
+    stdout_observed_tail: bytes = b""
+    stderr_observed_tail: bytes = b""
 
 
 class CodexProcessTimedOut(TimeoutError):
@@ -251,6 +329,208 @@ def _worker_descriptor(stream: BinaryIO) -> tuple[int | None, bool]:
     return descriptor, False
 
 
+def _write_descriptor(descriptor: int, value: bytes | memoryview) -> None:
+    view = memoryview(value)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("Codex capture transport made no progress")
+        view = view[written:]
+
+
+def _read_descriptor(descriptor: int, size: int) -> bytes:
+    value = bytearray()
+    while len(value) < size:
+        chunk = os.read(descriptor, size - len(value))
+        if not chunk:
+            break
+        value.extend(chunk)
+    return bytes(value)
+
+
+class _CaptureSink:
+    """Write staging bytes in a process that cleanup can always terminate."""
+
+    _codex_close_is_nonblocking = True
+
+    def __init__(
+        self,
+        destination: Path,
+        *,
+        deadline: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.destination = destination
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._closed = False
+        self._aborted = False
+        creationflags = (
+            getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        )
+        self.process = _CAPTURE_POPEN(
+            (sys.executable, "-u", "-c", _capture_helper_source(), str(destination)),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            bufsize=0,
+            creationflags=creationflags,
+        )
+        assert self.process.stdin is not None
+        assert self.process.stdout is not None
+        self._input_descriptor: int | None = os.dup(self.process.stdin.fileno())
+        self._ack_descriptor: int | None = os.dup(self.process.stdout.fileno())
+        self.process.stdin.close()
+        self.process.stdout.close()
+        if deadline is None:
+            deadline = clock() + CLEANUP_SECONDS
+        try:
+            remaining = max(0.0, deadline - clock())
+            reap_reserve = min(0.02, remaining / 4.0)
+            ready_deadline = max(clock(), deadline - reap_reserve)
+            if self._read_ack_until(ready_deadline, clock) != b"R":
+                raise OSError("Codex capture helper did not initialize")
+        except BaseException:
+            self.abort(deadline=deadline, clock=clock)
+            raise
+
+    def write(self, value: bytes | memoryview) -> int:
+        payload = bytes(value)
+        with self._lock:
+            if self._closed or self._aborted or self._input_descriptor is None:
+                raise OSError("Codex capture helper is closed")
+            input_descriptor = self._input_descriptor
+        _write_descriptor(input_descriptor, len(payload).to_bytes(8, "big"))
+        _write_descriptor(input_descriptor, payload)
+        if self._read_ack() != b"A":
+            raise OSError("Codex capture helper failed while writing output")
+        return len(payload)
+
+    def flush(self) -> None:
+        # A per-chunk acknowledgement is emitted only after the helper's
+        # unbuffered staging write completes, so there is no buffered flush.
+        return None
+
+    def close(
+        self,
+        *,
+        deadline: float | None = None,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        clock = self._clock if clock is None else clock
+        if deadline is None:
+            deadline = clock() + CLEANUP_SECONDS
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            descriptor = self._input_descriptor
+            self._input_descriptor = None
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        remaining = max(0.0, deadline - clock())
+        reap_reserve = min(0.1, remaining / 2.0)
+        graceful_timeout = max(0.0, remaining - reap_reserve)
+        try:
+            self.process.wait(timeout=graceful_timeout)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            confirmed = self.abort(deadline=deadline, clock=clock)
+            if not confirmed:
+                raise OSError(
+                    "Codex capture helper shutdown could not be confirmed"
+                ) from error
+            raise OSError("Codex capture helper did not close promptly") from error
+        finally:
+            self._close_ack_descriptor()
+        if self.process.returncode != 0 and not self._aborted:
+            raise OSError("Codex capture helper exited unsuccessfully")
+
+    def abort(
+        self,
+        *,
+        deadline: float | None = None,
+        clock: Callable[[], float] | None = None,
+    ) -> bool:
+        """Force-stop the writer under the caller's remaining deadline."""
+
+        clock = self._clock if clock is None else clock
+        if deadline is None:
+            deadline = clock() + CLEANUP_SECONDS
+        self.request_abort()
+        try:
+            self.process.wait(timeout=max(0.0, deadline - clock()))
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        self._close_ack_descriptor()
+        return self.process.poll() is not None
+
+    def request_abort(self) -> None:
+        """Revoke descriptors and request forceful stop without waiting."""
+
+        with self._lock:
+            self._aborted = True
+            input_descriptor = self._input_descriptor
+            self._input_descriptor = None
+        if input_descriptor is not None:
+            try:
+                os.close(input_descriptor)
+            except OSError:
+                pass
+        try:
+            if self.process.poll() is None:
+                self.process.kill()
+        except OSError:
+            pass
+
+    @property
+    def stopped(self) -> bool:
+        return self.process.poll() is not None
+
+    def _read_ack(self) -> bytes:
+        with self._lock:
+            descriptor = self._ack_descriptor
+        if descriptor is None:
+            return b""
+        return _read_descriptor(descriptor, 1)
+
+    def _read_ack_until(
+        self,
+        deadline: float,
+        clock: Callable[[], float],
+    ) -> bytes:
+        """Read one helper acknowledgement without owning an unbounded wait."""
+
+        result: list[bytes] = []
+
+        def read() -> None:
+            result.append(self._read_ack())
+
+        reader = threading.Thread(
+            target=read,
+            name="codex-capture-readiness",
+            daemon=True,
+        )
+        reader.start()
+        reader.join(max(0.0, deadline - clock()))
+        if reader.is_alive():
+            return b""
+        return result[0] if result else b""
+
+    def _close_ack_descriptor(self) -> None:
+        with self._lock:
+            descriptor = self._ack_descriptor
+            self._ack_descriptor = None
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
 class _StreamWorker:
     def __init__(
         self,
@@ -259,7 +539,7 @@ class _StreamWorker:
         *,
         stream_name: str,
         observer: _CodexEventObserver | None = None,
-        output: BinaryIO | None = None,
+        output: object | None = None,
     ) -> None:
         self.stream = stream
         self.destination = destination
@@ -270,8 +550,12 @@ class _StreamWorker:
         self.error: BaseException | None = None
         self.capture_failed = False
         self.buffer = bytearray()
-        self.capture_lock = threading.Lock()
-        self.capture_sealed = False
+        self.state_lock = threading.Lock()
+        self.capture_revoked = threading.Event()
+        self.capture_prefix_bytes = 0
+        self.observed_bytes = 0
+        self.capture_operation_active = False
+        self.capture_sink = output
         self.file_descriptor, self.owns_descriptor = _worker_descriptor(stream)
         self.uses_descriptor = self.file_descriptor is not None
         self.descriptor_lock = threading.Lock()
@@ -284,8 +568,14 @@ class _StreamWorker:
     def start(self) -> None:
         self.thread.start()
 
-    def cancel(self) -> bool:
+    def cancel(
+        self,
+        *,
+        deadline: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> bool:
         self.cancel_requested.set()
+        self.revoke_capture(deadline=deadline, clock=clock)
         if os.name == "nt" and self.thread.is_alive():
             return _cancel_blocked_windows_thread(self.thread)
         return True
@@ -322,12 +612,13 @@ class _StreamWorker:
     def _run(self) -> None:
         try:
             if self.destination is not None and self.output is None:
-                opened = self.destination.open("wb", buffering=0)
-                with self.capture_lock:
-                    if self.capture_sealed:
+                opened = _open_capture(self.destination)
+                if self.capture_revoked.is_set():
+                    if opened is not None:
                         opened.close()
-                    else:
-                        self.output = opened
+                else:
+                    self.output = opened
+                    self.capture_sink = opened
             while not self.cancel_requested.is_set():
                 chunk = self._read()
                 if not chunk:
@@ -335,25 +626,44 @@ class _StreamWorker:
                 # Retain and observe bytes immediately after reading them. Capture
                 # storage is fallible and must not erase the chunk that triggered
                 # a streaming failure.
-                self.buffer.extend(chunk)
-                if len(self.buffer) > _DIAGNOSTIC_TAIL_BYTES:
-                    del self.buffer[:-_DIAGNOSTIC_TAIL_BYTES]
+                with self.state_lock:
+                    self.observed_bytes += len(chunk)
+                    self.buffer.extend(chunk)
+                    if len(self.buffer) > _DIAGNOSTIC_TAIL_BYTES:
+                        del self.buffer[:-_DIAGNOSTIC_TAIL_BYTES]
                 if self.observer is not None:
                     self.observer.feed(chunk)
                 try:
-                    with self.capture_lock:
-                        output = None if self.capture_sealed else self.output
-                        if output is None:
-                            continue
+                    with self.state_lock:
+                        output = self.output
+                        if output is None or self.capture_revoked.is_set():
+                            output = None
+                        else:
+                            self.capture_operation_active = True
+                    if output is None:
+                        if self.capture_revoked.is_set():
+                            # Revocation is used only after the bounded healthy-
+                            # drain interval. Preserve this one already-observed
+                            # chunk in the diagnostic suffix, then stop before
+                            # reading and silently discarding more pipe data.
+                            break
+                        # A caller may intentionally omit provider capture while
+                        # still requiring the stream to be drained.
+                        continue
+                    try:
                         view = memoryview(chunk)
-                        while view:
+                        while view and not self.capture_revoked.is_set():
                             written = output.write(view)
                             if written is None:
                                 written = len(view)
                             if written <= 0:
                                 raise OSError("Codex capture write made no progress")
+                            with self.state_lock:
+                                self.capture_prefix_bytes += written
                             view = view[written:]
-                        output.flush()
+                    finally:
+                        with self.state_lock:
+                            self.capture_operation_active = False
                 except (BufferError, OSError, RuntimeError, TypeError, ValueError):
                     self.capture_failed = True
                     raise
@@ -362,17 +672,11 @@ class _StreamWorker:
         except (BufferError, OSError, RuntimeError, TypeError, ValueError) as error:
             self.error = error
         finally:
-            self.seal_capture()
-            self.force_close_descriptor()
-            self.done.set()
-
-    def seal_capture(self) -> None:
-        """Revoke this worker's ability to mutate its staging capture."""
-
-        with self.capture_lock:
-            self.capture_sealed = True
-            output = self.output
-            self.output = None
+            self.capture_revoked.set()
+            with self.state_lock:
+                self.capture_operation_active = True
+                output = self.output
+                self.output = None
             try:
                 if output is not None:
                     output.close()
@@ -380,9 +684,132 @@ class _StreamWorker:
                 self.capture_failed = True
                 if self.error is None:
                     self.error = error
+            self.force_close_descriptor()
+            self.done.set()
+
+    def revoke_capture(
+        self,
+        *,
+        deadline: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        """Prevent writes and terminate the isolated staging writer."""
+
+        already_revoked = self.capture_revoked.is_set()
+        self.capture_revoked.set()
+        with self.state_lock:
+            output = self.capture_sink
+        if already_revoked and bool(output is None or getattr(output, "stopped", False)):
+            return
+        abort = getattr(output, "abort", None)
+        if abort is not None:
+            try:
+                abort(deadline=deadline, clock=clock)
+            except TypeError:
+                # Non-production test sinks retain the historical no-argument
+                # seam; they never own a helper process.
+                try:
+                    abort()
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    pass
+            except (OSError, RuntimeError, ValueError):
+                pass
+
+    def request_capture_abort(self) -> bool:
+        """Revoke this worker and signal its helper before shared waiting."""
+
+        self.capture_revoked.set()
+        with self.state_lock:
+            output = self.capture_sink
+        request_abort = getattr(output, "request_abort", None)
+        if request_abort is None:
+            return output is None
+        try:
+            request_abort()
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return False
+        return True
+
+    def close_capture_if_idle(
+        self,
+        *,
+        deadline: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> bool:
+        """Close an idle native capture without contending with sink I/O."""
+
+        self.capture_revoked.set()
+        with self.state_lock:
+            output = self.output
+            if output is None:
+                sink = self.capture_sink
+                return bool(sink is None or getattr(sink, "stopped", False))
+            if self.capture_operation_active:
+                abort = getattr(self.capture_sink, "abort", None)
+                if abort is not None:
+                    try:
+                        try:
+                            return bool(abort(deadline=deadline, clock=clock))
+                        except TypeError:
+                            return bool(abort())
+                    except (OSError, RuntimeError, TypeError, ValueError):
+                        return False
+                return False
+            if type(output).__module__ != "_io" and not getattr(
+                output, "_codex_close_is_nonblocking", False
+            ):
+                return False
+            self.output = None
+        try:
+            try:
+                output.close(deadline=deadline, clock=clock)
+            except TypeError:
+                output.close()
+        except (OSError, RuntimeError, ValueError) as error:
+            self.capture_failed = True
+            if self.error is None:
+                self.error = error
+            return False
+        return True
+
+    def capture_snapshot(self) -> tuple[int, int, bytes]:
+        """Return the durable-prefix claim and bounded observed tail."""
+
+        with self.state_lock:
+            return (
+                self.capture_prefix_bytes,
+                self.observed_bytes,
+                bytes(self.buffer),
+            )
+
+    def recovery_snapshot(self) -> tuple[Path | None, int, bool]:
+        """Compatibility hook: isolated primary capture needs no recovery spool."""
+
+        return None, 0, False
+
+    def capture_stable(self) -> bool:
+        with self.state_lock:
+            sink = self.capture_sink
+            operation_active = self.capture_operation_active
+        if self.done.is_set() and not self.thread.is_alive():
+            return True
+        return bool(
+            self.capture_revoked.is_set()
+            and not operation_active
+            and (sink is None or getattr(sink, "stopped", False))
+        )
+
+    def durable_prefix_bytes(self) -> int:
+        prefix_bytes, _, _ = self.capture_snapshot()
+        if not self.capture_stable() or self.destination is None:
+            return prefix_bytes
+        try:
+            return self.destination.stat().st_size
+        except OSError:
+            return prefix_bytes
 
     def text(self) -> str:
-        return decode_human_output(bytes(self.buffer))
+        return decode_human_output(self.capture_snapshot()[2])
 
 
 class _InputWorker:
@@ -474,6 +901,7 @@ class _StartObserverWorker:
     def __init__(self, observer: Callable[[], None]) -> None:
         self.observer = observer
         self.done = threading.Event()
+        self.cancel_requested = threading.Event()
         self.error: BaseException | None = None
         self.thread = threading.Thread(
             target=self._run,
@@ -484,9 +912,21 @@ class _StartObserverWorker:
     def start(self) -> None:
         self.thread.start()
 
+    def cancel(self) -> bool:
+        self.cancel_requested.set()
+        cancel = getattr(self.observer, "cancel", None)
+        if cancel is None:
+            return True
+        try:
+            cancel()
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return False
+        return True
+
     def _run(self) -> None:
         try:
-            self.observer()
+            if not self.cancel_requested.is_set():
+                self.observer()
         except BaseException as error:  # noqa: BLE001 - preserve interruptions
             self.error = error
         finally:
@@ -664,12 +1104,30 @@ class SubprocessCodexRunner:
         timeout_seconds: float | None,
         on_process_start: Callable[[], None] | None = None,
     ) -> CodexProcessResult:
-        stdout_capture = _open_capture(command.stdout_capture)
+        # Capture-helper startup precedes the Codex launch and therefore uses
+        # its own bounded native-monotonic setup window. Do not sample the
+        # injectable work clock until immediately before the Codex Popen call.
+        capture_setup_deadline = time.monotonic() + CLEANUP_SECONDS
+        stdout_capture = _open_capture(
+            command.stdout_capture,
+            deadline=capture_setup_deadline,
+            clock=time.monotonic,
+        )
         try:
-            stderr_capture = _open_capture(command.stderr_capture)
+            capture_setup_deadline = time.monotonic() + CLEANUP_SECONDS
+            stderr_capture = _open_capture(
+                command.stderr_capture,
+                deadline=capture_setup_deadline,
+                clock=time.monotonic,
+            )
         except BaseException:
             if stdout_capture is not None:
-                stdout_capture.close()
+                _close_captures(
+                    (stdout_capture, None),
+                    deadline=capture_setup_deadline,
+                    clock=time.monotonic,
+                    force=True,
+                )
             raise
         capture_streams = (stdout_capture, stderr_capture)
         popen_options: dict[str, object] = {
@@ -691,29 +1149,45 @@ class SubprocessCodexRunner:
         try:
             process = subprocess.Popen(command.argv, **popen_options)
         except BaseException:
-            _close_captures(capture_streams)
+            launch_cleanup_deadline = min(
+                self._monotonic() + CLEANUP_SECONDS,
+                (deadline or self._monotonic()) + CLEANUP_SECONDS,
+            )
+            _close_captures(
+                capture_streams,
+                deadline=launch_cleanup_deadline,
+                clock=self._monotonic,
+                force=True,
+            )
             raise
         containment: _InvocationContainment
         try:
             containment = _contain_process(process)
         except BaseException as error:
+            cleanup_started = self._monotonic()
             cleanup_deadline = self._monotonic() + CLEANUP_SECONDS
             if deadline is not None:
                 cleanup_deadline = min(cleanup_deadline, deadline + CLEANUP_SECONDS)
+            _request_capture_aborts(capture_streams)
             cleanup = _emergency_cleanup(
                 process,
                 _SingleProcessContainment(process),
                 cleanup_deadline,
                 self._monotonic,
             )
-            _close_captures(capture_streams)
+            capture_confirmed = _close_captures(
+                capture_streams,
+                deadline=cleanup_deadline,
+                clock=self._monotonic,
+                force=True,
+            )
             if not isinstance(error, Exception):
                 raise
             uncertain_cleanup = _CleanupResult(
                 "incomplete",
                 "containment-setup-failed",
                 False,
-                cleanup.duration,
+                max(cleanup.duration, self._monotonic() - cleanup_started),
                 True,
             )
             observer = _CodexEventObserver(
@@ -743,20 +1217,37 @@ class SubprocessCodexRunner:
                 stderr_capture_complete=False,
                 transport_failure=(
                     f"Codex invocation containment failed after launch: {error}"
+                    + (
+                        ""
+                        if capture_confirmed
+                        else "; capture-helper shutdown could not be confirmed"
+                    )
                 ),
             )
         workers_for_cleanup: (
             tuple[_StreamWorker, _StreamWorker, _InputWorker] | None
         ) = None
+        start_observer_worker: _StartObserverWorker | None = None
         observer: _CodexEventObserver | None = None
+        capture_close_deadline: float | None = None
+        capture_helpers_confirmed = True
         try:
             if not all(
                 hasattr(process, name) for name in ("stdin", "stdout", "stderr", "poll")
             ):
-                if not self._notify_process_start(on_process_start, deadline):
+                notified, start_observer_worker = self._notify_process_start(
+                    on_process_start, deadline
+                )
+                if not notified:
                     cleanup = _emergency_cleanup(
                         process,
                         containment,
+                        (deadline or self._monotonic()) + CLEANUP_SECONDS,
+                        self._monotonic,
+                    )
+                    cleanup = _include_start_observer_cleanup(
+                        cleanup,
+                        start_observer_worker,
                         (deadline or self._monotonic()) + CLEANUP_SECONDS,
                         self._monotonic,
                     )
@@ -822,7 +1313,10 @@ class SubprocessCodexRunner:
             workers_for_cleanup = workers
             for worker in workers[:2]:
                 worker.start()
-            if not self._notify_process_start(on_process_start, deadline):
+            notified, start_observer_worker = self._notify_process_start(
+                on_process_start, deadline
+            )
+            if not notified:
                 assert timeout_seconds is not None
                 return self._timeout(
                     process,
@@ -835,6 +1329,7 @@ class SubprocessCodexRunner:
                     launched_at=launched_at,
                     deadline=deadline,
                     timeout_seconds=float(timeout_seconds),
+                    start_observer_worker=start_observer_worker,
                 )
             input_worker.start()
             return self._monitor(
@@ -855,9 +1350,17 @@ class SubprocessCodexRunner:
             cleanup_deadline = self._monotonic() + CLEANUP_SECONDS
             if deadline is not None:
                 cleanup_deadline = min(cleanup_deadline, deadline + CLEANUP_SECONDS)
+            capture_close_deadline = cleanup_deadline
             if workers_for_cleanup is None:
+                _request_capture_aborts(capture_streams)
                 cleanup = _emergency_cleanup(
                     process, containment, cleanup_deadline, self._monotonic
+                )
+                cleanup = _include_start_observer_cleanup(
+                    cleanup,
+                    start_observer_worker,
+                    cleanup_deadline,
+                    self._monotonic,
                 )
             else:
                 cleanup = _cleanup(
@@ -866,7 +1369,26 @@ class SubprocessCodexRunner:
                     workers_for_cleanup,
                     cleanup_deadline,
                     self._monotonic,
+                    start_observer_worker=start_observer_worker,
                 )
+            if workers_for_cleanup is None:
+                capture_helpers_confirmed = _close_captures(
+                    capture_streams,
+                    deadline=cleanup_deadline,
+                    clock=self._monotonic,
+                    force=True,
+                )
+                if not capture_helpers_confirmed:
+                    cleanup = _CleanupResult(
+                        "incomplete",
+                        cleanup.method,
+                        cleanup.confirmed,
+                        max(
+                            cleanup.duration,
+                            max(0.0, self._monotonic() - launched_at),
+                        ),
+                        True,
+                    )
             if isinstance(original, _ProcessStartObserverRaised):
                 raise original.error
             if not isinstance(original, Exception):
@@ -882,6 +1404,12 @@ class SubprocessCodexRunner:
             )
             stderr_worker = (
                 None if workers_for_cleanup is None else workers_for_cleanup[1]
+            )
+            stdout_capture = _capture_result(
+                stdout_worker, command.stdout_capture, cleanup
+            )
+            stderr_capture = _capture_result(
+                stderr_worker, command.stderr_capture, cleanup
             )
             return CodexProcessResult(
                 returncode=(
@@ -899,36 +1427,61 @@ class SubprocessCodexRunner:
                     finalization_outcome="failed",
                     cleanup=cleanup,
                 ),
-                stdout_capture=command.stdout_capture,
-                stderr_capture=command.stderr_capture,
-                stdout_capture_complete=_capture_complete(stdout_worker, cleanup),
-                stderr_capture_complete=_capture_complete(stderr_worker, cleanup),
+                stdout_capture=stdout_capture.source,
+                stderr_capture=stderr_capture.source,
+                stdout_capture_complete=stdout_capture.complete,
+                stderr_capture_complete=stderr_capture.complete,
+                stdout_capture_stable=stdout_capture.stable,
+                stderr_capture_stable=stderr_capture.stable,
                 transport_failure=(
                     f"Codex transport setup failed after launch: {original}"
+                    + (
+                        ""
+                        if capture_helpers_confirmed
+                        else "; capture-helper shutdown could not be confirmed"
+                    )
                 ),
+                stdout_capture_prefix_bytes=stdout_capture.prefix_bytes,
+                stderr_capture_prefix_bytes=stderr_capture.prefix_bytes,
+                stdout_observed_bytes=stdout_capture.observed_bytes,
+                stderr_observed_bytes=stderr_capture.observed_bytes,
+                stdout_observed_tail=stdout_capture.observed_tail,
+                stderr_observed_tail=stderr_capture.observed_tail,
             )
         finally:
             containment.close()
-            _close_captures(capture_streams)
+            if workers_for_cleanup is None:
+                if capture_close_deadline is None:
+                    capture_close_deadline = min(
+                        self._monotonic() + CLEANUP_SECONDS,
+                        (deadline or self._monotonic()) + CLEANUP_SECONDS,
+                    )
+                _close_captures(
+                    capture_streams,
+                    deadline=capture_close_deadline,
+                    clock=self._monotonic,
+                    force=True,
+                )
 
     def _notify_process_start(
         self,
         observer: Callable[[], None] | None,
         deadline: float | None,
-    ) -> bool:
+    ) -> tuple[bool, _StartObserverWorker | None]:
         if observer is None:
-            return True
+            return True, None
         worker = _StartObserverWorker(observer)
         worker.start()
         while not worker.done.is_set():
             now = self._monotonic()
             if deadline is not None and now >= deadline:
-                return False
+                worker.cancel()
+                return False, worker
             wait = 0.005 if deadline is None else min(0.005, deadline - now)
             worker.done.wait(max(0.0, wait))
         if worker.error is not None:
             raise _ProcessStartObserverRaised(worker.error)
-        return True
+        return True, worker
 
     def _monitor(
         self,
@@ -1145,16 +1698,26 @@ class SubprocessCodexRunner:
             finalization_outcome=finalization_outcome,
             cleanup=cleanup,
         )
+        stdout_capture = _capture_result(stdout_worker, command.stdout_capture, cleanup)
+        stderr_capture = _capture_result(stderr_worker, command.stderr_capture, cleanup)
         return CodexProcessResult(
             returncode=returncode,
             stdout=stdout_worker.text(),
             stderr=stderr_worker.text(),
             evidence=evidence,
-            stdout_capture=command.stdout_capture,
-            stderr_capture=command.stderr_capture,
-            stdout_capture_complete=_capture_complete(stdout_worker, cleanup),
-            stderr_capture_complete=_capture_complete(stderr_worker, cleanup),
+            stdout_capture=stdout_capture.source,
+            stderr_capture=stderr_capture.source,
+            stdout_capture_complete=stdout_capture.complete,
+            stderr_capture_complete=stderr_capture.complete,
+            stdout_capture_stable=stdout_capture.stable,
+            stderr_capture_stable=stderr_capture.stable,
             transport_failure=transport_failure,
+            stdout_capture_prefix_bytes=stdout_capture.prefix_bytes,
+            stderr_capture_prefix_bytes=stderr_capture.prefix_bytes,
+            stdout_observed_bytes=stdout_capture.observed_bytes,
+            stderr_observed_bytes=stderr_capture.observed_bytes,
+            stdout_observed_tail=stdout_capture.observed_tail,
+            stderr_observed_tail=stderr_capture.observed_tail,
         )
 
     def _timeout(
@@ -1170,6 +1733,7 @@ class SubprocessCodexRunner:
         launched_at: float,
         deadline: float,
         timeout_seconds: float,
+        start_observer_worker: _StartObserverWorker | None = None,
     ) -> CodexProcessResult:
         cleanup = _cleanup(
             process,
@@ -1177,6 +1741,7 @@ class SubprocessCodexRunner:
             (stdout_worker, stderr_worker, input_worker),
             deadline + CLEANUP_SECONDS,
             self._monotonic,
+            start_observer_worker=start_observer_worker,
         )
         evidence = _evidence(
             observer,
@@ -1188,16 +1753,26 @@ class SubprocessCodexRunner:
             finalization_outcome="not-eligible",
             cleanup=cleanup,
         )
+        stdout_capture = _capture_result(stdout_worker, command.stdout_capture, cleanup)
+        stderr_capture = _capture_result(stderr_worker, command.stderr_capture, cleanup)
         raise CodexProcessTimedOut(
             CodexProcessTimeout(
                 stdout=stdout_worker.text(),
                 stderr=stderr_worker.text(),
                 timeout_seconds=timeout_seconds,
                 evidence=evidence,
-                stdout_capture=command.stdout_capture,
-                stderr_capture=command.stderr_capture,
-                stdout_capture_complete=_capture_complete(stdout_worker, cleanup),
-                stderr_capture_complete=_capture_complete(stderr_worker, cleanup),
+                stdout_capture=stdout_capture.source,
+                stderr_capture=stderr_capture.source,
+                stdout_capture_complete=stdout_capture.complete,
+                stderr_capture_complete=stderr_capture.complete,
+                stdout_capture_stable=stdout_capture.stable,
+                stderr_capture_stable=stderr_capture.stable,
+                stdout_capture_prefix_bytes=stdout_capture.prefix_bytes,
+                stderr_capture_prefix_bytes=stderr_capture.prefix_bytes,
+                stdout_observed_bytes=stdout_capture.observed_bytes,
+                stderr_observed_bytes=stderr_capture.observed_bytes,
+                stdout_observed_tail=stdout_capture.observed_tail,
+                stderr_observed_tail=stderr_capture.observed_tail,
             )
         )
 
@@ -1277,20 +1852,81 @@ class _CleanupResult:
         return cls("not-required", None, True, 0.0, False)
 
 
+@dataclass(frozen=True)
+class _CaptureResult:
+    source: Path | None
+    complete: bool
+    stable: bool
+    prefix_bytes: int
+    observed_bytes: int
+    observed_tail: bytes
+
+
+def _capture_result(
+    worker: _StreamWorker | None,
+    source: Path | None,
+    cleanup: _CleanupResult,
+) -> _CaptureResult:
+    if worker is None:
+        return _CaptureResult(source, False, False, 0, 0, b"")
+    _, observed_bytes, observed_tail = worker.capture_snapshot()
+    prefix_bytes = worker.durable_prefix_bytes()
+    complete = _capture_complete(worker, cleanup)
+    if complete:
+        return _CaptureResult(
+            source,
+            True,
+            True,
+            prefix_bytes,
+            observed_bytes,
+            observed_tail,
+        )
+    recovery_source, recovery_prefix, recovery_stable = worker.recovery_snapshot()
+    if recovery_stable and recovery_prefix == observed_bytes:
+        # The recovery spool was populated before each primary-sink operation,
+        # then fenced and closed during cleanup. It can be atomically promoted
+        # even when the primary writer remains blocked on another inode.
+        return _CaptureResult(
+            recovery_source,
+            False,
+            True,
+            recovery_prefix,
+            observed_bytes,
+            observed_tail,
+        )
+    return _CaptureResult(
+        source,
+        False,
+        _capture_stable(worker),
+        prefix_bytes,
+        observed_bytes,
+        observed_tail,
+    )
+
+
 def _capture_complete(
     worker: _StreamWorker | None,
     cleanup: _CleanupResult,
 ) -> bool:
     """A capture is promotable only after its sole writer stopped cleanly."""
 
+    if worker is None:
+        return False
+    _, observed_bytes, _ = worker.capture_snapshot()
+    prefix_bytes = worker.durable_prefix_bytes()
     return bool(
-        worker is not None
-        and worker.done.is_set()
-        and not worker.thread.is_alive()
+        _capture_stable(worker)
         and worker.error is None
         and not worker.capture_failed
         and not cleanup.drain_truncated
+        and prefix_bytes == observed_bytes
     )
+
+
+def _capture_stable(worker: _StreamWorker | None) -> bool:
+    """Return whether no worker can append to its staging capture."""
+
+    return bool(worker is not None and worker.capture_stable())
 
 
 def _cleanup(
@@ -1299,6 +1935,8 @@ def _cleanup(
     workers: tuple[_StreamWorker, _StreamWorker, _InputWorker],
     deadline: float,
     clock: Callable[[], float],
+    *,
+    start_observer_worker: _StartObserverWorker | None = None,
 ) -> _CleanupResult:
     started = clock()
     method: str | None = None
@@ -1347,15 +1985,39 @@ def _cleanup(
             worker.thread.join(max(0.0, drain_until - clock()))
 
     forced_output_close = any(worker.thread.is_alive() for worker in workers[:2])
-    cancellation_results = [
-        worker.cancel() if hasattr(worker, "cancel") else True for worker in workers
-    ]
+    # Healthy readers retain every byte made available by containment
+    # termination during the bounded drain interval. Revoke only workers that
+    # failed to finish; cancellation below prevents another read after the
+    # single already-observed chunk has been accounted for.
+    for worker in workers[:2]:
+        if (
+            worker.thread.is_alive()
+            and hasattr(worker, "revoke_capture")
+            and hasattr(worker, "request_capture_abort")
+        ):
+            worker.request_capture_abort()
+    for worker in workers[:2]:
+        if worker.thread.is_alive() and hasattr(worker, "revoke_capture"):
+            worker.revoke_capture(deadline=deadline, clock=clock)
+    all_workers = (
+        workers if start_observer_worker is None else (*workers, start_observer_worker)
+    )
+    cancellation_results: list[bool] = []
+    for worker in all_workers:
+        if not hasattr(worker, "cancel"):
+            cancellation_results.append(True)
+        elif isinstance(worker, _StreamWorker):
+            cancellation_results.append(
+                worker.cancel(deadline=deadline, clock=clock)
+            )
+        else:
+            cancellation_results.append(worker.cancel())
     initial_join_deadline = min(deadline, clock() + 0.05)
-    for worker in workers:
+    for worker in all_workers:
         if worker.thread.ident is not None:
             worker.thread.join(max(0.0, initial_join_deadline - clock()))
     if os.name == "nt":
-        for worker in workers:
+        for worker in all_workers:
             if not worker.thread.is_alive():
                 continue
             cancellation_results.append(
@@ -1363,21 +2025,26 @@ def _cleanup(
             )
             cancellation_results.append(_cancel_blocked_windows_thread(worker.thread))
     secondary_join_deadline = min(deadline, clock() + 0.05)
-    for worker in workers:
+    for worker in all_workers:
         if worker.thread.ident is not None and worker.thread.is_alive():
             worker.thread.join(max(0.0, secondary_join_deadline - clock()))
-    for worker in workers:
+    for worker in all_workers:
         if worker.thread.is_alive() and hasattr(worker, "force_close_descriptor"):
             cancellation_results.append(worker.force_close_descriptor())
+    for worker in workers[:2]:
+        if hasattr(worker, "close_recovery_if_idle"):
+            cancellation_results.append(worker.close_recovery_if_idle())
+    for worker in workers[:2]:
+        if hasattr(worker, "close_capture_if_idle"):
+            cancellation_results.append(
+                worker.close_capture_if_idle(deadline=deadline, clock=clock)
+            )
     for worker in workers:
         if worker.thread.ident is not None and worker.thread.is_alive():
             worker.thread.join(max(0.0, deadline - clock()))
-    for worker in workers:
+    for worker in all_workers:
         if not worker.thread.is_alive() and hasattr(worker, "force_close_descriptor"):
             cancellation_results.append(worker.force_close_descriptor())
-    for worker in workers[:2]:
-        if hasattr(worker, "seal_capture"):
-            worker.seal_capture()
     streams_closed = _close_process_streams(
         process,
         tuple(
@@ -1406,7 +2073,7 @@ def _cleanup(
         or any(getattr(worker, "error", None) is not None for worker in workers[:2])
         or any(worker.thread.is_alive() for worker in workers[:2])
     )
-    workers_stopped = not any(worker.thread.is_alive() for worker in workers)
+    workers_stopped = not any(worker.thread.is_alive() for worker in all_workers)
     cancellation_confirmed = workers_stopped or all(cancellation_results)
     return _CleanupResult(
         (
@@ -1498,6 +2165,30 @@ def _emergency_cleanup(
     )
 
 
+def _include_start_observer_cleanup(
+    cleanup: _CleanupResult,
+    worker: _StartObserverWorker | None,
+    deadline: float,
+    clock: Callable[[], float],
+) -> _CleanupResult:
+    """Cancel and bound a start recorder under the existing cleanup deadline."""
+
+    if worker is None or not worker.thread.is_alive():
+        return cleanup
+    started = clock()
+    cancelled = worker.cancel()
+    observer_deadline = min(deadline, clock() + 0.05)
+    worker.thread.join(max(0.0, observer_deadline - clock()))
+    stopped = not worker.thread.is_alive()
+    return _CleanupResult(
+        cleanup.outcome if cancelled and stopped else "incomplete",
+        cleanup.method,
+        cleanup.confirmed,
+        cleanup.duration + max(0.0, clock() - started),
+        cleanup.drain_truncated,
+    )
+
+
 def _close_process_streams(
     process: object,
     names: tuple[str, ...],
@@ -1576,7 +2267,7 @@ def _contain_process(process: subprocess.Popen[bytes]) -> _InvocationContainment
     return _PosixProcessGroup(process)
 
 
-def _open_capture(path: Path | None) -> BinaryIO | None:
+def _open_native_capture(path: Path | None) -> BinaryIO | None:
     if path is None:
         return None
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -1586,19 +2277,107 @@ def _open_capture(path: Path | None) -> BinaryIO | None:
         flags |= os.O_NOFOLLOW
     descriptor = os.open(path, flags, 0o600)
     try:
-        return os.fdopen(descriptor, "wb")
+        # Unbuffered staging makes capture_prefix_bytes a durable-file prefix
+        # claim and prevents a late flush from changing an O(1)-promoted file.
+        return os.fdopen(descriptor, "wb", buffering=0)
     except BaseException:
         os.close(descriptor)
         raise
 
 
-def _close_captures(captures: tuple[BinaryIO | None, BinaryIO | None]) -> None:
-    for capture in captures:
-        if capture is not None:
+def _open_capture(
+    path: Path | None,
+    *,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> object | None:
+    """Open a killable isolated primary sink through the transport-test seam."""
+
+    return (
+        None
+        if path is None
+        else _CaptureSink(path, deadline=deadline, clock=clock)
+    )
+
+
+def _close_captures(
+    captures: tuple[object | None, object | None],
+    *,
+    deadline: float,
+    clock: Callable[[], float],
+    force: bool = False,
+) -> bool:
+    """Stop capture helpers concurrently under one shared absolute deadline."""
+
+    active = tuple(capture for capture in captures if capture is not None)
+    if not active:
+        return True
+    results: list[bool] = [False] * len(active)
+
+    def stop(index: int, capture: object) -> None:
+        try:
+            operation = getattr(capture, "abort" if force else "close")
             try:
-                capture.close()
-            except (OSError, ValueError):
-                pass
+                value = operation(deadline=deadline, clock=clock)
+            except TypeError:
+                value = operation()
+            results[index] = (
+                bool(value)
+                if force
+                else bool(getattr(capture, "stopped", True))
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            results[index] = False
+
+    threads = tuple(
+        threading.Thread(
+            target=stop,
+            args=(index, capture),
+            name=f"codex-capture-{index}-closer",
+            daemon=True,
+        )
+        for index, capture in enumerate(active)
+    )
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(max(0.0, deadline - clock()))
+    for capture, thread in zip(active, threads, strict=True):
+        if thread.is_alive():
+            request_abort = getattr(capture, "request_abort", None)
+            if request_abort is not None:
+                try:
+                    request_abort()
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    pass
+    for thread in threads:
+        if thread.is_alive():
+            thread.join(max(0.0, deadline - clock()))
+    return bool(
+        all(results)
+        and not any(thread.is_alive() for thread in threads)
+        and all(getattr(capture, "stopped", True) for capture in active)
+    )
+
+
+def _request_capture_aborts(
+    captures: tuple[object | None, object | None],
+) -> bool:
+    """Signal every helper before any shared-deadline reaping begins."""
+
+    succeeded = True
+    for capture in captures:
+        if capture is None:
+            continue
+        request_abort = getattr(capture, "request_abort", None)
+        if request_abort is None:
+            succeeded = False
+            continue
+        try:
+            request_abort()
+        except (OSError, RuntimeError, TypeError, ValueError):
+            succeeded = False
+    return succeeded
 
 
 def _resume_windows_process(pid: int) -> None:

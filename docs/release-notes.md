@@ -43,8 +43,17 @@ failure terminate the complete Windows Job Object or POSIX process group, with
 one ten-second budget shared by termination, drain, reap, and thread shutdown.
 Invocation-start recording is included in the launch deadline; a blocked
 recorder cannot keep the contained tree alive. Stdout/stderr use exclusive
-attempt-owned staging captures that are promoted only after their workers stop
-cleanly, while the canonical result remains in external provider scratch until
+attempt-owned staging captures. Complete captures are promoted only after their
+workers stop cleanly; incomplete captures publish an immutable copy of the
+durable prefix plus any unique observed suffix. Capture revocation and closure
+are deadline-bounded. Capture-helper readiness is bounded before launch; after
+launch, both helpers share the invocation's one cleanup deadline for closure,
+termination, and reaping. Delayed invocation-start recorders are cancelled and
+stale attempt updates are revalidated and rejected inside the atomic commit
+fence after finalization, for writable and review attempts. Unconfirmed tree
+cleanup is represented by a provider-neutral cleanup-uncertain failure and forces
+writable runs to `HUMAN_REQUIRED`, even if the immediate workspace snapshot is
+unchanged. The canonical result remains in external provider scratch until
 validation. Non-UTF-8 result bytes are retained as octet-stream diagnostics.
 Provider-native execution evidence is now schema 2 and records deadline,
 terminal, finalisation, termination, cleanup, and structured-result decisions.

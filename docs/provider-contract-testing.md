@@ -39,6 +39,9 @@ The Codex registration is `TestCodexProviderContract` in
 runner. It does not launch Codex, use provider credentials, or access the network.
 Provider-specific tests additionally exercise live JSONL framing/timing,
 structured-message agreement, bounded finalisation, partial diagnostics, and
-native process-tree cleanup. Native Windows Job Object and POSIX process-group
+native process-tree cleanup. They also prove that unconfirmed cleanup crosses
+the neutral contract as repository uncertainty and that incomplete capture
+publication retains its stable prefix without leaving a staging writer attached
+to the published artifact. Native Windows Job Object and POSIX process-group
 regressions use short offline helper processes and must only be skipped when the
 corresponding operating system is unavailable.

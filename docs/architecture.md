@@ -63,7 +63,10 @@ Provider-neutral task deadlines are configured by phase and persisted in each
 task's execution policy. Concrete adapters own live protocol observation and OS
 containment. In particular, Codex JSONL terminal parsing, Node/wrapper process
 details, Windows Job Objects, and POSIX process groups never cross into the
-domain or lifecycle controller.
+domain or lifecycle controller. Adapters propagate unconfirmed invocation
+cleanup through the provider-neutral failure vocabulary, so writable lifecycle
+policy can treat it as repository uncertainty without interpreting native
+containment metadata.
 
 Run and attempt paths are ownership boundaries as well as naming conventions.
 Resume accepts only a direct, non-linked run directory whose persisted identity
@@ -76,6 +79,11 @@ verification calls. Replacement of either directory stops before post-call evide
 or attempt updates are written. Mutable text artifacts are atomically replaced, and
 immutable text/byte artifacts are exclusively created, so pre-existing file links
 cannot redirect an authoritative or diagnostic write.
+Attempt updates prepare and flush their replacement payload before entering a
+short per-attempt commit fence. Inside that fence they revalidate the complete
+previously loaded record and perform the atomic replacement. Lifecycle
+finalisation therefore does not wait on a recorder blocked while preparing its
+write, and a delayed recorder cannot overwrite a newer finalized attempt record.
 The bound run token is also required by authoritative lifecycle reads after it is
 acquired. Resume, handoff, correction planning, review, verification evidence, and
 terminal reporting therefore reject a replaced run directory instead of rebinding

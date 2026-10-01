@@ -25,14 +25,27 @@ class CodecError(ValueError):
     """Raised when persisted data does not satisfy its declared codec."""
 
 
-def atomic_write_json(path: Path | str, value: JsonMapping) -> None:
+AtomicCommit: TypeAlias = Callable[[Callable[[], None]], None]
+
+
+def atomic_write_json(
+    path: Path | str,
+    value: JsonMapping,
+    *,
+    commit: AtomicCommit | None = None,
+) -> None:
     """Write one JSON object using the repository-wide durability policy."""
 
     def write_payload(output: TextIO) -> None:
         json.dump(value, output, indent=2, sort_keys=True, ensure_ascii=False)
         output.write("\n")
 
-    _atomic_write_text_payload(Path(path), write_payload, description="JSON")
+    _atomic_write_text_payload(
+        Path(path),
+        write_payload,
+        description="JSON",
+        commit=commit,
+    )
 
 
 def atomic_write_text(path: Path | str, value: str) -> None:
@@ -164,6 +177,7 @@ def _atomic_write_text_payload(
     write_payload: Callable[[TextIO], None],
     *,
     description: str,
+    commit: AtomicCommit | None = None,
 ) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
@@ -181,7 +195,18 @@ def _atomic_write_text_payload(
             write_payload(output)
             output.flush()
             os.fsync(output.fileno())
-        os.replace(temporary, destination)
+        def replace_destination() -> None:
+            assert temporary is not None
+            os.replace(temporary, destination)
+
+        if commit is None:
+            replace_destination()
+        else:
+            # Payload creation and fsync intentionally happen before entering a
+            # caller-owned commit fence. The fence therefore covers only the
+            # final validity check and atomic replacement, not potentially slow
+            # JSON serialization or storage flushes.
+            commit(replace_destination)
         _sync_directory(destination.parent)
     except BaseException as error:
         if descriptor != -1:

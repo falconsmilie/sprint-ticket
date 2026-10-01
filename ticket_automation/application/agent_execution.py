@@ -84,6 +84,7 @@ class AgentFailureCategory(StrEnum):
     TIMEOUT = "timeout"
     PROVIDER_REJECTION_OR_SERVICE_FAILURE = "provider-rejection-or-service-failure"
     NON_SUCCESSFUL_EXECUTION = "non-successful-execution"
+    INVOCATION_CLEANUP_UNCERTAIN = "invocation-cleanup-uncertain"
     MISSING_RESULT = "missing-result"
     INVALID_RESULT = "invalid-result"
     CAPABILITY_OR_CONFIGURATION_FAILURE = "capability-or-configuration-failure"

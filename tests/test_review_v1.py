@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+import ticket_automation.attempts as attempts_module
 import ticket_automation.review as review_module
 from tests.helpers import (
     completed_codex_process_result,
@@ -222,10 +225,21 @@ def test_invalid_review_result_without_provider_artifacts_requires_human(
     )
     save_run_record(reviewing, snapshot.run_dir / "run.json")
 
+    observed_started_before_return = False
+
     class InvalidResultExecutor:
         def execute(self, request, *, on_invocation_start=None):
+            nonlocal observed_started_before_return
             if on_invocation_start is not None:
                 on_invocation_start()
+            active = latest_attempt(
+                request.artifact_layout.run_root,
+                phases=(AttemptPhase.REVIEWING,),
+            )
+            assert active is not None
+            assert active.status is AttemptStatus.STARTED
+            assert active.process_started is True
+            observed_started_before_return = True
             now = fixed_clock()
             return AgentExecution(
                 provider_id=ProviderId("test-provider"),
@@ -252,6 +266,136 @@ def test_invalid_review_result_without_provider_artifacts_requires_human(
     assert result.outcome is StageOutcome.HUMAN_REQUIRED
     assert result.controller_message == "Invalid review result."
     assert result.processing_error == "Invalid review result."
+    assert observed_started_before_return is True
     assert attempt is not None
     assert attempt.process_started is True
     assert attempt.status is AttemptStatus.HUMAN_REQUIRED
+
+
+def test_delayed_review_start_writer_cannot_replace_finalized_attempt(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repository = create_git_repo(tmp_path / "target")
+    config = make_config(repository)
+    ticket = tmp_path / "TA-ARCH-009.md"
+    ticket.write_text("# Ticket\n", encoding="utf-8")
+    snapshot = create_trusted_prepared_run(
+        config,
+        ticket,
+        runs_dir=tmp_path / "runs",
+        clock=fixed_clock,
+    )
+    implementing = snapshot.run_record.transition_to(
+        WorkflowState.IMPLEMENTING,
+        updated_timestamp="2026-09-14T10:16:00Z",
+    )
+    save_run_record(implementing, snapshot.run_dir / "run.json")
+    implementation = run_test_stage(
+        run_implementation_stage,
+        AttemptPhase.IMPLEMENTING,
+        config,
+        snapshot.run_dir,
+        agent_executor=make_agent_executor(
+            config, process_runner=CompletingCodexRunner()
+        ),
+        clock=fixed_clock,
+    )
+    verifying = implementation.run_record.transition_to(
+        WorkflowState.VERIFYING,
+        updated_timestamp="2026-09-14T10:17:00Z",
+    )
+    save_run_record(verifying, snapshot.run_dir / "run.json")
+    verification = run_test_stage(
+        run_verification_stage,
+        AttemptPhase.VERIFYING,
+        config,
+        snapshot.run_dir,
+        process_runner=PassingVerificationRunner(),
+        clock=fixed_clock,
+    )
+    reviewing = verification.run_record.transition_to(
+        WorkflowState.REVIEWING,
+        updated_timestamp="2026-09-14T10:18:00Z",
+    )
+    save_run_record(reviewing, snapshot.run_dir / "run.json")
+
+    recorder_entered = threading.Event()
+    release_recorder = threading.Event()
+    recorder_errors: list[BaseException] = []
+    notifications: list[Path] = []
+    real_atomic_write_json = attempts_module.atomic_write_json
+
+    def delayed_atomic_write_json(path, value, **kwargs) -> None:
+        if (
+            threading.current_thread().name == "delayed-review-start"
+            and value.get("process_started") is True
+        ):
+            notifications.append(Path(path))
+            recorder_entered.set()
+            release_recorder.wait(timeout=5)
+        real_atomic_write_json(path, value, **kwargs)
+
+    monkeypatch.setattr(
+        attempts_module,
+        "atomic_write_json",
+        delayed_atomic_write_json,
+    )
+
+    class DelayedReviewExecutor:
+        observer_thread: threading.Thread | None = None
+
+        def execute(self, request, *, on_invocation_start=None):
+            assert on_invocation_start is not None
+
+            def notify() -> None:
+                try:
+                    on_invocation_start()
+                except BaseException as error:  # noqa: BLE001 - test observation
+                    recorder_errors.append(error)
+
+            self.observer_thread = threading.Thread(
+                target=notify,
+                name="delayed-review-start",
+            )
+            self.observer_thread.start()
+            assert recorder_entered.wait(timeout=2)
+            now = fixed_clock()
+            return AgentExecution(
+                provider_id=ProviderId("test-provider"),
+                task_kind=request.task_kind,
+                status=AgentExecutionStatus.FAILED,
+                invocation_start=InvocationStart.STARTED,
+                started_at=now,
+                ended_at=now,
+                duration_seconds=0,
+                failure_category=AgentFailureCategory.INVOCATION_CLEANUP_UNCERTAIN,
+                failure_message="Review cleanup could not be confirmed.",
+            )
+
+    executor = DelayedReviewExecutor()
+    started = time.monotonic()
+    result = run_review_stage(
+        config,
+        snapshot.run_dir,
+        agent_executor=executor,
+        clock=fixed_clock,
+    )
+    assert time.monotonic() - started < 2
+    assert result.outcome is StageOutcome.HUMAN_REQUIRED
+    attempt = latest_attempt(snapshot.run_dir, phases=(AttemptPhase.REVIEWING,))
+    assert attempt is not None
+    assert attempt.status is AttemptStatus.HUMAN_REQUIRED
+    finalized = (attempt.artifact_directory / "attempt.json").read_bytes()
+
+    release_recorder.set()
+    assert executor.observer_thread is not None
+    executor.observer_thread.join(timeout=2)
+
+    assert not executor.observer_thread.is_alive()
+    assert len(notifications) == 1
+    assert recorder_errors
+    assert (attempt.artifact_directory / "attempt.json").read_bytes() == finalized
+    persisted = latest_attempt(snapshot.run_dir, phases=(AttemptPhase.REVIEWING,))
+    assert persisted is not None
+    assert persisted.status is AttemptStatus.HUMAN_REQUIRED

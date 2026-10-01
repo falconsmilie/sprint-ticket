@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from collections.abc import Callable
 from dataclasses import InitVar, dataclass, field, replace
 from datetime import datetime
@@ -377,6 +378,11 @@ class _AttemptTracker:
     run_ownership: RunOwnership | None = None
     process_started: bool = False
     evidence_errors: list[str] = field(default_factory=list)
+    _start_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
 
     def revalidate(self) -> None:
         self.artifact_layout.revalidate()
@@ -392,15 +398,21 @@ class _AttemptTracker:
         self.record_started(True)
 
     def record_started(self, value: bool) -> None:
-        if not value:
+        with self._start_lock:
+            if not value:
+                if self.process_started:
+                    self.evidence_errors.append(
+                        "executor returned not-started after reporting invocation start"
+                    )
+                return
             if self.process_started:
-                self.evidence_errors.append(
-                    "executor returned not-started after reporting invocation start"
-                )
-            return
-        if self.process_started:
-            return
-        self.process_started = True
+                return
+            self.process_started = True
+        # Persist from the launch observer so a controller crash after launch
+        # cannot leave the invocation recorded as never started. The attempt
+        # store revalidates the complete expected record in the same short
+        # commit fence as replacement, which excludes a stale observer after a
+        # newer controller-owned update or finalisation.
         self._update(process_started=True, propagate_interrupt=True)
 
     def record_after(
@@ -421,6 +433,8 @@ class _AttemptTracker:
     def _update(self, *, propagate_interrupt: bool = False, **changes: object) -> None:
         if self.record is None:
             return
+        with self._start_lock:
+            changes.setdefault("process_started", self.process_started)
         self.revalidate()
         try:
             self.record = update_attempt(
@@ -661,6 +675,7 @@ class GuardedWritableOperation:
                 AgentFailureCategory.MISSING_RESULT,
                 AgentFailureCategory.INVALID_RESULT,
                 AgentFailureCategory.TIMEOUT,
+                AgentFailureCategory.INVOCATION_CLEANUP_UNCERTAIN,
             }
         )
         if (

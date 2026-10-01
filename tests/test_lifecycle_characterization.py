@@ -196,6 +196,17 @@ _WRITABLE_STOP_CASES = [
     ),
     pytest.param(
         WritableStopCase(
+            "cleanup-uncertain",
+            WorkflowState.HUMAN_REQUIRED,
+            StopCategory.REPOSITORY_UNCERTAIN,
+            "HUMAN_REQUIRED",
+            True,
+            False,
+        ),
+        id="cleanup-uncertain",
+    ),
+    pytest.param(
+        WritableStopCase(
             "staging-change",
             WorkflowState.HUMAN_REQUIRED,
             StopCategory.SAFETY_VIOLATION,

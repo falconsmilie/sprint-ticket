@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -8,6 +10,7 @@ from pathlib import Path
 import pytest
 
 import ticket_automation.application.guarded_writable_operation as guarded_module
+import ticket_automation.attempts as attempts_module
 from tests.fake_agent_executor import InMemoryAgentExecutor
 from tests.helpers import GIT, create_git_repo, run_git
 from ticket_automation.application.agent_execution import (
@@ -107,13 +110,18 @@ class MatrixExecutor:
             )
         if self.scenario in {
             "nonzero-unchanged",
+            "cleanup-uncertain",
             "changed-tracked-failure",
             "changed-untracked-failure",
         }:
             return _failure(
                 request.task_kind,
                 InvocationStart.STARTED,
-                AgentFailureCategory.NON_SUCCESSFUL_EXECUTION,
+                (
+                    AgentFailureCategory.INVOCATION_CLEANUP_UNCERTAIN
+                    if self.scenario == "cleanup-uncertain"
+                    else AgentFailureCategory.NON_SUCCESSFUL_EXECUTION
+                ),
             )
         result = ImplementationResult(
             ImplementationStatus.COMPLETED,
@@ -150,6 +158,7 @@ class MatrixExecutor:
         ("timeout-before-start", WritableRejectedBeforeStart),
         ("timeout-after-start", WritableFailedUncertain),
         ("nonzero-unchanged", WritableFailedUnchanged),
+        ("cleanup-uncertain", WritableFailedUncertain),
         ("invalid-result", WritableFailedUncertain),
         ("exception-before-start", WritableFailedUncertain),
         ("exception-after-start", WritableFailedUncertain),
@@ -638,6 +647,7 @@ def test_interrupt_while_recording_start_returns_a_typed_uncertain_outcome(
     assert isinstance(outcome, WritableFailedUncertain)
     assert outcome.audit.invocation_start is InvocationStart.STARTED
     assert outcome.audit.before_workspace == outcome.audit.after_workspace
+    assert outcome.audit.changed_files == ()
     assert any(
         violation.name == "writable-attempt-evidence"
         for violation in outcome.audit.safety_violations
@@ -649,6 +659,132 @@ def test_interrupt_while_recording_start_returns_a_typed_uncertain_outcome(
     assert tuple(persisted_guard["inspection_errors_after"]) == (
         outcome.audit.workspace_guard.after.inspection_errors
     )
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required")
+def test_delayed_start_recorder_cannot_overwrite_finalized_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = GitRepository(create_git_repo(tmp_path / "target"))
+    before = WorkspaceSnapshot.capture(repository)
+    request = _request(
+        tmp_path,
+        repository,
+        before,
+        AgentTaskKind.IMPLEMENTATION,
+        AttemptPhase.IMPLEMENTING,
+    )
+    recorder_entered = threading.Event()
+    release_recorder = threading.Event()
+    notifications: list[object] = []
+    real_atomic_write_json = attempts_module.atomic_write_json
+
+    def delayed_atomic_write_json(path, value, **kwargs) -> None:
+        # Reproduce the dangerous interleaving: the observer has validated the
+        # old authoritative record, but is suspended inside persistence before
+        # temporary-payload preparation and the fenced replacement. The
+        # controller must remain free to finalize while this writer is blocked.
+        if (
+            threading.current_thread().name == "delayed-start-observer"
+            and value.get("process_started") is True
+        ):
+            notifications.append(path)
+            recorder_entered.set()
+            release_recorder.wait(timeout=5)
+        real_atomic_write_json(path, value, **kwargs)
+
+    monkeypatch.setattr(
+        attempts_module,
+        "atomic_write_json",
+        delayed_atomic_write_json,
+    )
+
+    class DelayedStartExecutor(MatrixExecutor):
+        def __init__(self) -> None:
+            super().__init__("cleanup-uncertain")
+            self.observer_thread: threading.Thread | None = None
+
+        def execute(self, execution_request, *, on_invocation_start=None):
+            assert on_invocation_start is not None
+            self.calls += 1
+            self.observer_thread = threading.Thread(
+                target=on_invocation_start,
+                name="delayed-start-observer",
+            )
+            self.observer_thread.start()
+            assert recorder_entered.wait(timeout=2)
+            return _failure(
+                execution_request.task_kind,
+                InvocationStart.STARTED,
+                AgentFailureCategory.INVOCATION_CLEANUP_UNCERTAIN,
+            )
+
+    executor = DelayedStartExecutor()
+    started = time.monotonic()
+    outcome = GuardedWritableOperation(executor).execute(request)
+    assert time.monotonic() - started < 2
+    assert isinstance(outcome, WritableFailedUncertain)
+    assert len(notifications) == 1
+    assert executor.observer_thread is not None
+    assert executor.observer_thread.is_alive()
+
+    run_dir = request.execution_request.artifact_directory.parent.parent
+    active = load_attempt_records(run_dir)[-1]
+    completed = complete_stage_attempt(
+        run_dir,
+        active,
+        stage_outcome=StageOutcome.HUMAN_REQUIRED,
+        after_workspace_fingerprint=outcome.audit.after_workspace_fingerprint,
+        process_started=True,
+    )
+    finalized = completed.path.read_bytes()
+    release_recorder.set()
+    executor.observer_thread.join(timeout=2)
+
+    assert not executor.observer_thread.is_alive()
+    assert completed.path.read_bytes() == finalized
+    assert load_attempt_records(run_dir)[-1].status.value == "HUMAN_REQUIRED"
+
+
+@pytest.mark.skipif(GIT is None, reason="git executable is required")
+@pytest.mark.parametrize(
+    ("task_kind", "phase"),
+    [
+        (AgentTaskKind.IMPLEMENTATION, AttemptPhase.IMPLEMENTING),
+        (AgentTaskKind.CORRECTION, AttemptPhase.CORRECTING),
+    ],
+)
+def test_writable_launch_is_persisted_before_executor_returns_or_raises(
+    tmp_path: Path,
+    task_kind: AgentTaskKind,
+    phase: AttemptPhase,
+) -> None:
+    repository = GitRepository(create_git_repo(tmp_path / "target"))
+    before = WorkspaceSnapshot.capture(repository)
+    request = _request(tmp_path, repository, before, task_kind, phase)
+    observed_started = False
+
+    class ActiveExecutor(MatrixExecutor):
+        def execute(self, execution_request, *, on_invocation_start=None):
+            nonlocal observed_started
+            assert on_invocation_start is not None
+            self.calls += 1
+            on_invocation_start()
+            [active] = load_attempt_records(
+                execution_request.artifact_layout.run_root
+            )
+            assert active.status.value == "STARTED"
+            assert active.process_started is True
+            observed_started = True
+            raise KeyboardInterrupt("controller interrupted after launch")
+
+    outcome = GuardedWritableOperation(ActiveExecutor("unused")).execute(request)
+
+    assert observed_started is True
+    assert isinstance(outcome, WritableFailedUncertain)
+    [persisted] = load_attempt_records(tmp_path / "run")
+    assert persisted.process_started is True
 
 
 @pytest.mark.skipif(GIT is None, reason="git executable is required")

@@ -46,6 +46,8 @@ from ticket_automation.providers.codex_cli import (
     CodexProcessTimeout,
     SubprocessCodexRunner,
 )
+from ticket_automation.providers.codex_cli import adapter as adapter_module
+from ticket_automation.providers.codex_cli import evidence as evidence_module
 from ticket_automation.providers.codex_cli import process as process_module
 from ticket_automation.providers.codex_cli.command import build_command
 
@@ -782,7 +784,9 @@ def test_post_start_file_error_is_transport_failure_with_uncertain_cleanup(
         runner=StartedThenFailedRunner(),
     ).execute(request(tmp_path))
 
-    assert execution.failure_category is AgentFailureCategory.NON_SUCCESSFUL_EXECUTION
+    assert (
+        execution.failure_category is AgentFailureCategory.INVOCATION_CLEANUP_UNCERTAIN
+    )
     assert execution.invocation_start is InvocationStart.STARTED
     assert execution.provider_metadata["deadline_outcome"] == "transport-exception"
     assert execution.provider_metadata["cleanup_outcome"] == "unknown"
@@ -1980,7 +1984,7 @@ def test_stream_capture_failure_terminates_the_invocation(
     monkeypatch.setattr(
         process_module,
         "_open_capture",
-        lambda path: None if path is None else FailingCapture(),
+        lambda path, **kwargs: None if path is None else FailingCapture(),
     )
     payload = json.dumps(implementation_payload())
     event = json.dumps(
@@ -2011,34 +2015,68 @@ def test_stream_capture_failure_terminates_the_invocation(
     assert result.stdout_capture_complete is False
 
 
-def test_capture_failure_tail_reaches_final_provider_artifact_once(
+def test_isolated_capture_failure_preserves_durable_prefix_and_suffix_once(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    class FailingCapture:
-        def write(self, value: bytes) -> int:
-            del value
-            raise OSError("capture failed")
+    failing_helper = """
+import os
+import pathlib
+import sys
 
-        def flush(self) -> None:
-            pass
+path = sys.argv[1]
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+if hasattr(os, "O_BINARY"):
+    flags |= os.O_BINARY
+descriptor = os.open(path, flags, 0o600)
 
-        def close(self) -> None:
-            pass
+def read_exact(size):
+    value = bytearray()
+    while len(value) < size:
+        chunk = os.read(sys.stdin.fileno(), size - len(value))
+        if not chunk:
+            raise EOFError
+        value.extend(chunk)
+    return bytes(value)
+
+os.write(sys.stdout.fileno(), b"R")
+writes = 0
+while True:
+    header = os.read(sys.stdin.fileno(), 8)
+    if not header:
+        break
+    while len(header) < 8:
+        header += read_exact(8 - len(header))
+    payload = read_exact(int.from_bytes(header, "big"))
+    writes += 1
+    if "events" in pathlib.Path(path).name and writes == 3:
+        os.write(descriptor, payload[: len(payload) // 2])
+        os.close(descriptor)
+        raise OSError("injected late capture failure")
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        view = view[written:]
+    os.write(sys.stdout.fileno(), b"A")
+os.close(descriptor)
+"""
+    monkeypatch.setattr(
+        process_module,
+        "_capture_helper_source",
+        lambda: failing_helper,
+    )
 
     clock = ControlledMonotonic(monitor_time=0.2)
-    process = ControlledProcess(clock, [(0.1, b"recoverable byte\n")])
+    chunks = [b"a" * (64 * 1024), b"b" * (64 * 1024), b"recoverable byte\n"]
+    process = ControlledProcess(
+        clock,
+        [(0.05, chunks[0]), (0.1, chunks[1]), (0.15, chunks[2])],
+    )
     monkeypatch.setattr(
         process_module.subprocess,
         "Popen",
         lambda *args, **kwargs: process,
     )
-    monkeypatch.setattr(
-        process_module,
-        "_open_capture",
-        lambda path: None if path is None else FailingCapture(),
-    )
-
     execution = CodexCliAgentExecutor(
         SETTINGS,
         runner=SubprocessCodexRunner(),
@@ -2048,13 +2086,286 @@ def test_capture_failure_tail_reaches_final_provider_artifact_once(
     assert execution.result is None
     assert execution.provider_metadata["deadline_outcome"] == "stream-failure"
     assert execution.provider_metadata["output_publication_truncated"] is True
-    assert (tmp_path / "artifacts" / "events.jsonl").read_bytes() == (
-        b"recoverable byte\n"
+    assert (tmp_path / "artifacts" / "events.jsonl").read_bytes() == b"".join(chunks)
+    assert not list((tmp_path / "artifacts").glob("*.capture"))
+    assert not any(
+        thread.is_alive() and thread.name == "codex-stdout-reader"
+        for thread in threading.enumerate()
     )
     persisted = json.loads(
         (tmp_path / "artifacts" / "codex-execution.json").read_text(encoding="utf-8")
     )
     assert persisted["output_publication_truncated"] is True
+
+
+def test_termination_drain_captures_more_than_one_tail_per_stream(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    stdout_chunks = [b"a" * (70 * 1024), b"b" * (70 * 1024)]
+    stderr_chunks = [b"c" * (70 * 1024), b"d" * (70 * 1024)]
+    clock = ControlledMonotonic(monitor_time=1.0)
+    process = ControlledProcess(
+        clock,
+        [(1.0, chunk) for chunk in stdout_chunks],
+        release_output_on_kill=True,
+    )
+    process.stderr = ControlledOutput(
+        clock,
+        [(1.0, chunk) for chunk in stderr_chunks],
+        release=process.release,
+    )
+    monkeypatch.setattr(
+        process_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: process,
+    )
+    execution_request = replace(
+        request(tmp_path),
+        policy=AgentExecutionPolicy(1.0, NetworkAccess.ALLOWED),
+    )
+
+    execution = CodexCliAgentExecutor(
+        SETTINGS,
+        runner=SubprocessCodexRunner(monotonic=clock),
+    ).execute(execution_request)
+
+    assert execution.failure_category is AgentFailureCategory.TIMEOUT
+    assert (tmp_path / "artifacts" / "events.jsonl").read_bytes() == b"".join(
+        stdout_chunks
+    )
+    assert (tmp_path / "artifacts" / "stderr.log").read_bytes() == b"".join(
+        stderr_chunks
+    )
+    assert execution.provider_metadata["output_publication_truncated"] is False
+    assert not list((tmp_path / "artifacts").glob("*.capture"))
+
+
+def test_blocked_capture_helper_is_terminated_before_published_output_returns(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    helper_pid = tmp_path / "blocked-capture-helper.pid"
+    helper_blocked = tmp_path / "blocked-capture-helper.ready"
+    blocked_helper = f"""
+import os
+import pathlib
+import sys
+import time
+
+path = sys.argv[1]
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+if hasattr(os, "O_BINARY"):
+    flags |= os.O_BINARY
+descriptor = os.open(path, flags, 0o600)
+
+def read_exact(size):
+    value = bytearray()
+    while len(value) < size:
+        chunk = os.read(sys.stdin.fileno(), size - len(value))
+        if not chunk:
+            raise EOFError
+        value.extend(chunk)
+    return bytes(value)
+
+os.write(sys.stdout.fileno(), b"R")
+writes = 0
+while True:
+    header = os.read(sys.stdin.fileno(), 8)
+    if not header:
+        break
+    while len(header) < 8:
+        header += read_exact(8 - len(header))
+    payload = read_exact(int.from_bytes(header, "big"))
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        view = view[written:]
+    writes += 1
+    if "events" in pathlib.Path(path).name and writes == 3:
+        pathlib.Path({str(helper_pid)!r}).write_text(str(os.getpid()))
+        pathlib.Path({str(helper_blocked)!r}).write_text("blocked")
+        time.sleep(30)
+    os.write(sys.stdout.fileno(), b"A")
+os.close(descriptor)
+"""
+    monkeypatch.setattr(
+        process_module,
+        "_capture_helper_source",
+        lambda: blocked_helper,
+    )
+    chunks = [b"a" * (40 * 1024), b"b" * (40 * 1024), b"c" * (40 * 1024)]
+    payload = b"".join(chunks)
+    clock = ControlledMonotonic(monitor_time=0.0)
+    process = ControlledProcess(clock, [(0.0, chunk) for chunk in chunks])
+    monkeypatch.setattr(
+        process_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: process,
+    )
+    cleanup_seconds = 0.2
+    timeout_seconds = 0.05
+    monkeypatch.setattr(process_module, "CLEANUP_SECONDS", cleanup_seconds)
+    monkeypatch.setattr(adapter_module, "CLEANUP_SECONDS", cleanup_seconds)
+    execution_request = replace(
+        request(tmp_path),
+        policy=AgentExecutionPolicy(timeout_seconds, NetworkAccess.ALLOWED),
+    )
+    started = time.monotonic()
+    execution = CodexCliAgentExecutor(
+        SETTINGS,
+        runner=SubprocessCodexRunner(),
+    ).execute(execution_request)
+    elapsed = time.monotonic() - started
+    published_path = tmp_path / "artifacts" / "events.jsonl"
+    published = published_path.read_bytes()
+
+    assert helper_blocked.is_file()
+    assert elapsed < timeout_seconds + cleanup_seconds + 0.5
+    assert process.killed
+    assert execution.failure_category is AgentFailureCategory.TIMEOUT
+    assert execution.provider_metadata["cleanup_outcome"] == "completed"
+    assert execution.provider_metadata["output_draining_truncated"] is True
+    assert execution.provider_metadata["output_publication_truncated"] is True
+    assert execution.provider_metadata["output_publication_deadline_exhausted"] is True
+    assert published == payload
+    capture_pid = int(helper_pid.read_text(encoding="utf-8"))
+    if os.name == "nt":
+        assert not _windows_pid_is_running(capture_pid)
+    else:
+        assert not _posix_pid_is_running(capture_pid)
+    time.sleep(0.1)
+    assert (tmp_path / "artifacts" / "events.jsonl").read_bytes() == published
+    assert not any(
+        thread.is_alive() and thread.name == "codex-stdout-reader"
+        for thread in threading.enumerate()
+    )
+
+
+def test_capture_helper_missing_readiness_is_bounded_and_reaped(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    helper_pid = tmp_path / "unready-capture-helper.pid"
+    unready_helper = f"""
+import os
+import pathlib
+import sys
+import time
+
+path = sys.argv[1]
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+if hasattr(os, "O_BINARY"):
+    flags |= os.O_BINARY
+descriptor = os.open(path, flags, 0o600)
+pathlib.Path({str(helper_pid)!r}).write_text(str(os.getpid()))
+time.sleep(30)
+os.close(descriptor)
+"""
+    monkeypatch.setattr(process_module, "_capture_helper_source", lambda: unready_helper)
+    cleanup_seconds = 0.2
+    monkeypatch.setattr(process_module, "CLEANUP_SECONDS", cleanup_seconds)
+
+    started = time.monotonic()
+    with pytest.raises(OSError, match="did not initialize"):
+        SubprocessCodexRunner().run(
+            CodexCommand(
+                (sys.executable, "-c", "pass"),
+                tmp_path,
+                stdout_capture=tmp_path / "unready.capture",
+            ),
+            stdin="prompt",
+            timeout_seconds=1,
+        )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < cleanup_seconds + 0.5
+    assert helper_pid.is_file()
+    pid = int(helper_pid.read_text(encoding="utf-8"))
+    if os.name == "nt":
+        assert not _windows_pid_is_running(pid)
+    else:
+        assert not _posix_pid_is_running(pid)
+    assert not any(
+        thread.is_alive() and thread.name == "codex-capture-readiness"
+        for thread in threading.enumerate()
+    )
+
+
+def test_containment_failure_stops_both_capture_helpers_with_one_cleanup_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    stalled_helper = """
+import os
+import pathlib
+import sys
+import time
+
+path = sys.argv[1]
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+if hasattr(os, "O_BINARY"):
+    flags |= os.O_BINARY
+descriptor = os.open(path, flags, 0o600)
+pathlib.Path(path + ".pid").write_text(str(os.getpid()))
+os.write(sys.stdout.fileno(), b"R")
+while os.read(sys.stdin.fileno(), 1024):
+    pass
+time.sleep(30)
+os.close(descriptor)
+"""
+    monkeypatch.setattr(process_module, "_capture_helper_source", lambda: stalled_helper)
+    cleanup_seconds = 0.25
+    monkeypatch.setattr(process_module, "CLEANUP_SECONDS", cleanup_seconds)
+    clock = ControlledMonotonic(monitor_time=0.0)
+    process = ControlledProcess(clock, [])
+    launched_at: list[float] = []
+
+    def launch_main(*args, **kwargs):
+        del args, kwargs
+        launched_at.append(time.monotonic())
+        return process
+
+    def fail_containment(spawned):
+        assert spawned is process
+        raise OSError("containment setup unavailable")
+
+    monkeypatch.setattr(process_module.subprocess, "Popen", launch_main)
+    monkeypatch.setattr(process_module, "_contain_process", fail_containment)
+    stdout_capture = tmp_path / "events.capture"
+    stderr_capture = tmp_path / "stderr.capture"
+
+    result = SubprocessCodexRunner().run(
+        CodexCommand(
+            (sys.executable, "-c", "pass"),
+            tmp_path,
+            stdout_capture=stdout_capture,
+            stderr_capture=stderr_capture,
+        ),
+        stdin="prompt",
+        timeout_seconds=1,
+    )
+    assert launched_at
+    elapsed_after_launch = time.monotonic() - launched_at[0]
+
+    assert elapsed_after_launch < cleanup_seconds + 0.5
+    assert process.killed
+    assert result.evidence.cleanup_outcome == "incomplete"
+    assert result.evidence.output_draining_truncated is True
+    assert result.stdout_capture_complete is False
+    assert result.stderr_capture_complete is False
+    for capture in (stdout_capture, stderr_capture):
+        pid_path = Path(f"{capture}.pid")
+        assert pid_path.is_file()
+        pid = int(pid_path.read_text(encoding="utf-8"))
+        if os.name == "nt":
+            assert not _windows_pid_is_running(pid)
+        else:
+            assert not _posix_pid_is_running(pid)
+    assert not any(
+        thread.is_alive() and thread.name.endswith("-closer")
+        for thread in threading.enumerate()
+    )
 
 
 def test_worker_start_failure_returns_typed_cleanup_evidence_and_cleans_process(
@@ -2160,7 +2471,9 @@ def test_containment_setup_failure_is_typed_and_published_by_adapter(
 
     assert execution.status is AgentExecutionStatus.FAILED
     assert execution.result is None
-    assert execution.failure_category is AgentFailureCategory.NON_SUCCESSFUL_EXECUTION
+    assert (
+        execution.failure_category is AgentFailureCategory.INVOCATION_CLEANUP_UNCERTAIN
+    )
     assert execution.provider_metadata["deadline_outcome"] == "containment-failure"
     assert execution.provider_metadata["cleanup_outcome"] == "incomplete"
     assert execution.provider_metadata["termination_method"] == (
@@ -2826,6 +3139,83 @@ def test_timeout_publishes_large_attempt_capture_without_copying(
     assert not list((tmp_path / "artifacts").glob("*.capture"))
     assert len(scratch_paths) == 1
     assert not scratch_paths[0].exists()
+
+
+def test_partial_capture_promotion_is_constant_time_at_overall_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    payload = b"ordered partial output\n" * (256 * 1024)
+    cleanup_seconds = 0.05
+    timeout_seconds = 0.01
+
+    class StablePartialTimeoutRunner:
+        def run(self, command, *, stdin, timeout_seconds, on_process_start=None):
+            del stdin
+            if on_process_start is not None:
+                on_process_start()
+            assert command.stdout_capture is not None
+            command.stdout_capture.write_bytes(payload)
+            time.sleep(timeout_seconds + cleanup_seconds + 0.01)
+            evidence = CodexProcessEvidence(
+                work_timeout_seconds=timeout_seconds,
+                work_elapsed_seconds=timeout_seconds,
+                total_elapsed_seconds=timeout_seconds + cleanup_seconds,
+                deadline_outcome="timed-out",
+                finalization_outcome="not-eligible",
+                cleanup_outcome="incomplete",
+                tree_termination_confirmed=True,
+                output_draining_truncated=True,
+            )
+            raise CodexProcessTimedOut(
+                CodexProcessTimeout(
+                    payload[-64 * 1024 :].decode("utf-8", errors="replace"),
+                    "",
+                    timeout_seconds,
+                    evidence=evidence,
+                    stdout_capture=command.stdout_capture,
+                    stderr_capture=command.stderr_capture,
+                    stdout_capture_complete=False,
+                    stderr_capture_complete=True,
+                    stdout_capture_stable=True,
+                    stderr_capture_stable=True,
+                    stdout_capture_prefix_bytes=len(payload),
+                    stdout_observed_bytes=len(payload),
+                    stdout_observed_tail=payload[-64 * 1024 :],
+                )
+            )
+
+    def full_prefix_copy_would_exceed_deadline(*args, **kwargs):
+        del args, kwargs
+        time.sleep(1)
+        raise AssertionError("stable partial capture must not be recopied")
+
+    monkeypatch.setattr(adapter_module, "CLEANUP_SECONDS", cleanup_seconds)
+    monkeypatch.setattr(
+        evidence_module, "_write_all", full_prefix_copy_would_exceed_deadline
+    )
+    execution_request = replace(
+        request(tmp_path),
+        policy=AgentExecutionPolicy(timeout_seconds, NetworkAccess.ALLOWED),
+    )
+    started = time.monotonic()
+
+    execution = CodexCliAgentExecutor(
+        SETTINGS,
+        runner=StablePartialTimeoutRunner(),
+    ).execute(execution_request)
+
+    elapsed = time.monotonic() - started
+    assert elapsed < timeout_seconds + cleanup_seconds + 0.3
+    assert execution.failure_category is AgentFailureCategory.TIMEOUT
+    assert execution.provider_metadata["output_publication_truncated"] is True
+    assert execution.provider_metadata["output_publication_deadline_exhausted"] is True
+    assert (tmp_path / "artifacts" / "events.jsonl").read_bytes() == payload
+    persisted = json.loads(
+        (tmp_path / "artifacts" / "codex-execution.json").read_text(encoding="utf-8")
+    )
+    assert persisted["output_publication_deadline_exhausted"] is True
+    assert not list((tmp_path / "artifacts").glob("*.capture"))
 
 
 def test_canonical_result_must_match_timely_structured_message(tmp_path: Path) -> None:

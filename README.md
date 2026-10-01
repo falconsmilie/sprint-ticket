@@ -150,8 +150,11 @@ or automatic Git cleanup.
 Codex stdout and stderr are drained concurrently into exclusively created,
 hidden staging captures inside the owned attempt directory. The runner is the
 only writer, marks a capture incomplete if reading or bounded shutdown fails,
-revokes worker access before return, and atomically promotes only a complete,
-revalidated regular file. The canonical result file is different: Codex writes
+and revokes worker access before return. A complete, revalidated regular file is
+atomically promoted; after a late capture failure, the adapter instead publishes
+a stable copy of the complete captured prefix plus the uniquely observed
+diagnostic suffix. A blocked staging writer can therefore never mutate the
+published artifact. The canonical result file is different: Codex writes
 it in external provider scratch storage, and the adapter validates it before
 publishing either a typed result or separate diagnostic evidence. A successful
 `turn.completed` and its final structured agent message must both be observed
@@ -170,6 +173,11 @@ the launched wrapper is suspended; POSIX uses a dedicated session/process
 group. Termination, drain, reap, and worker shutdown share one ten-second cleanup
 budget. `codex-execution.json` is the provider-native schema (version 2);
 `execution.json` remains the provider-neutral lifecycle envelope.
+If invocation-tree termination cannot be confirmed, the neutral execution is
+classified as cleanup-uncertain and writable lifecycle handling stops in
+`HUMAN_REQUIRED`, even when the immediate workspace snapshot is unchanged.
+Invocation-start ledger updates are fenced against stale writes after an attempt
+has been finalized.
 
 ## Resume Behaviour
 

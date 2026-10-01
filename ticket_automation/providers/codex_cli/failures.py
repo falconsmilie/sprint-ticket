@@ -44,7 +44,16 @@ _FAILURE_CATEGORIES = {
 }
 
 
-def map_failure(reason: CodexFailureReason) -> AgentFailureCategory:
+def map_failure(
+    reason: CodexFailureReason,
+    *,
+    tree_termination_confirmed: bool | None = True,
+) -> AgentFailureCategory:
+    if (
+        tree_termination_confirmed is False
+        and reason is not CodexFailureReason.TIMEOUT
+    ):
+        return AgentFailureCategory.INVOCATION_CLEANUP_UNCERTAIN
     return _FAILURE_CATEGORIES[reason]
 
 

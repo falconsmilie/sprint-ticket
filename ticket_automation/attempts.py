@@ -7,8 +7,10 @@ they are deliberately not checkpoints that can advance a run on their own.
 
 from __future__ import annotations
 
+import os
 import re
 import tempfile
+import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -63,6 +65,18 @@ _ATTEMPT_RECORD_FIELDS = frozenset(
 )
 
 _ATTEMPT_DIRECTORY_PATTERN = re.compile(r"^(0*[1-9][0-9]*)-(.+)$")
+_ATTEMPT_COMMIT_FENCES: dict[str, threading.Lock] = {}
+_ATTEMPT_COMMIT_FENCES_LOCK = threading.Lock()
+
+
+def _attempt_commit_fence(path: Path) -> threading.Lock:
+    """Return the process-local serialization fence for one attempt ledger."""
+
+    key = str(path.absolute())
+    if os.name == "nt":
+        key = key.casefold()
+    with _ATTEMPT_COMMIT_FENCES_LOCK:
+        return _ATTEMPT_COMMIT_FENCES.setdefault(key, threading.Lock())
 
 
 @dataclass(frozen=True)
@@ -319,6 +333,7 @@ def start_attempt(
 def save_attempt(
     record: AttemptRecord,
     *,
+    expected_record: AttemptRecord | None = None,
     run_ownership: RunOwnership | None = None,
 ) -> None:
     _validate_record(record)
@@ -336,10 +351,29 @@ def save_attempt(
         raise AttemptError(
             "Attempt update requires the original persisted attempt record."
         )
-    persisted = _load_attempt(path, run_ownership=run_ownership)
-    if not _same_attempt_identity(persisted, record):
-        raise AttemptError("Persisted attempt identity changed before update.")
-    atomic_write_json(path, record.to_dict())
+
+    def require_expected_persisted_record() -> None:
+        persisted = _load_attempt(path, run_ownership=run_ownership)
+        if not _same_attempt_identity(persisted, record):
+            raise AttemptError("Persisted attempt identity changed before update.")
+        if expected_record is not None and persisted != expected_record:
+            raise AttemptError(
+                "Persisted attempt changed after this update was prepared."
+            )
+
+    # Retain the early diagnostic check, then repeat it inside the short commit
+    # fence. A delayed start recorder can prepare and fsync a stale temporary
+    # payload without holding up lifecycle finalisation; once released, it must
+    # revalidate after the finaliser and cannot replace the newer record.
+    require_expected_persisted_record()
+    fence = _attempt_commit_fence(path)
+
+    def commit(replace_destination: Callable[[], None]) -> None:
+        with fence:
+            require_expected_persisted_record()
+            replace_destination()
+
+    atomic_write_json(path, record.to_dict(), commit=commit)
 
 
 def update_attempt(
@@ -377,7 +411,11 @@ def update_attempt(
         metadata=record.metadata if metadata is None else metadata,
         ended_at=timestamp_now(clock) if ended else record.ended_at,
     )
-    save_attempt(updated, run_ownership=run_ownership)
+    save_attempt(
+        updated,
+        expected_record=record,
+        run_ownership=run_ownership,
+    )
     return updated
 
 

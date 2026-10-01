@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -368,8 +369,29 @@ def _run_review_stage(
             run_ownership=run_ownership,
         )
 
+    invocation_started = False
+    invocation_start_recording = False
+    invocation_started_lock = threading.Lock()
+
     def mark_invocation_started() -> None:
-        mark_process_started()
+        nonlocal invocation_started, invocation_start_recording
+        with invocation_started_lock:
+            if invocation_started or invocation_start_recording:
+                return
+            invocation_start_recording = True
+        recorded = False
+        try:
+            # Do not hold the notification lock across persistence: lifecycle
+            # fallback/finalisation must remain deadline-safe if the recorder
+            # is delayed there. The attempt commit fence rejects its stale
+            # replacement after finalisation.
+            mark_process_started()
+            recorded = True
+        finally:
+            with invocation_started_lock:
+                invocation_start_recording = False
+                if recorded:
+                    invocation_started = True
 
     request = AgentExecutionRequest(
         task_kind=AgentTaskKind.REVIEW,
@@ -393,6 +415,8 @@ def _run_review_stage(
         request,
         on_invocation_start=mark_invocation_started,
     )
+    if execution.invocation_start is InvocationStart.STARTED:
+        mark_invocation_started()
     assert request.artifact_layout is not None
     request.artifact_layout.revalidate()
     write_execution_evidence(
@@ -411,7 +435,10 @@ def _run_review_stage(
             message = (
                 "Agent review failed and repository safety invariants were violated."
             )
-        elif execution.failure_category is AgentFailureCategory.INVALID_RESULT:
+        elif execution.failure_category in {
+            AgentFailureCategory.INVALID_RESULT,
+            AgentFailureCategory.INVOCATION_CLEANUP_UNCERTAIN,
+        }:
             outcome = StageOutcome.HUMAN_REQUIRED
             processing_error = execution.failure_message
             message = execution.failure_message or "Agent review result was invalid."

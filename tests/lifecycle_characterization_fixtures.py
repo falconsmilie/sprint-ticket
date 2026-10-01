@@ -15,6 +15,7 @@ from tests.helpers import (
 from ticket_automation.attempts import AttemptRecord, load_attempt_records
 from ticket_automation.config import AppConfig
 from ticket_automation.providers.codex_cli import (
+    CodexProcessEvidence,
     CodexProcessResult,
     CodexProcessTimedOut,
     CodexProcessTimeout,
@@ -96,6 +97,22 @@ class ScriptedCodexRunner:
             return CodexProcessResult(2, "", "fake codex failed\n")
         if action == "fail":
             return CodexProcessResult(2, "", "fake codex failed\n")
+        if action == "cleanup-uncertain":
+            return CodexProcessResult(
+                1,
+                "",
+                "fake cleanup uncertainty\n",
+                evidence=CodexProcessEvidence(
+                    work_timeout_seconds=timeout_seconds,
+                    deadline_outcome="stream-failure",
+                    finalization_outcome="failed",
+                    cleanup_outcome="incomplete",
+                    termination_method="test-containment",
+                    tree_termination_confirmed=False,
+                    output_draining_truncated=True,
+                ),
+                transport_failure="invocation-tree cleanup could not be confirmed",
+            )
         if action == "missing-result":
             missing_payload = (
                 _scripted_review_result("review-pass")
